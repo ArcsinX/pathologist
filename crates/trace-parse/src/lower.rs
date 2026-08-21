@@ -1,16 +1,17 @@
 use crate::deps::IncludeGraph;
+use crate::discover::discover_source_files;
+use crate::index_cache::IndexSourceCache;
 use crate::merge::{merge_unit_index, UnitIndex};
 use crate::parse::{node_text, parse_c_source};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use trace_ir::{
     CallSite, Diagnostic, DiagnosticSeverity, FieldId, FlowConstraint, FnId, Function, Linkage,
     Program, ReturnFlow, Span, StorageClass, TypeDesc, VarId, Variable,
 };
-use trace_preproc::{preprocess_file, PreprocessOptions};
+use trace_preproc::{macro_table_from_defines, PreprocessOptions};
 use tree_sitter::Node;
 
 struct LowerContext {
@@ -47,122 +48,127 @@ pub fn build_program_with_jobs(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    let headers = normalize_discovered_paths(crate::discover::discover_header_files(root));
-    let files = normalize_discovered_paths(crate::discover::discover_c_files(root));
+    let (files, headers) = discover_source_files(root);
+    let files = normalize_discovered_paths(files);
+    let headers = normalize_discovered_paths(headers);
     if files.is_empty() && headers.is_empty() {
         return Err(format!("no .c or .h files found under {}", root.display()));
     }
 
     let include_graph = IncludeGraph::build(root, &files, &headers);
-    // Headers expanded into preprocessed `.c` TUs do not need a separate index pass.
-    // Orphan headers (never `#include`d by any translation unit) carry no reachable code.
-    let headers_to_index: Vec<PathBuf> = Vec::new();
-    let header_order = include_graph.index_order(&headers_to_index);
     let file_order = include_graph.index_order(&files);
 
-    let mut to_precompute: HashSet<PathBuf> = HashSet::new();
-    for p in file_order.iter().chain(header_order.iter()) {
-        if should_preprocess_file(p, opts, &include_graph) {
-            to_precompute.insert(p.clone());
+    let basename_index = Arc::new(include_graph.basename_index.clone());
+    let include_expansion_cache = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let eff_opts = project_preprocess_opts(root, opts, &include_graph)
+        .for_indexing()
+        .with_include_expansion_cache(Arc::clone(&include_expansion_cache))
+        .with_basename_index(basename_index);
+
+    let shared_macros = Arc::new(std::sync::RwLock::new(macro_table_from_defines(&opts.defines)));
+    let project_headers: Vec<PathBuf> = include_graph
+        .project_files
+        .iter()
+        .filter(|p| p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("h")))
+        .cloned()
+        .collect();
+    let c_sources: HashSet<PathBuf> = files.iter().cloned().collect();
+    let reachable_from_c = include_graph.reachable_from(&c_sources);
+    let headers_for_macro_warm: Vec<PathBuf> = include_graph.index_order(
+        &project_headers
+            .iter()
+            .filter(|p| reachable_from_c.contains(*p))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    // Headers never #included from any `.c` must be indexed separately; the rest
+    // are already expanded into translation units during TU preprocess.
+    let orphan_headers: Vec<PathBuf> = include_graph.index_order(
+        &project_headers
+            .iter()
+            .filter(|p| !reachable_from_c.contains(*p))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+
+    let source_cache = IndexSourceCache::new();
+    let header_prep_opts = eff_opts
+        .clone()
+        .with_shared_macros(Arc::clone(&shared_macros))
+        .with_accumulate_macros(true);
+    for path in &headers_for_macro_warm {
+        if let Err(e) = source_cache.get_or_preprocess(path, &include_graph, &header_prep_opts) {
+            program.add_diagnostic(Diagnostic {
+                severity: DiagnosticSeverity::Warning,
+                file: None,
+                line: 0,
+                message: format!(
+                    "macro warm preprocess failed for {}: {e}",
+                    path.display()
+                ),
+                stage: "preprocess".into(),
+            });
         }
     }
-    let eff_opts = project_preprocess_opts(root, opts, &include_graph);
-    let preprocessed_cache: Arc<HashMap<PathBuf, String>> = Arc::new(if to_precompute.is_empty() {
-        HashMap::new()
-    } else if jobs == 1 {
-        to_precompute
-            .iter()
-            .filter_map(|path| {
-                preprocess_file(path, &eff_opts)
-                    .ok()
-                    .map(|r| (path.clone(), r.output))
-            })
-            .collect()
-    } else {
-        to_precompute
-            .par_iter()
-            .filter_map(|path| {
-                preprocess_file(path, &eff_opts)
-                    .ok()
-                    .map(|r| (path.clone(), r.output))
-            })
-            .collect()
-    });
+
+    let index_opts = eff_opts.with_shared_macros(shared_macros);
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(jobs)
         .build()
         .map_err(|e| e.to_string())?;
 
-    if jobs == 1 {
-        for path in &header_order {
-            let _ = lower_header_unit(
-                &mut program,
-                path,
-                opts,
-                &include_graph,
-                &preprocessed_cache,
-            );
-        }
-        for path in &file_order {
-            if let Err(e) = process_translation_unit(
-                &mut program,
-                path,
-                opts,
-                &include_graph,
-                &preprocessed_cache,
-            ) {
-                program.add_diagnostic(Diagnostic {
-                    severity: DiagnosticSeverity::Error,
-                    file: None,
-                    line: 0,
-                    message: e,
-                    stage: "parse".into(),
-                });
-            }
-        }
-    } else {
-        pool.install(|| {
-            let mut header_units: std::collections::HashMap<PathBuf, Result<UnitIndex, String>> =
-                headers_to_index
-                    .par_iter()
-                    .map(|path| {
-                        let unit = index_header_unit(
-                            path,
-                            opts,
-                            root,
-                            &include_graph,
-                            &preprocessed_cache,
-                        );
-                        (path.clone(), unit)
-                    })
-                    .collect();
-            for path in &header_order {
-                if let Some(unit) = header_units.remove(path) {
-                    match unit {
-                        Ok(u) => merge_unit_index(&mut program, u),
-                        Err(e) => program.add_diagnostic(Diagnostic {
-                            severity: DiagnosticSeverity::Error,
-                            file: None,
-                            line: 0,
-                            message: e.clone(),
-                            stage: "parse".into(),
-                        }),
-                    }
-                }
-            }
-
-            let mut units: std::collections::HashMap<PathBuf, UnitIndex> = files
-                .par_iter()
-                .map(|path| {
-                    let unit = index_translation_unit(
+    pool.install(|| {
+        let mut header_units: HashMap<PathBuf, UnitIndex> = orphan_headers
+            .par_iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    index_source_file(
                         path,
-                        opts,
                         root,
                         &include_graph,
-                        &preprocessed_cache,
-                    );
-                    (path.clone(), unit)
+                        &index_opts,
+                        &source_cache,
+                    ),
+                )
+            })
+            .collect();
+        for path in &orphan_headers {
+            if let Some(unit) = header_units.remove(path) {
+                merge_unit_index(&mut program, unit);
+            }
+        }
+    });
+
+    pool.install(|| {
+        if jobs == 1 {
+            for path in &file_order {
+                merge_unit_index(
+                    &mut program,
+                    index_source_file(
+                        path,
+                        root,
+                        &include_graph,
+                        &index_opts,
+                        &source_cache,
+                    ),
+                );
+            }
+        } else {
+            let mut units: HashMap<PathBuf, UnitIndex> = file_order
+                .par_iter()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        index_source_file(
+                            path,
+                            root,
+                            &include_graph,
+                            &index_opts,
+                            &source_cache,
+                        ),
+                    )
                 })
                 .collect();
             for path in &file_order {
@@ -170,8 +176,8 @@ pub fn build_program_with_jobs(
                     merge_unit_index(&mut program, unit);
                 }
             }
-        });
-    }
+        }
+    });
 
     program.include_deps = include_graph.edge_list();
     for dir in &include_graph.include_dirs {
@@ -188,13 +194,6 @@ fn normalize_discovered_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         .into_iter()
         .map(|p| p.canonicalize().unwrap_or(p))
         .collect()
-}
-
-fn should_preprocess_file(path: &Path, opts: &PreprocessOptions, graph: &IncludeGraph) -> bool {
-    if !opts.defines.is_empty() || !opts.include_paths.is_empty() {
-        return true;
-    }
-    graph.needs_preprocess.contains(path)
 }
 
 fn project_preprocess_opts(
@@ -215,27 +214,21 @@ fn project_preprocess_opts(
     eff
 }
 
-fn index_header_unit(
+fn index_source_file(
     path: &Path,
-    opts: &PreprocessOptions,
     root: &Path,
     graph: &IncludeGraph,
-    preprocessed: &Arc<HashMap<PathBuf, String>>,
-) -> Result<UnitIndex, String> {
-    let mut program = Program::new(root.to_path_buf());
-    lower_header_unit(&mut program, path, opts, graph, preprocessed)?;
-    Ok(program_into_unit(path.to_path_buf(), program))
-}
-
-fn index_translation_unit(
-    path: &Path,
-    opts: &PreprocessOptions,
-    root: &Path,
-    graph: &IncludeGraph,
-    preprocessed: &Arc<HashMap<PathBuf, String>>,
+    index_opts: &PreprocessOptions,
+    source_cache: &IndexSourceCache,
 ) -> UnitIndex {
     let mut program = Program::new(root.to_path_buf());
-    match process_translation_unit(&mut program, path, opts, graph, preprocessed) {
+    match process_indexed_file(
+        &mut program,
+        path,
+        graph,
+        index_opts,
+        source_cache,
+    ) {
         Ok(()) => program_into_unit(path.to_path_buf(), program),
         Err(e) => UnitIndex {
             path: path.to_path_buf(),
@@ -251,6 +244,35 @@ fn index_translation_unit(
     }
 }
 
+fn process_indexed_file(
+    program: &mut Program,
+    path: &Path,
+    graph: &IncludeGraph,
+    index_opts: &PreprocessOptions,
+    source_cache: &IndexSourceCache,
+) -> Result<(), String> {
+    let source = source_cache.get_or_preprocess(path, graph, index_opts)?;
+    let parsed = parse_c_source(source.as_ref())?;
+    if crate::parse::has_parse_errors(&parsed.tree) {
+        program.add_diagnostic(Diagnostic {
+            severity: DiagnosticSeverity::Warning,
+            file: None,
+            line: 0,
+            message: format!("parse errors in {}", path.display()),
+            stage: "parse".into(),
+        });
+    }
+
+    let file_id = program.symbols.add_file(path.to_path_buf());
+    let mut ctx = LowerContext {
+        current_fn: None,
+        current_file: file_id,
+        locals: HashMap::new(),
+    };
+    lower_tree(program, &mut ctx, &parsed.source, parsed.tree.root_node());
+    Ok(())
+}
+
 fn program_into_unit(path: PathBuf, program: Program) -> UnitIndex {
     UnitIndex {
         path,
@@ -263,52 +285,6 @@ fn program_into_unit(path: PathBuf, program: Program) -> UnitIndex {
         diagnostics: program.diagnostics,
         anon_type_counter: program.anon_type_counter,
     }
-}
-
-fn read_source_file(
-    path: &Path,
-    root: &Path,
-    opts: &PreprocessOptions,
-    graph: &IncludeGraph,
-    preprocessed: &Arc<HashMap<PathBuf, String>>,
-) -> Result<String, String> {
-    if !should_preprocess_file(path, opts, graph) {
-        return fs::read_to_string(path).map_err(|e| e.to_string());
-    }
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if let Some(out) = preprocessed.get(&canonical) {
-        return Ok(out.clone());
-    }
-    let eff = project_preprocess_opts(root, opts, graph);
-    let preproc_result = preprocess_file(path, &eff).map_err(|e| e.to_string())?;
-    let preproc_failed = preproc_result.diagnostics.iter().any(|d| {
-        matches!(d.severity, trace_preproc::DiagnosticSeverity::Error)
-            || d.message.contains("preprocess stopped")
-    });
-    if preproc_failed {
-        fs::read_to_string(path).map_err(|e| e.to_string())
-    } else {
-        Ok(preproc_result.output)
-    }
-}
-
-fn lower_header_unit(
-    program: &mut Program,
-    path: &Path,
-    opts: &PreprocessOptions,
-    graph: &IncludeGraph,
-    preprocessed: &Arc<HashMap<PathBuf, String>>,
-) -> Result<(), String> {
-    let source = read_source_file(path, &program.root, opts, graph, preprocessed)?;
-    let parsed = parse_c_source(&source)?;
-    let file_id = program.symbols.add_file(path.to_path_buf());
-    let mut ctx = LowerContext {
-        current_fn: None,
-        current_file: file_id,
-        locals: HashMap::new(),
-    };
-    lower_type_declarations(program, &mut ctx, &parsed.source, parsed.tree.root_node());
-    Ok(())
 }
 
 fn lower_typedef(program: &mut Program, source: &str, node: Node) {
@@ -336,56 +312,6 @@ fn lower_typedef(program: &mut Program, source: &str, node: Node) {
     }
 }
 
-fn lower_type_declarations(
-    program: &mut Program,
-    ctx: &mut LowerContext,
-    source: &str,
-    node: Node,
-) {
-    match node.kind() {
-        "declaration" => lower_declaration(program, ctx, source, node, None),
-        "struct_specifier" | "union_specifier" => {
-            lower_struct_specifier(program, source, node);
-        }
-        "type_definition" => lower_typedef(program, source, node),
-        _ => {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                lower_type_declarations(program, ctx, source, child);
-            }
-        }
-    }
-}
-
-fn process_translation_unit(
-    program: &mut Program,
-    path: &Path,
-    opts: &PreprocessOptions,
-    graph: &IncludeGraph,
-    preprocessed: &Arc<HashMap<PathBuf, String>>,
-) -> Result<(), String> {
-    let source = read_source_file(path, &program.root, opts, graph, preprocessed)?;
-    let parsed = parse_c_source(&source)?;
-    if crate::parse::has_parse_errors(&parsed.tree) {
-        program.add_diagnostic(Diagnostic {
-            severity: DiagnosticSeverity::Warning,
-            file: None,
-            line: 0,
-            message: format!("parse errors in {}", path.display()),
-            stage: "parse".into(),
-        });
-    }
-
-    let file_id = program.symbols.add_file(path.to_path_buf());
-    let mut ctx = LowerContext {
-        current_fn: None,
-        current_file: file_id,
-        locals: HashMap::new(),
-    };
-    lower_tree(program, &mut ctx, &parsed.source, parsed.tree.root_node());
-    Ok(())
-}
-
 fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node: Node) {
     match node.kind() {
         "function_definition" => lower_function(program, ctx, source, node),
@@ -393,6 +319,7 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
         "struct_specifier" | "union_specifier" => {
             lower_struct_specifier(program, source, node);
         }
+        "type_definition" => lower_typedef(program, source, node),
         _ => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {

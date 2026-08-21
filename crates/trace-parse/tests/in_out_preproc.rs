@@ -11,7 +11,7 @@ fn in_out_preprocessed_still_has_assignment() {
         &PreprocessOptions::new().with_include(path.parent().unwrap().into()),
     )
     .unwrap();
-    let parsed = parse_c_source(&pre.output).unwrap();
+    let parsed = parse_c_source(pre.output).unwrap();
     let mut found = false;
     fn walk(node: tree_sitter::Node, found: &mut bool) {
         if node.kind() == "assignment_expression" {

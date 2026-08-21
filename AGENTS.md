@@ -86,8 +86,10 @@ Register external function summaries in `trace-analysis/src/summaries.rs`. Docum
 ```bash
 cargo build --workspace
 cargo test --workspace
-cargo run -p trace-cli -- analyze tests/fixtures/direct_call -o /tmp/out.db
+cargo run -p trace-cli --release -- analyze tests/fixtures/direct_call -o /tmp/out.db
 ```
+
+Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace` after every compile) so benchmarks run the current binary.
 
 ## Common tasks
 

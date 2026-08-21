@@ -8,7 +8,7 @@ struct NetDeviceImplOp {
     int32_t (*init)(struct NetDeviceImpl *netDevice);
 };
 "#;
-    let parsed = parse_c_source(src).unwrap();
+    let parsed = parse_c_source(src.to_string()).unwrap();
     fn walk(node: tree_sitter::Node, depth: usize) {
         if depth <= 8 {
             println!("{}{}", "  ".repeat(depth), node.kind());

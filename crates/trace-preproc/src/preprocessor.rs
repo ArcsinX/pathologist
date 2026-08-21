@@ -1,8 +1,9 @@
+use crate::macros::{MacroDef, MacroTable};
 use crate::{Diagnostic, DiagnosticSeverity, Lexer, LineMap, PreprocessOptions, Token, TokenKind};
-use indexmap::IndexMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -23,22 +24,10 @@ pub struct PreprocessResult {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Debug, Clone)]
-enum MacroDef {
-    Object {
-        replacement: Vec<Token>,
-    },
-    Function {
-        params: Vec<String>,
-        replacement: Vec<Token>,
-        variadic: bool,
-    },
-}
-
 #[derive(Debug)]
 struct PreprocessorState {
     opts: PreprocessOptions,
-    macros: IndexMap<String, MacroDef>,
+    macros: MacroTable,
     include_stack: Vec<PathBuf>,
     included_guard: HashSet<PathBuf>,
     conditional_stack: Vec<bool>,
@@ -53,7 +42,7 @@ impl PreprocessorState {
     fn new(opts: PreprocessOptions, file: PathBuf) -> Self {
         let mut state = Self {
             opts,
-            macros: IndexMap::new(),
+            macros: MacroTable::new(),
             include_stack: vec![file.clone()],
             included_guard: HashSet::new(),
             conditional_stack: vec![true],
@@ -63,23 +52,60 @@ impl PreprocessorState {
             current_file: file,
             current_line: 1,
         };
-        state.init_predefined_macros();
+        if let Some(shared) = &state.opts.shared_macros {
+            if let Ok(guard) = shared.read() {
+                state.macros = guard.clone();
+            }
+        } else {
+            state.init_predefined_macros();
+        }
         state
     }
 
     fn init_predefined_macros(&mut self) {
-        for (name, val) in &self.opts.defines {
-            let tokens = Lexer::new(val).tokenize();
+        if self.opts.shared_macros.is_some() {
+            return;
+        }
+        let defines: Vec<_> = self
+            .opts
+            .defines
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (name, val) in defines {
+            let tokens = Lexer::new(&val).tokenize();
             let filtered: Vec<Token> = tokens
                 .into_iter()
                 .filter(|t| !matches!(t.kind, TokenKind::Eof))
                 .collect();
-            self.macros.insert(
-                name.clone(),
+            self.insert_macro(
+                name,
                 MacroDef::Object {
                     replacement: filtered,
                 },
             );
+        }
+    }
+
+    fn insert_macro(&mut self, name: String, def: MacroDef) {
+        self.macros.insert(name.clone(), def.clone());
+        if self.opts.accumulate_macros {
+            if let Some(shared) = &self.opts.shared_macros {
+                if let Ok(mut guard) = shared.write() {
+                    guard.insert(name, def);
+                }
+            }
+        }
+    }
+
+    fn remove_macro(&mut self, name: &str) {
+        self.macros.shift_remove(name);
+        if self.opts.accumulate_macros {
+            if let Some(shared) = &self.opts.shared_macros {
+                if let Ok(mut guard) = shared.write() {
+                    guard.shift_remove(name);
+                }
+            }
         }
     }
 
@@ -99,8 +125,10 @@ impl PreprocessorState {
         let offset = self.output.len();
         let text = token_to_string(&tok.kind);
         self.output.push_str(&text);
-        self.line_map
-            .push(offset, self.current_file.clone(), tok.line, tok.col);
+        if self.opts.track_line_map {
+            self.line_map
+                .push(offset, self.current_file.clone(), tok.line, tok.col);
+        }
         if matches!(tok.kind, TokenKind::Newline) {
             self.current_line += 1;
         }
@@ -109,8 +137,10 @@ impl PreprocessorState {
     fn emit_str(&mut self, s: &str, line: u32, col: u32) {
         let offset = self.output.len();
         self.output.push_str(s);
-        self.line_map
-            .push(offset, self.current_file.clone(), line, col);
+        if self.opts.track_line_map {
+            self.line_map
+                .push(offset, self.current_file.clone(), line, col);
+        }
     }
 
     fn warn(&mut self, line: u32, message: impl Into<String>) {
@@ -138,7 +168,31 @@ impl PreprocessorState {
         if self.included_guard.contains(&canonical) {
             return Ok(());
         }
+
+        if let Some(cache) = &self.opts.include_expansion_cache {
+            let cached = cache
+                .read()
+                .ok()
+                .and_then(|guard| guard.get(&canonical).cloned());
+            if let Some(entry) = cached {
+                self.emit_str(&entry.text, 1, 1);
+                self.included_guard.extend(entry.files.iter().cloned());
+                return Ok(());
+            }
+        }
+
+        let cache_header = self.opts.include_expansion_cache.is_some()
+            && canonical
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("h"));
+
+        let guard_snapshot = if cache_header {
+            self.included_guard.clone()
+        } else {
+            HashSet::new()
+        };
         self.included_guard.insert(canonical.clone());
+        let output_start = self.output.len();
 
         let content = if let Some(cache) = &self.opts.source_cache {
             let key = canonical.clone();
@@ -168,6 +222,26 @@ impl PreprocessorState {
 
         self.include_stack.pop();
         self.current_file = prev_file;
+
+        if cache_header {
+            if let Some(cache) = &self.opts.include_expansion_cache {
+                let text: Arc<str> = self.output[output_start..].into();
+                if !text.is_empty() {
+                    let new_files: HashSet<PathBuf> = self
+                        .included_guard
+                        .difference(&guard_snapshot)
+                        .cloned()
+                        .collect();
+                    if let Ok(mut guard) = cache.write() {
+                        guard.entry(canonical).or_insert(crate::IncludeExpansion {
+                            text,
+                            files: Arc::new(new_files),
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -368,7 +442,7 @@ impl PreprocessorState {
             }
             "undef" if self.is_active() => {
                 let name = self.read_directive_ident(tokens, &mut i)?;
-                self.macros.shift_remove(&name);
+                self.remove_macro(&name);
             }
             "undef" if !self.is_active() => {}
             _ => {
@@ -445,8 +519,17 @@ impl PreprocessorState {
         }
         for inc in &self.opts.include_paths {
             let p = inc.join(path);
-            if p.exists() {
+            if p.is_file() {
                 return Ok(p);
+            }
+        }
+        if let Some(index) = &self.opts.basename_index {
+            if let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) {
+                if let Some(matches) = index.get(name) {
+                    if matches.len() == 1 {
+                        return Ok(matches[0].clone());
+                    }
+                }
             }
         }
         Err(PreprocessError::Message {
@@ -477,7 +560,7 @@ impl PreprocessorState {
                 replacement.push(tokens[i].clone());
                 i += 1;
             }
-            self.macros.insert(
+            self.insert_macro(
                 name,
                 MacroDef::Function {
                     params,
@@ -505,7 +588,7 @@ impl PreprocessorState {
             replacement.push(tokens[i].clone());
             i += 1;
         }
-        self.macros.insert(name, MacroDef::Object { replacement });
+        self.insert_macro(name, MacroDef::Object { replacement });
         Ok(i)
     }
 
@@ -898,7 +981,7 @@ fn token_to_string(kind: &TokenKind) -> String {
     }
 }
 
-fn eval_pp_condition(cond: &str, macros: &IndexMap<String, MacroDef>) -> bool {
+fn eval_pp_condition(cond: &str, macros: &MacroTable) -> bool {
     let cond = cond.trim();
     if cond.is_empty() {
         return false;

@@ -80,14 +80,17 @@ For `#include "header.h"` / `#include <header.h>`:
 
 Only **project-local** files under the analysis root are linked; system headers outside the tree are not resolved unless present in the project.
 
-## Include graph optimizations
+## Include graph and header indexing
 
-| Optimization | Purpose |
-|--------------|---------|
-| `needs_preprocess` set | Skip preprocess for TUs with no includes/defines |
+| Behavior | Notes |
+|----------|-------|
+| `needs_preprocess` set | Files with `#include` edges (or included by another) run through the preprocessor |
 | `source_cache` | Reuse file text while scanning `#include` edges |
-| Orphan header skip | Headers never reached from any `.c` are not indexed separately |
-| Parallel precompute | `--jobs` fills preprocess cache before TU indexing |
+| Reachable headers | Headers transitively `#include`d from any `.c` are expanded into that TU; not indexed as separate units |
+| Orphan headers | Project `.h` never reached from any `.c` are indexed as their own units (may contain calls) |
+| Parallel index | Orphan headers and `.c` TUs: parallel parse/lower, sequential merge |
+
+**Limitation:** Reachability is computed from literal `#include` lines in raw source (no macro expansion). Headers included only via macros may be misclassified as orphan (duplicate work, usually still correct). Headers excluded by `#if 0` in the preprocessor but visible in the raw graph are treated as reachable and not indexed separately — if the TU also omits them at preprocess time, calls in those headers can be missed.
 
 ## Error recovery
 

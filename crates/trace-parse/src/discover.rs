@@ -2,14 +2,42 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 pub fn discover_c_files(root: &Path) -> Vec<PathBuf> {
-    discover_by_extension(root, "c")
+    discover_source_files(root).0
 }
 
 /// `.h` files under the analyzed tree (for struct layouts), not external include dirs.
 pub fn discover_header_files(root: &Path) -> Vec<PathBuf> {
-    discover_by_extension(root, "h")
+    discover_source_files(root).1
 }
 
+/// Single directory walk collecting `.c` and `.h` paths.
+pub fn discover_source_files(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    if root.is_file() {
+        let ext = root.extension().and_then(|e| e.to_str());
+        return match ext {
+            Some("c") => (vec![root.to_path_buf()], Vec::new()),
+            Some("h") => (Vec::new(), vec![root.to_path_buf()]),
+            _ => (Vec::new(), Vec::new()),
+        };
+    }
+    let mut c_files = Vec::new();
+    let mut h_files = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        match entry.path().extension().and_then(|x| x.to_str()) {
+            Some("c") => c_files.push(entry.path().to_path_buf()),
+            Some("h") => h_files.push(entry.path().to_path_buf()),
+            _ => {}
+        }
+    }
+    c_files.sort();
+    h_files.sort();
+    (c_files, h_files)
+}
+
+#[allow(dead_code)]
 fn discover_by_extension(root: &Path, ext: &str) -> Vec<PathBuf> {
     if root.is_file() {
         return root

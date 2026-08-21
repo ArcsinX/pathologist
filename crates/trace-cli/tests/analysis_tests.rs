@@ -410,3 +410,125 @@ fn fn_static_local_variable() {
     assert_eq!(kind, "fn_static");
     let _ = std::fs::remove_file(db);
 }
+
+#[test]
+fn header_inline_call_indexed_from_header_unit() {
+    let root = fixture("header_inline_call");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let header_only = program.symbols.functions.iter().find(|f| {
+        f.name == "HeaderOnlyCaller"
+            && program
+                .symbols
+                .files
+                .get(f.file.0 as usize)
+                .is_some_and(|fi| fi.path.ends_with("orphan_call.h"))
+    });
+    assert!(
+        header_only.is_some(),
+        "orphan_call.h must be indexed as its own unit (not included by any .c)"
+    );
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "HeaderOnlyCaller",
+            "ExternalTarget",
+            ResolutionKind::Direct
+        ) || has_edge(
+            &program,
+            &analysis,
+            "HeaderOnlyCaller",
+            "ExternalTarget",
+            ResolutionKind::Indirect
+        ),
+        "call inside header-only inline function should resolve"
+    );
+    assert!(
+        !program
+            .symbols
+            .files
+            .iter()
+            .any(|f| f.path.ends_with("helper.h")),
+        "helper.h is reachable from main.c and must not be indexed as a separate unit"
+    );
+}
+
+#[test]
+fn header_chain_reachable_from_c_not_indexed_separately() {
+    let root = fixture("header_chain");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+
+    assert!(
+        !program
+            .symbols
+            .files
+            .iter()
+            .any(|f| f.path.ends_with("chain_b.h")),
+        "chain_b.h is reachable from main.c via chain_a.h and must not be a separate unit"
+    );
+    assert!(
+        !program
+            .symbols
+            .files
+            .iter()
+            .any(|f| f.path.ends_with("chain_a.h")),
+        "chain_a.h is reachable from main.c and must not be a separate unit"
+    );
+    let b_caller = program
+        .symbols
+        .functions
+        .iter()
+        .find(|f| f.name == "BCaller")
+        .expect("BCaller from chain_b.h should appear via main.c TU expansion");
+    assert!(
+        program
+            .symbols
+            .files
+            .get(b_caller.file.0 as usize)
+            .is_some_and(|fi| fi.path.ends_with("main.c")),
+        "BCaller should be attributed to the translation unit, not chain_b.h"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn macro_warm_preprocess_failure_is_nonfatal() {
+    use std::os::unix::fs::PermissionsExt;
+    let root =
+        std::env::temp_dir().join(format!("trace_warm_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("main.c"),
+        "#include \"good.h\"\nvoid main_fn(void) {}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("good.h"), "void helper(void);\n").unwrap();
+    std::fs::write(root.join("bad.h"), "void bad_helper(void);\n").unwrap();
+    std::fs::write(
+        root.join("also.c"),
+        "#include \"bad.h\"\nvoid also_fn(void) {}\n",
+    )
+    .unwrap();
+    let bad = root.join("bad.h");
+    let mut perms = std::fs::metadata(&bad).unwrap().permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(&bad, perms).unwrap();
+
+    let program = build_program(&root, &PreprocessOptions::new()).expect("build continues");
+    let _ = std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644));
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        program.diagnostics.iter().any(|d| {
+            d.stage == "preprocess" && d.message.contains("macro warm preprocess failed")
+        }),
+        "expected macro warm warning for unreadable reachable header: {:?}",
+        program.diagnostics
+    );
+    assert!(
+        program.symbols.functions.iter().any(|f| f.name == "main_fn"),
+        "main.c should still be indexed after macro warm failure"
+    );
+}

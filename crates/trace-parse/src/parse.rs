@@ -16,16 +16,14 @@ pub struct ParseResult {
     pub source: String,
 }
 
-pub fn parse_c_source(source: &str) -> Result<ParseResult, String> {
+pub fn parse_c_source(source: impl AsRef<str>) -> Result<ParseResult, String> {
+    let source = source.as_ref().to_string();
     PARSER.with(|p| {
         let mut parser = p.borrow_mut();
         let tree = parser
-            .parse(source, None)
+            .parse(&source, None)
             .ok_or_else(|| "tree-sitter returned no tree".to_string())?;
-        Ok(ParseResult {
-            tree,
-            source: source.to_string(),
-        })
+        Ok(ParseResult { tree, source })
     })
 }
 

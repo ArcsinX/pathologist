@@ -1,4 +1,5 @@
 use indexmap::IndexMap;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -17,6 +18,8 @@ pub struct IncludeGraph {
     pub needs_preprocess: HashSet<PathBuf>,
     /// Raw source text loaded while building the include graph (canonical paths).
     pub source_cache: HashMap<PathBuf, String>,
+    /// Basename → project files (for fast include resolution without tree walks).
+    pub basename_index: HashMap<String, Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,27 +43,37 @@ impl IncludeGraph {
         }
 
         let include_dirs = discover_include_dirs(&root, h_files);
+        let basename_index = build_basename_index(&project_files);
 
         let mut edges: IndexMap<PathBuf, Vec<PathBuf>> = IndexMap::new();
         let mut source_cache: HashMap<PathBuf, String> = HashMap::new();
-        for path in project_files.iter() {
-            let Ok(content) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            source_cache.insert(path.clone(), content.clone());
-            let mut deps = Vec::new();
-            for inc in scan_includes(&content) {
-                if let Some(resolved) = resolve_include(path, &inc, &include_dirs, &root) {
-                    let canon = canonicalize(&resolved);
-                    if project_files.contains(&canon) {
-                        deps.push(canon);
+        let project_list: Vec<PathBuf> = project_files.iter().cloned().collect();
+        let scanned: Vec<(PathBuf, String, Vec<PathBuf>)> = project_list
+            .par_iter()
+            .filter_map(|path| {
+                let Ok(content) = std::fs::read_to_string(path) else {
+                    return None;
+                };
+                let mut deps = Vec::new();
+                for inc in scan_includes(&content) {
+                    if let Some(resolved) =
+                        resolve_include(path, &inc, &include_dirs, &basename_index)
+                    {
+                        let canon = canonicalize(&resolved);
+                        if project_files.contains(&canon) {
+                            deps.push(canon);
+                        }
                     }
                 }
-            }
-            deps.sort();
-            deps.dedup();
+                deps.sort();
+                deps.dedup();
+                Some((path.clone(), content, deps))
+            })
+            .collect();
+        for (path, content, deps) in scanned {
+            source_cache.insert(path.clone(), content);
             if !deps.is_empty() {
-                edges.insert(path.clone(), deps);
+                edges.insert(path, deps);
             }
         }
 
@@ -73,6 +86,7 @@ impl IncludeGraph {
             include_dirs,
             needs_preprocess,
             source_cache,
+            basename_index,
         }
     }
 
@@ -239,11 +253,24 @@ fn scan_includes(source: &str) -> Vec<IncludeRef> {
     out
 }
 
+fn build_basename_index(project_files: &HashSet<PathBuf>) -> HashMap<String, Vec<PathBuf>> {
+    let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for path in project_files {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            index.entry(name.to_string()).or_default().push(path.clone());
+        }
+    }
+    for paths in index.values_mut() {
+        paths.sort();
+    }
+    index
+}
+
 fn resolve_include(
     from: &Path,
     inc: &IncludeRef,
     include_dirs: &[PathBuf],
-    root: &Path,
+    basename_index: &HashMap<String, Vec<PathBuf>>,
 ) -> Option<PathBuf> {
     let candidates = match inc.kind {
         IncludeKind::Local => {
@@ -265,23 +292,15 @@ fn resolve_include(
         }
     }
 
-    // Last resort: unique match under project root by filename.
-    let name = Path::new(&inc.path)
+    // Last resort: unique match under project by filename.
+    if let Some(name) = Path::new(&inc.path)
         .file_name()
-        .map(|n| n.to_string_lossy().to_string());
-    if let Some(name) = name {
-        let mut matches = Vec::new();
-        for entry in WalkDir::new(root)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            if entry.file_name().to_string_lossy() == name {
-                matches.push(entry.path().to_path_buf());
+        .and_then(|n| n.to_str())
+    {
+        if let Some(matches) = basename_index.get(name) {
+            if matches.len() == 1 {
+                return Some(matches[0].clone());
             }
-        }
-        if matches.len() == 1 {
-            return Some(matches[0].clone());
         }
     }
     None

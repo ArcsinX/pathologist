@@ -2,6 +2,7 @@
 
 mod deps;
 mod discover;
+mod index_cache;
 mod lower;
 mod merge;
 mod parse;
