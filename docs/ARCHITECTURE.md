@@ -1,0 +1,145 @@
+# Architecture
+
+## Overview
+
+trace analyzes a directory of C translation units (`.c` files), builds a merged whole-program IR, runs Andersen-style pointer analysis, and exports call graphs and argument-flow edges to SQLite.
+
+The pipeline is **strictly phased**: each stage has a narrow input/output contract and can be tested independently.
+
+## End-to-end pipeline
+
+```mermaid
+flowchart LR
+  Discover[Discover .c / .h]
+  Graph[IncludeGraph]
+  Preproc[trace-preproc]
+  Parse[trace-parse per TU]
+  Merge[merge_unit_index]
+  IR[Program]
+  PAG[trace-analysis Pag]
+  Solve[Solver]
+  Export[trace-db SQLite]
+
+  Discover --> Graph
+  Graph --> Preproc
+  Preproc --> Parse --> Merge --> IR --> PAG --> Solve --> Export
+```
+
+### Stage summary
+
+| Stage | Crate | Input | Output |
+|-------|-------|-------|--------|
+| Discover | `trace-parse` | Root directory | Lists of `.c` and `.h` paths |
+| Include graph | `trace-parse` | File lists | `IncludeGraph` (deps, include dirs, preprocess set) |
+| Preprocess | `trace-preproc` | Source file + options | Expanded source string + `LineMap` |
+| Parse + lower | `trace-parse` | Preprocessed TU | `UnitIndex` (symbols, types, flow, call sites) |
+| Merge | `trace-parse` | Per-TU indices | Single `Program` |
+| Analyze | `trace-analysis` | `Program` | `Pag` + `AnalysisResult` |
+| Export | `trace-db` | Program + analysis | SQLite v1 |
+
+## Translation units and headers
+
+- **Indexed TUs**: only `*.c` files under `<TARGET>`.
+- **Headers**: discovered for the include graph but **not** lowered as standalone TUs. Their declarations appear in preprocessed `.c` output.
+- **Orphan headers** (never `#include`d by any project `.c`) are skipped — they contribute no reachable code.
+- **Cross-TU linking**: external symbols merged by name in `merge_unit_index` (`fn_by_name`). **`static` / internal-linkage** functions and file-scope `static` variables remain **per-file** and are resolved with `resolve_function_in_scope(name, file)` at analysis time.
+
+## Crate dependencies
+
+```mermaid
+flowchart BT
+  CLI[trace-cli]
+  DB[trace-db]
+  Analysis[trace-analysis]
+  Parse[trace-parse]
+  Preproc[trace-preproc]
+  IR[trace-ir]
+
+  CLI --> DB
+  CLI --> Analysis
+  CLI --> Parse
+  CLI --> Preproc
+  DB --> Analysis
+  DB --> IR
+  Analysis --> IR
+  Parse --> Preproc
+  Parse --> IR
+  Preproc --> IR
+```
+
+| Crate | Responsibility |
+|-------|----------------|
+| `trace-ir` | IDs, types, symbol table, `FlowConstraint`, `ReturnFlow`, `Program` |
+| `trace-preproc` | Lexer, directives, macro expansion, `LineMap` |
+| `trace-parse` | Discovery, include graph, tree-sitter parse, IR lowering, TU merge |
+| `trace-analysis` | PAG build, Andersen solver, on-the-fly call graph, arg-flow extraction |
+| `trace-db` | SQLite schema, minimal/full export |
+| `trace-cli` | `analyze`, `inspect` |
+
+## Program IR (`trace-ir`)
+
+After merge, `Program` contains:
+
+| Field | Description |
+|-------|-------------|
+| `symbols` | Files, functions, variables, call sites |
+| `types` | Struct/union layouts, pointer types |
+| `flow` | Lowered assignment facts (`Copy`, `Store`, `GepField`, …) |
+| `fn_returns` | Per-function return-value summaries (`ReturnFlow`) |
+| `diagnostics` | Parse/preprocess warnings |
+| `include_deps` | `#include` edges for debugging |
+
+Lowering (`trace-parse/src/lower.rs`) walks tree-sitter ASTs and emits **flow constraints** — not a full statement-level CFG.
+
+## Analysis artifacts
+
+| Artifact | Description |
+|----------|-------------|
+| `Pag` | Pointer assignment graph: nodes, constraints, abstract locations, solver adjacency index |
+| `AnalysisResult.points_to` | Optional PAG-node → location sets (`--debug-points-to` only) |
+| `AnalysisResult.call_edges` | Resolved direct + indirect call graph edges |
+| `AnalysisResult.arg_flow_edges` | Actual → formal mapping per call site (`actual_var` or `actual_fn` + `formal`) |
+| SQLite | Persisted subset of the above (see export modes below) |
+
+## Export modes
+
+| CLI flag | Effect |
+|----------|--------|
+| *(default)* | Minimal export: functions, filtered call sites, call edges, arg-flow, arg-flow variables only |
+| `--full-export` | All types, all variables, PAG `locations` |
+| `--debug-points-to` | Retain points-to in memory; export `points_to` table |
+
+Indirect call sites **without** resolved edges are still exported in `call_sites` when `is_direct = 0`.
+
+## Threading model
+
+| Phase | Parallelism |
+|-------|-------------|
+| Preprocess cache | `--jobs N` (rayon), shared across TUs |
+| Parse + lower | `--jobs N` per-TU indexing, deterministic merge order |
+| Analysis + export | Single-threaded whole-program |
+
+Default job count: logical CPU count.
+
+## Source locations
+
+Spans are taken from **tree-sitter positions on preprocessed source** (the `.c` file path, expanded line numbers). The preprocessor maintains a `LineMap` for mapping output offsets to original files, but **exported line numbers today match the preprocessed TU**, not necessarily the on-disk file before includes/macros.
+
+## Error handling
+
+- Diagnostics collected per stage → `diagnostics` SQLite table.
+- A failed TU is recorded; the run continues if other TUs succeed.
+- Preprocessor errors on a TU may fall back to raw source read when expansion fails catastrophically.
+
+## Extension points
+
+| Change | Where |
+|--------|-------|
+| Preprocessor directive/macro | `trace-preproc` |
+| New C construct / flow fact | `trace-parse/src/lower.rs`, `trace-ir/src/flow.rs` |
+| New PAG constraint | `ConstraintKind` in `trace-analysis`, handler in `pag.rs` + `solver.rs` |
+| Return / call semantics | `ReturnFlow`, `CallReturn`, `pag.expand_return_flows` |
+| Libc summary | `trace-analysis/src/summaries.rs` |
+| SQLite column/table | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
+
+See [ANALYSIS.md](ANALYSIS.md) for algorithm details and [AGENTS.md](../AGENTS.md) for contributor invariants.

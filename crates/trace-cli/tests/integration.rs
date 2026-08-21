@@ -1,0 +1,72 @@
+//! Integration tests for the trace workspace.
+
+use std::path::PathBuf;
+use trace_analysis::analyze;
+use trace_db::{export_to_sqlite, open_db, ExportOptions};
+use trace_parse::build_program;
+use trace_preproc::PreprocessOptions;
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(name)
+}
+
+#[test]
+fn direct_call_fixture() {
+    let root = fixture("direct_call");
+    let opts = PreprocessOptions::new().with_include(root.clone());
+    let include_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/include");
+    let opts = opts.with_include(include_dir);
+    let program = build_program(&root, &opts).expect("build program");
+    assert!(program.symbols.functions.iter().any(|f| f.name == "main"));
+    assert!(program.symbols.functions.iter().any(|f| f.name == "helper"));
+
+    let (_pag, analysis) = analyze(&program);
+    assert!(!analysis.call_edges.is_empty());
+    assert!(analysis
+        .call_edges
+        .iter()
+        .any(|e| program.symbols.function(e.caller).name == "main"));
+}
+
+#[test]
+fn export_sqlite_roundtrip() {
+    let root = fixture("direct_call");
+    let opts = PreprocessOptions::new().with_include(root.clone());
+    let include_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/include");
+    let opts = opts.with_include(include_dir);
+    let program = build_program(&root, &opts).unwrap();
+    let (_pag, analysis) = analyze(&program);
+
+    let out = std::env::temp_dir().join(format!("trace_test_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    export_to_sqlite(
+        &program,
+        None,
+        &analysis,
+        &ExportOptions {
+            output: out.clone(),
+            include_points_to: false,
+            full_detail: false,
+        },
+    )
+    .unwrap();
+
+    let conn = open_db(&out).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))
+        .unwrap();
+    assert!(count >= 1);
+    let _ = std::fs::remove_file(out);
+}
+
+#[test]
+fn preproc_if0_dead_branch() {
+    let path = fixture("preproc/if0.c");
+    let result = trace_preproc::preprocess_file(&path, &PreprocessOptions::new()).unwrap();
+    assert!(!result.output.contains("42"));
+    assert!(result.output.contains("visible = 1") || result.output.contains("int visible"));
+}

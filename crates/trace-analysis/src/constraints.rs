@@ -1,0 +1,67 @@
+use trace_ir::{FieldId, LocId, PagNodeId, VarId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConstraintKind {
+    Copy,
+    AddrOf,
+    Load,
+    Store,
+    Gep,
+}
+
+#[derive(Debug, Clone)]
+pub struct Constraint {
+    pub kind: ConstraintKind,
+    pub dst: PagNodeId,
+    pub src: PagNodeId,
+    pub field: Option<FieldId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionKind {
+    Direct,
+    Indirect,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallGraphEdge {
+    pub call_site: trace_ir::CallSiteId,
+    pub caller: trace_ir::FnId,
+    pub callee: trace_ir::FnId,
+    pub resolution: ResolutionKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArgFlowEdge {
+    pub call_site: trace_ir::CallSiteId,
+    pub arg_index: u32,
+    pub actual_var: Option<VarId>,
+    pub actual_fn: Option<trace_ir::FnId>,
+    pub formal: VarId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocKind {
+    Global,
+    FileStatic,
+    FnStatic,
+    Local,
+    Heap,
+    Field,
+    /// Merged field storage across all instances of a struct type (may-analysis).
+    FieldSummary,
+    ArraySummary,
+    Function,
+}
+
+#[derive(Debug, Clone)]
+pub struct AbstractLocation {
+    pub id: LocId,
+    pub kind: LocKind,
+    pub var: Option<VarId>,
+    pub fn_id: Option<trace_ir::FnId>,
+    pub field: Option<FieldId>,
+    pub type_id: trace_ir::TypeId,
+    pub desc: String,
+}

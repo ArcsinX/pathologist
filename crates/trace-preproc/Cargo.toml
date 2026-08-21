@@ -1,0 +1,11 @@
+[package]
+name = "trace-preproc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trace-ir = { workspace = true }
+anyhow.workspace = true
+indexmap.workspace = true
+regex.workspace = true
+thiserror.workspace = true

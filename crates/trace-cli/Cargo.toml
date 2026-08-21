@@ -1,0 +1,20 @@
+[package]
+name = "trace-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "trace"
+path = "src/main.rs"
+
+[dependencies]
+trace-analysis = { workspace = true }
+trace-db = { workspace = true }
+trace-ir = { workspace = true }
+trace-parse = { workspace = true }
+trace-preproc = { workspace = true }
+anyhow.workspace = true
+clap.workspace = true
+indexmap.workspace = true
+rusqlite.workspace = true
+walkdir.workspace = true

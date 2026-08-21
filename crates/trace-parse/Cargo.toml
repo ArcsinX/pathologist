@@ -1,0 +1,15 @@
+[package]
+name = "trace-parse"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trace-ir = { workspace = true }
+trace-preproc = { workspace = true }
+anyhow.workspace = true
+indexmap.workspace = true
+thiserror.workspace = true
+tree-sitter.workspace = true
+tree-sitter-c.workspace = true
+walkdir.workspace = true
+rayon.workspace = true

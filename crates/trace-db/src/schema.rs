@@ -1,0 +1,96 @@
+pub const SCHEMA_V1: &str = r#"
+CREATE TABLE IF NOT EXISTS analysis_run (
+    id INTEGER PRIMARY KEY,
+    trace_version TEXT NOT NULL,
+    target_root TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    options_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    sha256 TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS functions (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    file_id INTEGER NOT NULL REFERENCES files(id),
+    line_start INTEGER NOT NULL,
+    line_end INTEGER NOT NULL,
+    linkage TEXT NOT NULL,
+    signature TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS types (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    layout_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS variables (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    fn_id INTEGER REFERENCES functions(id),
+    type_id INTEGER NOT NULL REFERENCES types(id),
+    file_id INTEGER NOT NULL REFERENCES files(id),
+    line INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS call_sites (
+    id INTEGER PRIMARY KEY,
+    caller_fn_id INTEGER NOT NULL REFERENCES functions(id),
+    file_id INTEGER NOT NULL REFERENCES files(id),
+    line INTEGER NOT NULL,
+    col INTEGER NOT NULL,
+    callee_text TEXT NOT NULL,
+    is_direct INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS call_edges (
+    id INTEGER PRIMARY KEY,
+    call_site_id INTEGER NOT NULL REFERENCES call_sites(id),
+    callee_fn_id INTEGER NOT NULL REFERENCES functions(id),
+    resolution TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS arg_flow_edges (
+    id INTEGER PRIMARY KEY,
+    call_site_id INTEGER NOT NULL REFERENCES call_sites(id),
+    arg_index INTEGER NOT NULL,
+    actual_var_id INTEGER REFERENCES variables(id),
+    actual_fn_id INTEGER REFERENCES functions(id),
+    formal_var_id INTEGER NOT NULL REFERENCES variables(id)
+);
+
+CREATE TABLE IF NOT EXISTS locations (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    desc TEXT NOT NULL,
+    type_id INTEGER REFERENCES types(id)
+);
+
+CREATE TABLE IF NOT EXISTS points_to (
+    var_node_id INTEGER NOT NULL,
+    loc_id INTEGER NOT NULL REFERENCES locations(id),
+    PRIMARY KEY (var_node_id, loc_id)
+);
+
+CREATE TABLE IF NOT EXISTS diagnostics (
+    id INTEGER PRIMARY KEY,
+    severity TEXT NOT NULL,
+    file_id INTEGER REFERENCES files(id),
+    line INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    stage TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_fn_id);
+CREATE INDEX IF NOT EXISTS idx_call_edges_callsite ON call_edges(call_site_id);
+CREATE INDEX IF NOT EXISTS idx_arg_flow_callsite ON arg_flow_edges(call_site_id);
+CREATE INDEX IF NOT EXISTS idx_functions_name ON functions(name);
+"#;

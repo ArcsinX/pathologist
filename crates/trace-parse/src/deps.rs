@@ -1,0 +1,325 @@
+use indexmap::IndexMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+
+/// `#include` edge: dependent file → included project file (canonical paths).
+#[derive(Debug, Clone, Default)]
+pub struct IncludeGraph {
+    pub root: PathBuf,
+    /// All `.c` / `.h` files under the analyzed root (canonical).
+    pub project_files: HashSet<PathBuf>,
+    /// Direct local include dependencies (dependent → included).
+    pub edges: IndexMap<PathBuf, Vec<PathBuf>>,
+    /// Search paths for `"..."` / `<...>` includes (project-local dirs).
+    pub include_dirs: Vec<PathBuf>,
+    /// Project files that should run through the preprocessor (have or receive `#include`s).
+    pub needs_preprocess: HashSet<PathBuf>,
+    /// Raw source text loaded while building the include graph (canonical paths).
+    pub source_cache: HashMap<PathBuf, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncludeKind {
+    Local,
+    System,
+}
+
+#[derive(Debug, Clone)]
+struct IncludeRef {
+    kind: IncludeKind,
+    path: String,
+}
+
+impl IncludeGraph {
+    pub fn build(root: &Path, c_files: &[PathBuf], h_files: &[PathBuf]) -> Self {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let mut project_files: HashSet<PathBuf> = HashSet::new();
+        for p in c_files.iter().chain(h_files.iter()) {
+            project_files.insert(canonicalize(p));
+        }
+
+        let include_dirs = discover_include_dirs(&root, h_files);
+
+        let mut edges: IndexMap<PathBuf, Vec<PathBuf>> = IndexMap::new();
+        let mut source_cache: HashMap<PathBuf, String> = HashMap::new();
+        for path in project_files.iter() {
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            source_cache.insert(path.clone(), content.clone());
+            let mut deps = Vec::new();
+            for inc in scan_includes(&content) {
+                if let Some(resolved) = resolve_include(path, &inc, &include_dirs, &root) {
+                    let canon = canonicalize(&resolved);
+                    if project_files.contains(&canon) {
+                        deps.push(canon);
+                    }
+                }
+            }
+            deps.sort();
+            deps.dedup();
+            if !deps.is_empty() {
+                edges.insert(path.clone(), deps);
+            }
+        }
+
+        let needs_preprocess = Self::compute_needs_preprocess(&edges, &project_files);
+
+        Self {
+            root,
+            project_files,
+            edges,
+            include_dirs,
+            needs_preprocess,
+            source_cache,
+        }
+    }
+
+    fn compute_needs_preprocess(
+        edges: &IndexMap<PathBuf, Vec<PathBuf>>,
+        project_files: &HashSet<PathBuf>,
+    ) -> HashSet<PathBuf> {
+        let mut set = HashSet::new();
+        for dep in edges.keys() {
+            set.insert(dep.clone());
+        }
+        for targets in edges.values() {
+            for t in targets {
+                set.insert(t.clone());
+            }
+        }
+        let _ = project_files;
+        set
+    }
+
+    /// Files that should be preprocessed/expanded: any project file with `#include` or included by another.
+    pub fn files_needing_includes(&self) -> &HashSet<PathBuf> {
+        &self.needs_preprocess
+    }
+
+    /// Topological index order: dependencies before dependents.
+    /// `files` must use the same canonical paths as [`IncludeGraph::project_files`].
+    pub fn index_order(&self, files: &[PathBuf]) -> Vec<PathBuf> {
+        let file_set: HashSet<PathBuf> = files.iter().cloned().collect();
+
+        let mut in_degree: IndexMap<PathBuf, usize> = IndexMap::new();
+        for f in files {
+            in_degree.entry(f.clone()).or_insert(0);
+        }
+        for (dep, incs) in &self.edges {
+            if !file_set.contains(dep) {
+                continue;
+            }
+            for inc in incs {
+                if file_set.contains(inc) {
+                    *in_degree.entry(dep.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut reverse: IndexMap<PathBuf, Vec<PathBuf>> = IndexMap::new();
+        for (dep, incs) in &self.edges {
+            if !file_set.contains(dep) {
+                continue;
+            }
+            for inc in incs {
+                if file_set.contains(inc) {
+                    reverse.entry(inc.clone()).or_default().push(dep.clone());
+                }
+            }
+        }
+
+        let mut queue: VecDeque<PathBuf> = in_degree
+            .iter()
+            .filter(|(_, deg)| **deg == 0)
+            .map(|(f, _)| f.clone())
+            .collect();
+        queue.make_contiguous().sort();
+
+        let mut order = Vec::with_capacity(files.len());
+        while let Some(node) = queue.pop_front() {
+            order.push(node.clone());
+            if let Some(dependents) = reverse.get(&node) {
+                for dep in dependents {
+                    if let Some(deg) = in_degree.get_mut(dep) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            queue.push_back(dep.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        for f in files {
+            if !order.contains(f) {
+                order.push(f.clone());
+            }
+        }
+        order
+    }
+
+    /// All project files transitively reachable from `sources` via `#include` edges.
+    pub fn reachable_from(&self, sources: &HashSet<PathBuf>) -> HashSet<PathBuf> {
+        let mut seen = HashSet::new();
+        let mut queue: VecDeque<PathBuf> = sources.iter().cloned().collect();
+        while let Some(node) = queue.pop_front() {
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            if let Some(includes) = self.edges.get(&node) {
+                for inc in includes {
+                    if self.project_files.contains(inc) {
+                        queue.push_back(inc.clone());
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    pub fn edge_list(&self) -> Vec<(PathBuf, PathBuf)> {
+        let mut out = Vec::new();
+        for (from, tos) in &self.edges {
+            for to in tos {
+                out.push((from.clone(), to.clone()));
+            }
+        }
+        out
+    }
+}
+
+fn canonicalize(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn discover_include_dirs(root: &Path, headers: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs: HashSet<PathBuf> = HashSet::new();
+    dirs.insert(canonicalize(root));
+    for h in headers {
+        if let Some(parent) = h.parent() {
+            dirs.insert(canonicalize(parent));
+        }
+    }
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_dir())
+    {
+        if entry.file_name() == "include" {
+            dirs.insert(canonicalize(entry.path()));
+        }
+    }
+    let mut v: Vec<PathBuf> = dirs.into_iter().collect();
+    v.sort();
+    v
+}
+
+fn scan_includes(source: &str) -> Vec<IncludeRef> {
+    let mut out = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("#include") {
+            continue;
+        }
+        let rest = trimmed["#include".len()..].trim();
+        if let Some(path) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            out.push(IncludeRef {
+                kind: IncludeKind::Local,
+                path: path.to_string(),
+            });
+        } else if let Some(path) = rest.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+            out.push(IncludeRef {
+                kind: IncludeKind::System,
+                path: path.to_string(),
+            });
+        }
+    }
+    out
+}
+
+fn resolve_include(
+    from: &Path,
+    inc: &IncludeRef,
+    include_dirs: &[PathBuf],
+    root: &Path,
+) -> Option<PathBuf> {
+    let candidates = match inc.kind {
+        IncludeKind::Local => {
+            let mut c = Vec::new();
+            if let Some(parent) = from.parent() {
+                c.push(parent.join(&inc.path));
+            }
+            for dir in include_dirs {
+                c.push(dir.join(&inc.path));
+            }
+            c
+        }
+        IncludeKind::System => include_dirs.iter().map(|dir| dir.join(&inc.path)).collect(),
+    };
+
+    for cand in candidates {
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+
+    // Last resort: unique match under project root by filename.
+    let name = Path::new(&inc.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string());
+    if let Some(name) = name {
+        let mut matches = Vec::new();
+        for entry in WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            if entry.file_name().to_string_lossy() == name {
+                matches.push(entry.path().to_path_buf());
+            }
+        }
+        if matches.len() == 1 {
+            return Some(matches[0].clone());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn include_graph_resolves_local_and_orders() {
+        let tmp = std::env::temp_dir().join(format!("trace_deps_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("api.h"), "struct S { int x; };\n").unwrap();
+        fs::write(
+            tmp.join("main.c"),
+            "#include \"api.h\"\nint f() { return 0; }\n",
+        )
+        .unwrap();
+
+        let c = vec![tmp.join("main.c")];
+        let h = vec![tmp.join("api.h")];
+        let g = IncludeGraph::build(&tmp, &c, &h);
+        assert_eq!(g.edges.len(), 1);
+        let deps = g.edges.get(&canonicalize(&tmp.join("main.c"))).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0], canonicalize(&tmp.join("api.h")));
+
+        let all = [
+            canonicalize(&tmp.join("api.h")),
+            canonicalize(&tmp.join("main.c")),
+        ];
+        let order = g.index_order(&all);
+        assert_eq!(order[0], canonicalize(&tmp.join("api.h")));
+        assert_eq!(order[1], canonicalize(&tmp.join("main.c")));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}

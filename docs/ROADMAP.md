@@ -1,0 +1,119 @@
+# Roadmap
+
+## Completed milestones
+
+### M0 — Skeleton & docs ✅
+
+- Cargo workspace (6 crates)
+- README, AGENTS.md, docs/
+- Fixture: `tests/fixtures/direct_call/`
+
+### M1 — Preprocessor P0 ✅
+
+- Lexer, `#include`, `#define`, conditionals
+- `LineMap`
+- Function-like macros (non-variadic), `##` pasting
+
+### M2 — Parse to IR ✅
+
+- tree-sitter-c integration
+- Function/global/parameter extraction, call site collection
+- Per-TU indexing + `merge_unit_index`
+- Include graph (`IncludeGraph`), orphan-header skip
+
+### M3 — Andersen MVP ✅
+
+- Copy/AddrOf/Load/Store from IR flow
+- Direct call graph
+- SQLite export
+
+### M4 — Field sensitivity ✅
+
+- `GepField` → PAG `Gep`
+- `Field` + **`FieldSummary`** locations
+- Global/static/local location kinds
+- Field-summary fallback when base `pts` is empty (vtable / param pointer patterns)
+
+### M5 — Indirect calls + arg-flow ✅
+
+- On-the-fly call graph for indirect calls
+- Multi-hop field path callees (`p->ops->fn`)
+- Designated initializer fn-ptr stores
+- Param `Copy` wiring + `arg_flow_edges`
+- Export unresolved indirect call sites
+
+### M6 — Hardening ✅
+
+- Diagnostics table
+- `trace inspect` CLI
+- Integration + adversarial fixtures
+- Libc summary stubs (`summaries.rs`)
+
+### M7 — Scale + export ✅
+
+- Parallel TU indexing (`--jobs`)
+- Parallel preprocess cache
+- Solver adjacency index + `loc_nodes` reverse index
+- Minimal SQLite export (default)
+- `--full-export`, `--debug-points-to`
+- Lazy abstract locations for locals/params
+
+### M8 — Return-value flow ✅
+
+- `ReturnFlow` / `program.fn_returns`
+- `CallReturn` flow constraint (callee resolved by name at PAG build)
+- Models `field = Getter()` and cross-TU getter functions
+- Field RHS store via temp + `Store` (fixes `&Fn` designated init)
+
+### M9 — Static linkage + arg-flow ✅
+
+- Scope-aware resolution for **`static` / internal** functions (direct calls + `CallReturn`)
+- Function-pointer actuals in **`arg_flow_edges`** (`actual_fn_id` column)
+- Function-local **`static`** variables classified as `FnStatic` (not `Local`)
+- Fixtures: `static_direct_call/`, `static_call_return/`, `fn_arg_flow/`, `fn_static_local/`
+
+## In progress / next
+
+| Item | Notes |
+|------|-------|
+| **`memcpy` / `memmove` summaries** | Registered but no-op; blocks fn-ptr-through-memcpy patterns |
+| **Original-source line remapping** | `LineMap` exists; export still uses preprocessed lines |
+| **`compile_commands.json`** | Include paths / defines today via CLI only |
+| **Heap allocation modeling** | `malloc` family stubs don't allocate fresh locs yet |
+| **C++ translation units** | `.cpp` adapters (e.g. HIPC sbuf) not indexed |
+| **Variadic macros** | `__VA_ARGS__`, `#` stringize |
+| **Constant array index refinement** | Avoid merging all fn-ptr table slots |
+| **Points-to visualization** | Beyond `--debug-points-to` SQL dump |
+
+## Non-goals (v1)
+
+- Control-flow / path sensitivity
+- Using gcc/clang as primary preprocessor
+- Flow-sensitive analysis without explicit design approval
+- Sound must-analysis (under-approximation)
+
+## Performance targets
+
+| Corpus | Index | Analyze | Export (minimal) |
+|--------|-------|---------|------------------|
+| HDF `drivers_hdf_core` (~600 `.c`) | ~25s | ~0.3s | ~0.1s |
+
+Further index-time wins: smarter header/preprocess skipping, incremental TU cache.
+
+## Fixture coverage map
+
+| Pattern | Fixture |
+|---------|---------|
+| Direct call | `direct_call/` |
+| Fn-ptr init | `fn_ptr_init/`, `fn_ptr_designated/` |
+| Field assign + call | `fn_ptr_field/` |
+| Multi-hop vtable | `fn_ptr_vtable/` |
+| Indirect param | `indirect_param/` |
+| SubDevice ops + call return | `camera_subdev_ops/` |
+| Static direct / call-return | `static_direct_call/`, `static_call_return/` |
+| Fn-ptr arg flow | `fn_arg_flow/` |
+| Function-local static | `fn_static_local/` |
+| Preprocessor | `tests/fixtures/preproc/` |
+| Adversarial / limitations | `tests/fixtures/adversarial_*`, `macro_*` |
+
+Run: `cargo test --workspace`

@@ -1,0 +1,349 @@
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenKind {
+    Identifier(String),
+    Number(String),
+    String(String),
+    Char(String),
+    Punct(String),
+    Hash, // #
+    Newline,
+    Eof,
+}
+
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub line: u32,
+    pub col: u32,
+}
+
+pub struct Lexer<'a> {
+    input: &'a str,
+    pos: usize,
+    line: u32,
+    col: u32,
+}
+
+impl<'a> Lexer<'a> {
+    pub fn new(input: &'a str) -> Self {
+        Self {
+            input,
+            pos: 0,
+            line: 1,
+            col: 1,
+        }
+    }
+
+    pub fn tokenize(mut self) -> Vec<Token> {
+        let mut tokens = Vec::new();
+        loop {
+            let tok = self.next_token();
+            let is_eof = matches!(tok.kind, TokenKind::Eof);
+            tokens.push(tok);
+            if is_eof {
+                break;
+            }
+        }
+        tokens
+    }
+
+    fn next_token(&mut self) -> Token {
+        self.skip_whitespace_and_comments();
+        let line = self.line;
+        let col = self.col;
+
+        if self.is_at_end() {
+            return Token {
+                kind: TokenKind::Eof,
+                line,
+                col,
+            };
+        }
+
+        let ch = self.peek_char();
+
+        if ch == '\n' {
+            self.advance_char();
+            return Token {
+                kind: TokenKind::Newline,
+                line,
+                col,
+            };
+        }
+
+        if ch == '#' {
+            if self.peek_char_at(1) == '#' {
+                self.advance_char();
+                self.advance_char();
+                return Token {
+                    kind: TokenKind::Punct("##".to_string()),
+                    line,
+                    col,
+                };
+            }
+            self.advance_char();
+            return Token {
+                kind: TokenKind::Hash,
+                line,
+                col,
+            };
+        }
+
+        if ch == '"' {
+            return self.read_string(line, col);
+        }
+
+        if ch == '\'' {
+            return self.read_char(line, col);
+        }
+
+        if ch.is_ascii_digit() {
+            return self.read_number(line, col);
+        }
+
+        if is_ident_start(ch) {
+            return self.read_identifier(line, col);
+        }
+
+        if "+-<>=!&|^~*/%.,;:()[]{}?\\".contains(ch) {
+            let mut s = String::new();
+            s.push(ch);
+            self.advance_char();
+            // two-char operators
+            if self.pos < self.input.len() {
+                let two = format!("{}{}", s, self.peek_char());
+                if matches!(
+                    two.as_str(),
+                    "<<" | ">>"
+                        | "<="
+                        | ">="
+                        | "=="
+                        | "!="
+                        | "&&"
+                        | "||"
+                        | "++"
+                        | "--"
+                        | "+="
+                        | "-="
+                        | "*="
+                        | "/="
+                        | "%="
+                        | "&="
+                        | "|="
+                        | "^="
+                        | "->"
+                ) {
+                    s = two;
+                    self.advance_char();
+                }
+            }
+            return Token {
+                kind: TokenKind::Punct(s),
+                line,
+                col,
+            };
+        }
+
+        // Unknown char - skip
+        self.advance_char();
+        self.next_token()
+    }
+
+    fn read_string(&mut self, line: u32, col: u32) -> Token {
+        let mut s = String::new();
+        self.advance_char(); // opening "
+        while !self.is_at_end() && self.peek_char() != '"' {
+            if self.peek_char() == '\\' {
+                s.push('\\');
+                self.advance_char();
+                if !self.is_at_end() {
+                    s.push(self.peek_char());
+                    self.advance_char();
+                }
+            } else if self.peek_char() == '\n' {
+                break;
+            } else {
+                s.push(self.peek_char());
+                self.advance_char();
+            }
+        }
+        if !self.is_at_end() && self.peek_char() == '"' {
+            self.advance_char();
+        }
+        Token {
+            kind: TokenKind::String(s),
+            line,
+            col,
+        }
+    }
+
+    fn read_char(&mut self, line: u32, col: u32) -> Token {
+        let mut s = String::new();
+        self.advance_char();
+        while !self.is_at_end() && self.peek_char() != '\'' {
+            if self.peek_char() == '\\' {
+                s.push('\\');
+                self.advance_char();
+                if !self.is_at_end() {
+                    s.push(self.peek_char());
+                    self.advance_char();
+                }
+            } else {
+                s.push(self.peek_char());
+                self.advance_char();
+            }
+        }
+        if !self.is_at_end() {
+            self.advance_char();
+        }
+        Token {
+            kind: TokenKind::Char(s),
+            line,
+            col,
+        }
+    }
+
+    fn read_number(&mut self, line: u32, col: u32) -> Token {
+        let mut s = String::new();
+        while !self.is_at_end() {
+            let ch = self.peek_char();
+            if ch.is_ascii_alphanumeric()
+                || ch == '.'
+                || ch == 'x'
+                || ch == 'X'
+                || ch == 'u'
+                || ch == 'U'
+                || ch == 'l'
+                || ch == 'L'
+            {
+                s.push(ch);
+                self.advance_char();
+            } else {
+                break;
+            }
+        }
+        Token {
+            kind: TokenKind::Number(s),
+            line,
+            col,
+        }
+    }
+
+    fn read_identifier(&mut self, line: u32, col: u32) -> Token {
+        let mut s = String::new();
+        while !self.is_at_end() {
+            let ch = self.peek_char();
+            if is_ident_continue(ch) {
+                s.push(ch);
+                self.advance_char();
+            } else {
+                break;
+            }
+        }
+        Token {
+            kind: TokenKind::Identifier(s),
+            line,
+            col,
+        }
+    }
+
+    fn skip_whitespace_and_comments(&mut self) {
+        loop {
+            if self.is_at_end() {
+                return;
+            }
+            let ch = self.peek_char();
+            if ch == ' ' || ch == '\t' || ch == '\r' {
+                self.advance_char();
+                continue;
+            }
+            if ch == '/' && self.peek_char_at(1) == '/' {
+                while !self.is_at_end() && self.peek_char() != '\n' {
+                    self.advance_char();
+                }
+                continue;
+            }
+            if ch == '/' && self.peek_char_at(1) == '*' {
+                self.advance_char();
+                self.advance_char();
+                while !self.is_at_end() {
+                    if self.peek_char() == '*' && self.peek_char_at(1) == '/' {
+                        self.advance_char();
+                        self.advance_char();
+                        break;
+                    }
+                    self.advance_char();
+                }
+                continue;
+            }
+            break;
+        }
+    }
+
+    fn peek_char(&self) -> char {
+        self.input[self.pos..].chars().next().unwrap_or('\0')
+    }
+
+    fn peek_char_at(&self, offset: usize) -> char {
+        self.input[self.pos..].chars().nth(offset).unwrap_or('\0')
+    }
+
+    fn advance_char(&mut self) {
+        if self.is_at_end() {
+            return;
+        }
+        let ch = self.peek_char();
+        self.pos += ch.len_utf8();
+        if ch == '\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+    }
+
+    fn is_at_end(&self) -> bool {
+        self.pos >= self.input.len()
+    }
+}
+
+fn is_ident_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_'
+}
+
+fn is_ident_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+impl fmt::Display for TokenKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenKind::Identifier(s) => write!(f, "id({s})"),
+            TokenKind::Number(s) => write!(f, "num({s})"),
+            TokenKind::String(s) => write!(f, "str({s})"),
+            TokenKind::Char(s) => write!(f, "char({s})"),
+            TokenKind::Punct(s) => write!(f, "{s}"),
+            TokenKind::Hash => write!(f, "#"),
+            TokenKind::Newline => write!(f, "\\n"),
+            TokenKind::Eof => write!(f, "EOF"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lexes_simple_c() {
+        let tokens = Lexer::new("int x = 42;").tokenize();
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "int")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Number(s) if s == "42")));
+    }
+}

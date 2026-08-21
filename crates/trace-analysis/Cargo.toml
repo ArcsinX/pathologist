@@ -1,0 +1,11 @@
+[package]
+name = "trace-analysis"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+trace-ir = { workspace = true }
+indexmap.workspace = true
+petgraph.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
