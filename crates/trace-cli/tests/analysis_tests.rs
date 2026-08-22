@@ -446,35 +446,25 @@ fn header_inline_call_indexed_from_header_unit() {
         "call inside header-only inline function should resolve"
     );
     assert!(
-        !program
+        program
             .symbols
             .files
             .iter()
             .any(|f| f.path.ends_with("helper.h")),
-        "helper.h is reachable from main.c and must not be indexed as a separate unit"
+        "helper.h is included by main.c and must appear as an attributed origin file"
     );
 }
 
 #[test]
-fn header_chain_reachable_from_c_not_indexed_separately() {
+fn header_chain_reachable_from_c_attributed_to_headers() {
     let root = fixture("header_chain");
     let program = build_program(&root, &default_opts(&root)).expect("build");
 
+    // Headers reachable from a .c are no longer separate indexing units,
+    // but they must appear as origin files for their lowered entities.
     assert!(
-        !program
-            .symbols
-            .files
-            .iter()
-            .any(|f| f.path.ends_with("chain_b.h")),
-        "chain_b.h is reachable from main.c via chain_a.h and must not be a separate unit"
-    );
-    assert!(
-        !program
-            .symbols
-            .files
-            .iter()
-            .any(|f| f.path.ends_with("chain_a.h")),
-        "chain_a.h is reachable from main.c and must not be a separate unit"
+        program.symbols.files.iter().any(|f| f.path.ends_with("chain_b.h")),
+        "chain_b.h must be an attributed origin file"
     );
     let b_caller = program
         .symbols
@@ -486,9 +476,9 @@ fn header_chain_reachable_from_c_not_indexed_separately() {
         program
             .symbols
             .files
-            .get(b_caller.file.0 as usize)
-            .is_some_and(|fi| fi.path.ends_with("main.c")),
-        "BCaller should be attributed to the translation unit, not chain_b.h"
+            .get(b_caller.span.file.0 as usize)
+            .is_some_and(|fi| fi.path.ends_with("chain_b.h")),
+        "BCaller should be attributed to its defining header, not the translation unit"
     );
 }
 
@@ -496,8 +486,7 @@ fn header_chain_reachable_from_c_not_indexed_separately() {
 #[cfg(unix)]
 fn macro_warm_preprocess_failure_is_nonfatal() {
     use std::os::unix::fs::PermissionsExt;
-    let root =
-        std::env::temp_dir().join(format!("trace_warm_test_{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("trace_warm_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
@@ -528,7 +517,11 @@ fn macro_warm_preprocess_failure_is_nonfatal() {
         program.diagnostics
     );
     assert!(
-        program.symbols.functions.iter().any(|f| f.name == "main_fn"),
+        program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "main_fn"),
         "main.c should still be indexed after macro warm failure"
     );
 }

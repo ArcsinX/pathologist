@@ -6,7 +6,7 @@ fn dump_designated_init_kinds() {
 static struct Ops { void (*handler)(int *); } g_ops = { .handler = target };
 static void target(int *p) { (void)p; }
 "#;
-    let parsed = parse_c_source(src.to_string()).unwrap();
+    let parsed = parse_c_source(src).unwrap();
     let root = parsed.tree.root_node();
     fn find_init(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
         if node.kind() == "init_declarator" {

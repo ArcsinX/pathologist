@@ -18,6 +18,10 @@ struct LowerContext {
     current_fn: Option<FnId>,
     current_file: trace_ir::FileId,
     locals: HashMap<String, VarId>,
+    /// Origin map for the preprocessed text being lowered. Lookup failures
+    /// fall back to TU-anchored spans.
+    line_map: Option<std::sync::Arc<trace_preproc::LineMap>>,
+    primary_path: PathBuf,
 }
 
 fn register_local(ctx: &mut LowerContext, name: String, id: VarId) {
@@ -65,11 +69,16 @@ pub fn build_program_with_jobs(
         .with_include_expansion_cache(Arc::clone(&include_expansion_cache))
         .with_basename_index(basename_index);
 
-    let shared_macros = Arc::new(std::sync::RwLock::new(macro_table_from_defines(&opts.defines)));
+    let shared_macros = Arc::new(std::sync::RwLock::new(macro_table_from_defines(
+        &opts.defines,
+    )));
     let project_headers: Vec<PathBuf> = include_graph
         .project_files
         .iter()
-        .filter(|p| p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("h")))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("h"))
+        })
         .cloned()
         .collect();
     let c_sources: HashSet<PathBuf> = files.iter().cloned().collect();
@@ -102,16 +111,19 @@ pub fn build_program_with_jobs(
                 severity: DiagnosticSeverity::Warning,
                 file: None,
                 line: 0,
-                message: format!(
-                    "macro warm preprocess failed for {}: {e}",
-                    path.display()
-                ),
+                message: format!("macro warm preprocess failed for {}: {e}", path.display()),
                 stage: "preprocess".into(),
             });
         }
     }
 
-    let index_opts = eff_opts.with_shared_macros(shared_macros);
+    // Parallel phases must treat the expansion cache as read-only: warm-pass
+    // entries were produced sequentially and deterministically, while worker
+    // inserts are first-writer-wins races that make output scheduling-
+    // dependent. Misses expand inline under each TU's own macro/guard state.
+    let index_opts = eff_opts
+        .with_shared_macros(shared_macros)
+        .with_frozen_expansion_cache(true);
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(jobs)
@@ -124,13 +136,7 @@ pub fn build_program_with_jobs(
             .map(|path| {
                 (
                     path.clone(),
-                    index_source_file(
-                        path,
-                        root,
-                        &include_graph,
-                        &index_opts,
-                        &source_cache,
-                    ),
+                    index_source_file(path, root, &include_graph, &index_opts, &source_cache),
                 )
             })
             .collect();
@@ -146,13 +152,7 @@ pub fn build_program_with_jobs(
             for path in &file_order {
                 merge_unit_index(
                     &mut program,
-                    index_source_file(
-                        path,
-                        root,
-                        &include_graph,
-                        &index_opts,
-                        &source_cache,
-                    ),
+                    index_source_file(path, root, &include_graph, &index_opts, &source_cache),
                 );
             }
         } else {
@@ -161,13 +161,7 @@ pub fn build_program_with_jobs(
                 .map(|path| {
                     (
                         path.clone(),
-                        index_source_file(
-                            path,
-                            root,
-                            &include_graph,
-                            &index_opts,
-                            &source_cache,
-                        ),
+                        index_source_file(path, root, &include_graph, &index_opts, &source_cache),
                     )
                 })
                 .collect();
@@ -222,13 +216,7 @@ fn index_source_file(
     source_cache: &IndexSourceCache,
 ) -> UnitIndex {
     let mut program = Program::new(root.to_path_buf());
-    match process_indexed_file(
-        &mut program,
-        path,
-        graph,
-        index_opts,
-        source_cache,
-    ) {
+    match process_indexed_file(&mut program, path, graph, index_opts, source_cache) {
         Ok(()) => program_into_unit(path.to_path_buf(), program),
         Err(e) => UnitIndex {
             path: path.to_path_buf(),
@@ -251,8 +239,8 @@ fn process_indexed_file(
     index_opts: &PreprocessOptions,
     source_cache: &IndexSourceCache,
 ) -> Result<(), String> {
-    let source = source_cache.get_or_preprocess(path, graph, index_opts)?;
-    let parsed = parse_c_source(source.as_ref())?;
+    let pre = source_cache.get_or_preprocess(path, graph, index_opts)?;
+    let parsed = parse_c_source(pre.text.as_ref())?;
     if crate::parse::has_parse_errors(&parsed.tree) {
         program.add_diagnostic(Diagnostic {
             severity: DiagnosticSeverity::Warning,
@@ -268,6 +256,8 @@ fn process_indexed_file(
         current_fn: None,
         current_file: file_id,
         locals: HashMap::new(),
+        line_map: Some(std::sync::Arc::clone(&pre.line_map)),
+        primary_path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
     };
     lower_tree(program, &mut ctx, &parsed.source, parsed.tree.root_node());
     Ok(())
@@ -275,6 +265,12 @@ fn process_indexed_file(
 
 fn program_into_unit(path: PathBuf, program: Program) -> UnitIndex {
     UnitIndex {
+        files: program
+            .symbols
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect(),
         path,
         types: program.types,
         functions: program.symbols.functions,
@@ -403,6 +399,7 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
 
     let is_static = declaration_is_static(source, node);
 
+    let span = node_span(program, ctx, node);
     let fn_id = program.symbols.add_function(Function {
         id: provisional_id,
         name: name.clone(),
@@ -414,7 +411,7 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
         return_type: ret_type,
         params: params.clone(),
         locals: Vec::new(),
-        span: node_span(ctx, node),
+        span,
         file: ctx.current_file,
         is_defined: true,
     });
@@ -459,6 +456,7 @@ fn lower_parameter(
     };
     let type_id = program.types.intern(type_desc);
     let var_id = program.symbols.alloc_var_id();
+    let span = node_span(program, ctx, node);
     program.symbols.add_variable(Variable {
         id: var_id,
         name: name.clone(),
@@ -466,7 +464,7 @@ fn lower_parameter(
         storage: StorageClass::Param,
         fn_id: Some(fn_id),
         param_index: Some(index),
-        span: node_span(ctx, node),
+        span,
         is_pointer: is_ptr,
     });
     register_local(ctx, name, var_id);
@@ -505,6 +503,19 @@ fn lower_declaration(
                 );
             }
             "declarator" | "pointer_declarator" | "function_declarator" => {
+                // A pointer-returning function declaration (`T *f(void);`) is a
+                // `pointer_declarator` wrapping a `function_declarator`; it must
+                // register a function, not a variable that shadows the name.
+                if let Some((fdecl, ptr_depth)) = fn_decl_under_pointer(child) {
+                    let mut ret = type_id;
+                    for _ in 0..ptr_depth {
+                        ret = program.types.intern(trace_ir::TypeDesc::Ptr(Box::new(
+                            program.types.get(ret).desc.clone(),
+                        )));
+                    }
+                    lower_function_decl(program, ctx, source, fdecl, ret, is_static);
+                    continue;
+                }
                 lower_one_declarator(
                     program,
                     ctx,
@@ -523,6 +534,7 @@ fn lower_declaration(
                     continue;
                 }
                 let var_id = program.symbols.alloc_var_id();
+                let span = node_span(program, ctx, child);
                 program.symbols.add_variable(Variable {
                     id: var_id,
                     name: name.clone(),
@@ -530,7 +542,7 @@ fn lower_declaration(
                     storage: storage_override.unwrap_or_else(|| storage_for(ctx, is_static)),
                     fn_id: ctx.current_fn,
                     param_index: None,
-                    span: node_span(ctx, child),
+                    span,
                     is_pointer: false,
                 });
                 register_local(ctx, name, var_id);
@@ -558,6 +570,7 @@ fn lower_one_declarator(
             return;
         }
         let var_id = program.symbols.alloc_var_id();
+        let span = node_span(program, ctx, span_node);
         program.symbols.add_variable(Variable {
             id: var_id,
             name: name.clone(),
@@ -565,7 +578,7 @@ fn lower_one_declarator(
             storage: storage_override.unwrap_or_else(|| storage_for(ctx, is_static)),
             fn_id: ctx.current_fn,
             param_index: None,
-            span: node_span(ctx, span_node),
+            span,
             is_pointer: true,
         });
         register_local(ctx, name, var_id);
@@ -588,6 +601,7 @@ fn lower_one_declarator(
         return;
     }
     let var_id = program.symbols.alloc_var_id();
+    let span = node_span(program, ctx, span_node);
     program.symbols.add_variable(Variable {
         id: var_id,
         name: name.clone(),
@@ -595,7 +609,7 @@ fn lower_one_declarator(
         storage: storage_override.unwrap_or_else(|| storage_for(ctx, is_static)),
         fn_id: ctx.current_fn,
         param_index: None,
-        span: node_span(ctx, span_node),
+        span,
         is_pointer: is_ptr,
     });
     register_local(ctx, name, var_id);
@@ -619,11 +633,40 @@ fn lower_fn_ptr_array_init(
         if matches!(child.kind(), "(" | ")" | ",") {
             continue;
         }
-        if let Some(callee) = resolve_call_fn_arg(program, ctx, source, child) {
-            program
-                .flow
-                .push(FlowConstraint::ArrayFnMember { array, callee });
+        // Arrays of structs: `{ {TYPE, Fn}, ... }` or `{ {.init = Fn}, ... }`.
+        // Recurse so element expressions nested in inner lists are visited.
+        if child.kind() == "initializer_list" {
+            lower_fn_ptr_array_init(program, ctx, source, array, child);
+            continue;
         }
+        if child.kind() == "initializer_pair" || child.kind() == "designated_initializer" {
+            if let Some(value) = init_pair_value_node(child) {
+                push_array_fn_member(program, ctx, source, array, value);
+            }
+            continue;
+        }
+        push_array_fn_member(program, ctx, source, array, child);
+    }
+}
+
+fn init_pair_value_node(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|c| c.is_named() && c.kind() != "field_designator")
+        .last()
+}
+
+fn push_array_fn_member(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    array: VarId,
+    elem: Node,
+) {
+    if let Some(callee) = resolve_call_fn_arg(program, ctx, source, elem) {
+        program
+            .flow
+            .push(FlowConstraint::ArrayFnMember { array, callee });
     }
 }
 
@@ -657,6 +700,7 @@ fn lower_function_decl(
             }
         }
     }
+    let span = node_span(program, ctx, decl);
     let fn_id = program.symbols.add_function(Function {
         id: provisional_id,
         name,
@@ -668,7 +712,7 @@ fn lower_function_decl(
         return_type: ret_type,
         params,
         locals: Vec::new(),
-        span: node_span(ctx, decl),
+        span,
         file: ctx.current_file,
         is_defined: false,
     });
@@ -758,6 +802,7 @@ fn collect_call_at_node(
         }
     }
     let call_id = program.symbols.alloc_call_id();
+    let span = node_span(program, ctx, node);
     program.symbols.call_sites.push(CallSite {
         id: call_id,
         caller,
@@ -765,7 +810,7 @@ fn collect_call_at_node(
         callee_var,
         var_args,
         fn_args,
-        span: node_span(ctx, node),
+        span,
         is_direct,
     });
 }
@@ -1003,6 +1048,7 @@ fn alloc_gep_temp(
     field: FieldId,
 ) -> VarId {
     let var_id = program.symbols.alloc_var_id();
+    let span = node_span(program, ctx, span_node);
     program.symbols.add_variable(Variable {
         id: var_id,
         name: format!("_gep{}", var_id.0),
@@ -1010,7 +1056,7 @@ fn alloc_gep_temp(
         storage: StorageClass::Local,
         fn_id: ctx.current_fn,
         param_index: None,
-        span: node_span(ctx, span_node),
+        span,
         is_pointer: true,
     });
     program.flow.push(FlowConstraint::GepField {
@@ -1061,12 +1107,18 @@ fn peel_ptr_to_struct(program: &mut Program, type_id: trace_ir::TypeId) -> trace
     inner.map_or(type_id, |desc| program.types.intern(desc))
 }
 
-fn struct_type_for_var(program: &Program, var: VarId) -> Option<trace_ir::TypeId> {
+fn struct_type_for_var(program: &mut Program, var: VarId) -> Option<trace_ir::TypeId> {
     let mut type_id = variable_type_id(program, var)?;
     for _ in 0..4 {
         match &program.types.get(type_id).desc {
             TypeDesc::Ptr(inner) => {
                 type_id = program.types.resolve_type_id(inner);
+            }
+            // Arrays of structs: field access via `arr[i].f` resolves
+            // against the element type (index-insensitive over-approx).
+            TypeDesc::Array { elem, .. } => {
+                let inner = (**elem).clone();
+                type_id = program.types.intern(inner);
             }
             TypeDesc::Struct { .. } | TypeDesc::Union { .. } => return Some(type_id),
             _ => return Some(type_id),
@@ -1104,9 +1156,30 @@ fn deref_operand(node: Node) -> Option<Node> {
     pointer_arg(node)
 }
 
-fn expr_to_store_src(
-    program: &Program,
+/// Lower `&base.f1.f2` into a gep-temp chain so the resulting pointer
+/// targets the field's own abstract location (with the field's type),
+/// not the flattened outer instance. Returns the final temp var.
+fn addr_of_field_path(
+    program: &mut Program,
     ctx: &LowerContext,
+    source: &str,
+    arg: Node,
+) -> Option<VarId> {
+    let peeled = peel_expression(arg);
+    if peeled.kind() != "field_expression" {
+        return None;
+    }
+    let (base, field_ids) = decompose_field_path(program, ctx, source, peeled)?;
+    let mut current = base;
+    for fid in field_ids {
+        current = alloc_gep_temp(program, ctx, peeled, current, fid);
+    }
+    Some(current)
+}
+
+fn expr_to_store_src(
+    program: &mut Program,
+    ctx: &mut LowerContext,
     source: &str,
     node: Node,
 ) -> Option<VarId> {
@@ -1115,7 +1188,8 @@ fn expr_to_store_src(
             let op = pointer_op(source, node);
             let arg = pointer_arg(node)?;
             if op.as_deref() == Some("&") {
-                return resolve_lvalue_var(program, ctx, source, arg);
+                return addr_of_field_path(program, ctx, source, arg)
+                    .or_else(|| resolve_lvalue_var(program, ctx, source, arg));
             }
             None
         }
@@ -1149,6 +1223,9 @@ fn expr_to_rhs_flow(
             if op.as_deref() == Some("&") {
                 if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
                     Some(FlowConstraint::AddrOfFn { dst, callee })
+                } else if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
+                    // The gep temp's pts-to is the field's own location.
+                    Some(FlowConstraint::Copy { dst, src: gep })
                 } else {
                     resolve_lvalue_var(program, ctx, source, arg)
                         .map(|src| FlowConstraint::AddrOfVar { dst, src })
@@ -1224,7 +1301,7 @@ fn collect_return_flow(
 }
 
 fn return_flow_from_expr(
-    program: &Program,
+    program: &mut Program,
     ctx: &LowerContext,
     source: &str,
     node: Node,
@@ -1236,13 +1313,17 @@ fn return_flow_from_expr(
             let arg = pointer_arg(node)?;
             if op.as_deref() == Some("&") {
                 if let Some(callee) = resolve_fn_ref(program, ctx, source, arg) {
-                    Some(ReturnFlow::AddrOfFn { callee })
-                } else {
-                    resolve_lvalue_var(program, ctx, source, arg).map(|src| ReturnFlow::AddrOfVar { src })
+                    return Some(ReturnFlow::AddrOfFn { callee });
                 }
-            } else {
-                None
+                // `&base.field` returns a pointer to the field subobject;
+                // carry it as a Copy of the gep temp's pts-to.
+                if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
+                    return Some(ReturnFlow::Copy { src: gep });
+                }
+                return resolve_lvalue_var(program, ctx, source, arg)
+                    .map(|src| ReturnFlow::AddrOfVar { src });
             }
+            None
         }
         "identifier" => {
             let name = node_text(source, &node);
@@ -1288,6 +1369,7 @@ fn resolve_direct_call(
 
 fn alloc_ret_temp(program: &mut Program, ctx: &LowerContext, span_node: Node) -> VarId {
     let var_id = program.symbols.alloc_var_id();
+    let span = node_span(program, ctx, span_node);
     program.symbols.add_variable(Variable {
         id: var_id,
         name: format!("_ret{}", var_id.0),
@@ -1295,7 +1377,7 @@ fn alloc_ret_temp(program: &mut Program, ctx: &LowerContext, span_node: Node) ->
         storage: StorageClass::Local,
         fn_id: ctx.current_fn,
         param_index: None,
-        span: node_span(ctx, span_node),
+        span,
         is_pointer: true,
     });
     var_id
@@ -1472,6 +1554,7 @@ fn emit_field_fn_ptr_load(
         type_id = field_type_id;
         if i + 1 == field_ids.len() {
             let load_var = program.symbols.alloc_var_id();
+            let span = node_span(program, ctx, span_node);
             program.symbols.add_variable(Variable {
                 id: load_var,
                 name: format!("_load{}", load_var.0),
@@ -1479,7 +1562,7 @@ fn emit_field_fn_ptr_load(
                 storage: StorageClass::Local,
                 fn_id: ctx.current_fn,
                 param_index: None,
-                span: node_span(ctx, span_node),
+                span,
                 is_pointer: true,
             });
             program.flow.push(FlowConstraint::Load {
@@ -1490,6 +1573,7 @@ fn emit_field_fn_ptr_load(
         }
         if matches!(program.types.get(field_type_id).desc, TypeDesc::Ptr(_)) {
             let load_var = program.symbols.alloc_var_id();
+            let span = node_span(program, ctx, span_node);
             program.symbols.add_variable(Variable {
                 id: load_var,
                 name: format!("_load{}", load_var.0),
@@ -1497,7 +1581,7 @@ fn emit_field_fn_ptr_load(
                 storage: StorageClass::Local,
                 fn_id: ctx.current_fn,
                 param_index: None,
-                span: node_span(ctx, span_node),
+                span,
                 is_pointer: true,
             });
             program.flow.push(FlowConstraint::Load {
@@ -1655,6 +1739,35 @@ fn is_function_pointer_declarator(decl: Node) -> bool {
     )
 }
 
+/// If `decl` denotes a function whose declarator chain starts with one or more
+/// pointer levels (`T *f(...)` / `T **f(...)`), return the innermost
+/// non-fn-ptr `function_declarator` and the number of pointer levels.
+/// Variables (plain pointers, arrays, fn-ptr vars) yield `None`.
+fn fn_decl_under_pointer(decl: Node) -> Option<(Node, usize)> {
+    let mut cur = decl;
+    let mut depth = 0usize;
+    loop {
+        match cur.kind() {
+            "pointer_declarator" => {
+                depth += 1;
+                cur = cur
+                    .child_by_field_name("declarator")
+                    .or_else(|| cur.named_child(0))?;
+            }
+            "parenthesized_declarator" => {
+                cur = cur.named_child(0)?;
+            }
+            "function_declarator" => {
+                if is_function_pointer_declarator(cur) {
+                    return None;
+                }
+                return Some((cur, depth));
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn storage_for(ctx: &LowerContext, is_static: bool) -> StorageClass {
     if ctx.current_fn.is_some() {
         if is_static {
@@ -1766,10 +1879,19 @@ fn find_params(decl: Node) -> Option<Node> {
     None
 }
 
-fn node_span(ctx: &LowerContext, node: Node) -> Span {
-    Span::new(
-        ctx.current_file,
-        node.start_position().row as u32 + 1,
-        node.start_position().column as u32 + 1,
-    )
+fn node_span(program: &mut Program, ctx: &LowerContext, node: Node) -> Span {
+    let line = node.start_position().row as u32 + 1;
+    let col = node.start_position().column as u32 + 1;
+    if let Some(line_map) = &ctx.line_map {
+        if let Some(entry) = line_map.lookup(node.start_byte()) {
+            let origin = line_map.path_of(entry);
+            if origin != ctx.primary_path {
+                // Code from an `#include`d file: attribute the entity to its
+                // original header (AGENTS.md LineMap invariant).
+                let fid = program.symbols.add_file_interned(origin.to_path_buf());
+                return Span::new(fid, entry.line, entry.col);
+            }
+        }
+    }
+    Span::new(ctx.current_file, line, col)
 }

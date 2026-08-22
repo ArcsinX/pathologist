@@ -66,9 +66,9 @@ flowchart LR
 
 The preprocessor records mappings from **output byte offsets** to original `(file, line, col)` in `LineMap`.
 
-**Current behavior:** tree-sitter parses **preprocessed** source; IR spans (`Span` in `trace-ir`) use line/column from that parse on the TU file path. Exported SQLite line numbers therefore reflect **preprocessed** coordinates (includes/macros expanded), not always the original on-disk line.
+**Current behavior:** tree-sitter parses **preprocessed** source; IR spans (`Span` in `trace-ir`) are resolved through the `LineMap`: code from `#include`d files is attributed to its original file with original line/column, while TU-local code uses positions on the preprocessed text (identical to the raw file when nothing was expanded). Cached `#include` expansions store their own sub-`LineMap`, which is spliced back on replay so origins survive caching.
 
-The `LineMap` is available for future remapping to original locations. Do not break offset mapping when extending the preprocessor.
+The `LineMap` must keep byte-accurate offset mapping when extending the preprocessor.
 
 ## Include resolution
 
@@ -89,6 +89,15 @@ Only **project-local** files under the analysis root are linked; system headers 
 | Reachable headers | Headers transitively `#include`d from any `.c` are expanded into that TU; not indexed as separate units |
 | Orphan headers | Project `.h` never reached from any `.c` are indexed as their own units (may contain calls) |
 | Parallel index | Orphan headers and `.c` TUs: parallel parse/lower, sequential merge |
+
+### Determinism
+
+Indexing output must be identical across runs of the same tree. Two mechanisms guarantee this:
+
+- **Macro warm pass** runs sequentially over C-reachable headers in canonical (`index_order`) order, building the shared macro table. Parallel workers start from that frozen snapshot and never accumulate into it.
+- **Expansion-cache freeze**: during parallel phases the include-expansion cache is read-only (`PreprocessOptions::frozen_expansion_cache`). Hits replay warm-pass entries (produced deterministically); misses expand inline under each TU's own macro/guard state and are *not* inserted — first-writer-wins inserts would make results scheduling-dependent.
+
+`index_order` itself is canonical: input files are sorted and dependents are visited in sorted order, so unordered `HashSet`/`HashMap` iteration cannot leak into processing order.
 
 **Limitation:** Reachability is computed from literal `#include` lines in raw source (no macro expansion). Headers included only via macros may be misclassified as orphan (duplicate work, usually still correct). Headers excluded by `#if 0` in the preprocessor but visible in the raw graph are treated as reachable and not indexed separately — if the TU also omits them at preprocess time, calls in those headers can be missed.
 

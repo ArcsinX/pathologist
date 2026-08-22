@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use trace_ir::{
     CallSite, CallSiteId, FlowConstraint, FnId, Function, Program, ReturnFlow, TypeDesc, TypeId,
@@ -9,6 +9,10 @@ use trace_ir::{
 #[derive(Debug, Clone, Default)]
 pub struct UnitIndex {
     pub path: PathBuf,
+    /// Unit-local file table: index == unit-local [`trace_ir::FileId`] value.
+    /// Includes the TU itself plus every `#include`d origin that produced
+    /// attributed entities.
+    pub files: Vec<PathBuf>,
     pub types: trace_ir::TypeTable,
     pub functions: Vec<Function>,
     pub variables: Vec<Variable>,
@@ -19,33 +23,75 @@ pub struct UnitIndex {
     pub anon_type_counter: u32,
 }
 
+type SiteKey = (trace_ir::FileId, u32, u32, String);
+
 pub fn merge_unit_index(program: &mut Program, unit: UnitIndex) {
     program.diagnostics.extend(unit.diagnostics);
     program.anon_type_counter = program.anon_type_counter.max(unit.anon_type_counter);
 
     let type_map = merge_types(&mut program.types, &unit.types);
-    let file_id = program.symbols.add_file(unit.path);
 
+    // Intern the unit's file table by path so headers reached through many
+    // TUs collapse to one FileId and spans keep their original attribution.
+    let mut file_map: Vec<trace_ir::FileId> = Vec::with_capacity(unit.files.len());
+    for path in &unit.files {
+        file_map.push(program.symbols.add_file_interned(path.clone()));
+    }
+    let primary_file_id = program.symbols.add_file_interned(unit.path.clone());
+    for &mapped in &file_map {
+        if mapped != primary_file_id {
+            program
+                .symbols
+                .register_included_header(primary_file_id, mapped);
+        }
+    }
+    let map_file = |id: trace_ir::FileId| -> trace_ir::FileId {
+        file_map
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or(primary_file_id)
+    };
     let mut fn_map: HashMap<FnId, FnId> = HashMap::new();
+    let mut dropped_fns: HashSet<FnId> = HashSet::new();
     for func in unit.functions {
         let old_id = func.id;
+        let span_file = map_file(func.span.file);
+        let key = (span_file, func.name.clone(), func.span.line);
+        if let Some(&canonical) = program.dedup.fn_keys.get(&key) {
+            // Same origin entity lowered by another TU (or re-included):
+            // keep the first copy, redirect all references to it.
+            fn_map.insert(old_id, canonical);
+            dropped_fns.insert(old_id);
+            continue;
+        }
         let new_id = program.symbols.alloc_fn_id();
         let mut f = func;
         f.id = new_id;
-        f.file = file_id;
+        f.span.file = span_file;
+        f.file = span_file;
         f.return_type = remap_type(f.return_type, &type_map);
         let merged = program.symbols.add_function(f);
         fn_map.insert(old_id, merged);
+        program.dedup.fn_keys.insert(key, merged);
     }
 
     let mut var_map: HashMap<VarId, VarId> = HashMap::new();
     for var in unit.variables {
+        // Locals/temps of dropped duplicate bodies are redundant.
+        if var
+            .fn_id
+            .map(|id| dropped_fns.contains(&id))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let new_id = program.symbols.alloc_var_id();
         let mut v = var;
         let old = v.id;
         v.id = new_id;
         v.type_id = remap_type(v.type_id, &type_map);
         v.fn_id = v.fn_id.and_then(|id| fn_map.get(&id).copied());
+        v.span.file = map_file(v.span.file);
         program.symbols.add_variable(v);
         var_map.insert(old, new_id);
     }
@@ -76,6 +122,17 @@ pub fn merge_unit_index(program: &mut Program, unit: UnitIndex) {
 
     let mut call_map: HashMap<CallSiteId, CallSiteId> = HashMap::new();
     for cs in unit.call_sites {
+        // A duplicate header body's own call sites are re-observed copies;
+        // after caller redirection they collapse onto the canonical ones.
+        if dropped_fns.contains(&cs.caller) {
+            continue;
+        }
+        let span_file = map_file(cs.span.file);
+        let key: SiteKey = (span_file, cs.span.line, cs.span.col, cs.callee_name.clone());
+        if let Some(&existing) = program.dedup.site_keys.get(&key) {
+            call_map.insert(cs.id, existing);
+            continue;
+        }
         let new_id = program.symbols.alloc_call_id();
         let old = cs.id;
         let mut site = cs;
@@ -92,21 +149,29 @@ pub fn merge_unit_index(program: &mut Program, unit: UnitIndex) {
             .into_iter()
             .filter_map(|(i, f)| fn_map.get(&f).map(|nf| (i, *nf)))
             .collect();
-        site.span.file = file_id;
+        site.span.file = span_file;
         program.symbols.call_sites.push(site);
+        program.dedup.site_keys.insert(key, new_id);
         call_map.insert(old, new_id);
     }
 
     for flow in unit.flow {
+        if !flow_vars(&flow).all(|v| var_map.contains_key(&v)) {
+            continue;
+        }
         program.flow.push(remap_flow(flow, &fn_map, &var_map));
     }
 
     for (old_fn, flows) in unit.fn_returns {
+        if dropped_fns.contains(&old_fn) {
+            continue;
+        }
         let Some(&new_fn) = fn_map.get(&old_fn) else {
             continue;
         };
         let remapped: Vec<ReturnFlow> = flows
             .into_iter()
+            .filter(|f| return_flow_vars(f).all(|v| var_map.contains_key(&v)))
             .map(|f| remap_return_flow(f, &fn_map, &var_map))
             .collect();
         program
@@ -115,6 +180,29 @@ pub fn merge_unit_index(program: &mut Program, unit: UnitIndex) {
             .or_default()
             .extend(remapped);
     }
+}
+
+fn flow_vars(flow: &FlowConstraint) -> impl Iterator<Item = VarId> + '_ {
+    match flow {
+        FlowConstraint::Copy { dst, src }
+        | FlowConstraint::Load { dst, src }
+        | FlowConstraint::Store { dst, src } => vec![*dst, *src],
+        FlowConstraint::AddrOfVar { dst, src } => vec![*dst, *src],
+        FlowConstraint::AddrOfFn { dst, .. } => vec![*dst],
+        FlowConstraint::GepField { dst, base, .. } => vec![*dst, *base],
+        FlowConstraint::ArrayFnMember { array, .. } => vec![*array],
+        FlowConstraint::CallReturn { dst, .. } => vec![*dst],
+    }
+    .into_iter()
+}
+
+fn return_flow_vars(flow: &ReturnFlow) -> impl Iterator<Item = VarId> + '_ {
+    match flow {
+        ReturnFlow::AddrOfVar { src } => vec![*src],
+        ReturnFlow::Copy { src } => vec![*src],
+        ReturnFlow::AddrOfFn { .. } | ReturnFlow::Call { .. } => Vec::new(),
+    }
+    .into_iter()
 }
 
 fn remap_type(id: TypeId, map: &HashMap<TypeId, TypeId>) -> TypeId {

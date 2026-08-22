@@ -7,6 +7,9 @@ use std::sync::{Arc, RwLock};
 pub struct IncludeExpansion {
     pub text: Arc<str>,
     pub files: Arc<HashSet<PathBuf>>,
+    /// Origin map for `text`: offsets are relative to the start of the
+    /// expansion. Empty when line-map tracking is disabled.
+    pub line_map: Arc<crate::LineMap>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -23,6 +26,11 @@ pub struct PreprocessOptions {
     pub shared_macros: Option<crate::SharedMacroTable>,
     /// When true, `#define` / `#undef` update [`Self::shared_macros`].
     pub accumulate_macros: bool,
+    /// When true, `include_expansion_cache` is read-only: hits are replayed,
+    /// misses are expanded inline but never inserted. Parallel workers must
+    /// set this so first-writer-wins races cannot make output scheduling-
+    /// dependent.
+    pub frozen_expansion_cache: bool,
     /// When false, skip `LineMap` updates (faster indexing; spans are not remapped yet).
     pub track_line_map: bool,
 }
@@ -35,8 +43,10 @@ impl PreprocessOptions {
         }
     }
 
+    /// Options used for indexing: line-map tracking stays on so lowered
+    /// entities can be attributed to their original `#include`d file.
     pub fn for_indexing(mut self) -> Self {
-        self.track_line_map = false;
+        self.track_line_map = true;
         self
     }
 
@@ -60,6 +70,11 @@ impl PreprocessOptions {
 
     pub fn with_accumulate_macros(mut self, accumulate: bool) -> Self {
         self.accumulate_macros = accumulate;
+        self
+    }
+
+    pub fn with_frozen_expansion_cache(mut self, frozen: bool) -> Self {
+        self.frozen_expansion_cache = frozen;
         self
     }
 

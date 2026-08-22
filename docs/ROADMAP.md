@@ -77,7 +77,7 @@
 | Item | Notes |
 |------|-------|
 | **`memcpy` / `memmove` summaries** | Registered but no-op; blocks fn-ptr-through-memcpy patterns |
-| **Original-source line remapping** | `LineMap` exists; export still uses preprocessed lines |
+| **Original-source line remapping** | Done for `#include`d code: header-origin entities carry original file/line via `LineMap` and are deduplicated across TUs |
 | **`compile_commands.json`** | Include paths / defines today via CLI only |
 | **Heap allocation modeling** | `malloc` family stubs don't allocate fresh locs yet |
 | **C++ translation units** | `.cpp` adapters (e.g. HIPC sbuf) not indexed |

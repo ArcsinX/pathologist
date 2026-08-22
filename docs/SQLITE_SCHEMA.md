@@ -69,13 +69,16 @@ diagnostics
 |--------|------|-------------|
 | `id` | INTEGER PK | Function id |
 | `name` | TEXT | Linkage-visible name |
-| `file_id` | INTEGER FK → `files` | Primary file |
-| `line_start` | INTEGER | Start line (preprocessed) |
+| `file_id` | INTEGER FK → `files` | Defining file (original header if include-originated) |
+| `line_start` | INTEGER | Start line (original file for header-origin entities; preprocessed otherwise) |
 | `line_end` | INTEGER | End line (currently ≈ start) |
 | `linkage` | TEXT | `external`, `internal`, `none` |
 | `signature` | TEXT | Placeholder `fn_<name>` |
 
 **Index:** `functions(name)`
+
+Header-defined functions are deduplicated across TUs at merge time (first copy
+wins, later copies redirect), so they appear once per origin.
 
 ### call_sites
 
@@ -84,10 +87,13 @@ diagnostics
 | `id` | INTEGER PK | Call site id |
 | `caller_fn_id` | INTEGER FK → `functions` | Containing function |
 | `file_id` | INTEGER FK → `files` | Call location file |
-| `line` | INTEGER | Line (preprocessed) |
+| `line` | INTEGER | Line (original file for header-origin sites; preprocessed otherwise) |
 | `col` | INTEGER | Column |
 | `callee_text` | TEXT | Surface syntax (`foo`, `p->handler`, …) |
 | `is_direct` | INTEGER | `1` direct by name; `0` indirect |
+
+Call sites inside header-defined functions are deduplicated by
+`(origin file, line, col, callee)` across TUs.
 
 ### call_edges
 

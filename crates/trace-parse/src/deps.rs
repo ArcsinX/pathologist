@@ -113,12 +113,17 @@ impl IncludeGraph {
     }
 
     /// Topological index order: dependencies before dependents.
-    /// `files` must use the same canonical paths as [`IncludeGraph::project_files`].
+    /// The input order does not affect the result: files are sorted up front
+    /// and dependents are visited in sorted order, so two runs over the same
+    /// tree always agree (std HashMap iteration would otherwise leak into
+    /// downstream processing order and make output nondeterministic).
     pub fn index_order(&self, files: &[PathBuf]) -> Vec<PathBuf> {
-        let file_set: HashSet<PathBuf> = files.iter().cloned().collect();
+        let mut ordered_files: Vec<PathBuf> = files.to_vec();
+        ordered_files.sort();
+        let file_set: HashSet<PathBuf> = ordered_files.iter().cloned().collect();
 
         let mut in_degree: IndexMap<PathBuf, usize> = IndexMap::new();
-        for f in files {
+        for f in &ordered_files {
             in_degree.entry(f.clone()).or_insert(0);
         }
         for (dep, incs) in &self.edges {
@@ -151,22 +156,24 @@ impl IncludeGraph {
             .collect();
         queue.make_contiguous().sort();
 
-        let mut order = Vec::with_capacity(files.len());
+        let mut order = Vec::with_capacity(ordered_files.len());
         while let Some(node) = queue.pop_front() {
             order.push(node.clone());
             if let Some(dependents) = reverse.get(&node) {
-                for dep in dependents {
+                let mut next: Vec<&PathBuf> = dependents.iter().collect();
+                next.sort();
+                for dep in next {
                     if let Some(deg) = in_degree.get_mut(dep) {
                         *deg -= 1;
                         if *deg == 0 {
-                            queue.push_back(dep.clone());
+                            queue.push_back((*dep).clone());
                         }
                     }
                 }
             }
         }
 
-        for f in files {
+        for f in &ordered_files {
             if !order.contains(f) {
                 order.push(f.clone());
             }
@@ -257,7 +264,10 @@ fn build_basename_index(project_files: &HashSet<PathBuf>) -> HashMap<String, Vec
     let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for path in project_files {
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            index.entry(name.to_string()).or_default().push(path.clone());
+            index
+                .entry(name.to_string())
+                .or_default()
+                .push(path.clone());
         }
     }
     for paths in index.values_mut() {
@@ -293,10 +303,7 @@ fn resolve_include(
     }
 
     // Last resort: unique match under project by filename.
-    if let Some(name) = Path::new(&inc.path)
-        .file_name()
-        .and_then(|n| n.to_str())
-    {
+    if let Some(name) = Path::new(&inc.path).file_name().and_then(|n| n.to_str()) {
         if let Some(matches) = basename_index.get(name) {
             if matches.len() == 1 {
                 return Some(matches[0].clone());

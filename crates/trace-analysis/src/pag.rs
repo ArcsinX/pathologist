@@ -45,6 +45,9 @@ pub struct Pag {
     /// Per-(struct type, field) summary location for instance-insensitive field flow.
     pub field_summary: IndexMap<(trace_ir::TypeId, FieldId), LocId>,
     pub field_loc_to_summary: IndexMap<LocId, LocId>,
+    /// Fn locations parked into an array var by `ArrayFnMember` inits
+    /// (`{ {.., Fn}, .. }`); reachable through any element field load.
+    pub array_fn_members: FxHashMap<VarId, Vec<LocId>>,
     pub indices: SolverIndices,
 }
 
@@ -313,9 +316,10 @@ impl Pag {
                 }
                 FlowConstraint::AddrOfFn { dst, callee } => {
                     let dst_n = self.var_node_id(*dst);
-                    let name = program.symbols.function(*callee).name.clone();
-                    let resolved = program.symbols.resolve_function(&name).unwrap_or(*callee);
-                    if let Some(&fn_loc) = self.fn_locations.get(&resolved) {
+                    // `callee` was resolved in TU scope during lowering and
+                    // remapped at merge; a global name lookup here could bind
+                    // an unrelated same-name function (e.g. file-`static`s).
+                    if let Some(&fn_loc) = self.fn_locations.get(callee) {
                         let loc_n = self.loc_node[&fn_loc];
                         self.add_addr_of(dst_n, loc_n);
                     }
@@ -337,11 +341,13 @@ impl Pag {
                 }
                 FlowConstraint::ArrayFnMember { array, callee } => {
                     let array_n = self.var_node_id(*array);
-                    let name = program.symbols.function(*callee).name.clone();
-                    let resolved = program.symbols.resolve_function(&name).unwrap_or(*callee);
-                    if let Some(&fn_loc) = self.fn_locations.get(&resolved) {
+                    // Trust the merge-remapped FnId (see AddrOfFn above).
+                    if let Some(&fn_loc) = self.fn_locations.get(callee) {
                         let loc_n = self.loc_node[&fn_loc];
                         self.add_addr_of(array_n, loc_n);
+                        // Also record for element-field loads through
+                        // pointers to the array (order-independent).
+                        self.array_fn_members.entry(*array).or_default().push(fn_loc);
                     }
                 }
                 FlowConstraint::CallReturn { dst, callee_name } => {
@@ -351,10 +357,14 @@ impl Pag {
                         .variable(*dst)
                         .fn_id
                         .map(|f| program.symbols.function(f).file);
-                    if let Some(callee) =
-                        program.symbols.resolve_function_in_scope(callee_name, file)
+                    // May-approximation: a merged name may bind to the
+                    // query file's `static` def, the external def, or both.
+                    let mut visited = FxHashSet::default();
+                    for callee in program
+                        .symbols
+                        .resolve_function_candidates(callee_name, file)
                     {
-                        self.expand_return_flows(program, dst_n, callee, &mut FxHashSet::default());
+                        self.expand_return_flows(program, dst_n, callee, &mut visited);
                     }
                 }
             }
@@ -383,9 +393,8 @@ impl Pag {
                     }
                 }
                 ReturnFlow::AddrOfFn { callee: fn_id } => {
-                    let name = program.symbols.function(fn_id).name.clone();
-                    let resolved = program.symbols.resolve_function(&name).unwrap_or(fn_id);
-                    if let Some(&fn_loc) = self.fn_locations.get(&resolved) {
+                    // Trust the merge-remapped FnId (see AddrOfFn above).
+                    if let Some(&fn_loc) = self.fn_locations.get(&fn_id) {
                         let loc_n = self.loc_node[&fn_loc];
                         self.add_addr_of(dst, loc_n);
                     }
@@ -396,9 +405,9 @@ impl Pag {
                 }
                 ReturnFlow::Call { callee_name } => {
                     let file = program.symbols.function(callee).file;
-                    if let Some(inner) = program
+                    for inner in program
                         .symbols
-                        .resolve_function_in_scope(&callee_name, Some(file))
+                        .resolve_function_candidates(&callee_name, Some(file))
                     {
                         self.expand_return_flows(program, dst, inner, visited);
                     }
@@ -512,6 +521,10 @@ fn struct_type_for_loc(pag: &Pag, program: &Program, loc: LocId) -> Option<trace
                         _ => program.types.resolve_type_id(inner),
                     };
                 }
+                // Arrays of structs: resolve fields against the element type.
+                trace_ir::TypeDesc::Array { elem, .. } => {
+                    type_id = program.types.resolve_type_id(inner_or_elem(elem));
+                }
                 trace_ir::TypeDesc::Struct { .. } | trace_ir::TypeDesc::Union { .. } => {
                     return Some(type_id);
                 }
@@ -521,6 +534,13 @@ fn struct_type_for_loc(pag: &Pag, program: &Program, loc: LocId) -> Option<trace
         return Some(type_id);
     }
     type_id_of_loc(pag, program, loc)
+}
+
+fn inner_or_elem(desc: &trace_ir::TypeDesc) -> &trace_ir::TypeDesc {
+    match desc {
+        trace_ir::TypeDesc::Ptr(inner) | trace_ir::TypeDesc::Array { elem: inner, .. } => inner,
+        other => other,
+    }
 }
 
 fn type_id_of_loc(pag: &Pag, program: &Program, loc: LocId) -> Option<trace_ir::TypeId> {
@@ -554,6 +574,10 @@ fn struct_type_from_type_id(
                         .unwrap_or_else(|| program.types.resolve_type_id(inner)),
                     _ => program.types.resolve_type_id(inner),
                 };
+            }
+            // Arrays of structs: resolve fields against the element type.
+            trace_ir::TypeDesc::Array { elem, .. } => {
+                type_id = program.types.resolve_type_id(inner_or_elem(elem));
             }
             trace_ir::TypeDesc::Struct { .. } | trace_ir::TypeDesc::Union { .. } => {
                 return Some(type_id);

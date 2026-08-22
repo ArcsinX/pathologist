@@ -1,8 +1,9 @@
 use crate::flow::ReturnFlow;
 use crate::symbol::SymbolTable;
 use crate::types::TypeTable;
-use crate::FnId;
+use crate::{CallSiteId, FileId, FnId};
 use indexmap::IndexMap;
+use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,14 @@ pub struct Diagnostic {
     pub stage: String,
 }
 
+/// Cross-unit deduplication state used by the merge stage: entities whose
+/// origin (header file + position) was already merged map to the first copy.
+#[derive(Debug, Clone, Default)]
+pub struct MergeDedup {
+    pub fn_keys: FxHashMap<(FileId, String, u32), FnId>,
+    pub site_keys: FxHashMap<(FileId, u32, u32, String), CallSiteId>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     pub root: PathBuf,
@@ -35,6 +44,7 @@ pub struct Program {
     pub include_deps: Vec<(PathBuf, PathBuf)>,
     pub defines: IndexMap<String, String>,
     pub anon_type_counter: u32,
+    pub dedup: MergeDedup,
 }
 
 impl Program {

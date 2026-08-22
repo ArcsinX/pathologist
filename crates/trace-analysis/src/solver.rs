@@ -16,7 +16,7 @@ pub struct AnalysisResult {
     pub points_to: IndexMap<PagNodeId, FxHashSet<LocId>>,
     pub call_edges: Vec<CallGraphEdge>,
     pub arg_flow_edges: Vec<ArgFlowEdge>,
-    pub wired_arg_flow: FxHashSet<(CallSiteId, u32)>,
+    pub wired_arg_flow: FxHashSet<(CallSiteId, u32, FnId)>,
 }
 
 pub fn analyze(program: &Program) -> (Pag, AnalysisResult) {
@@ -54,6 +54,45 @@ impl SolverState {
             }
         }
     }
+
+    /// Merge `memory_pts[mem_loc]` into `pts[dst]` without cloning. Field-
+    /// disjoint borrows keep this allocation-free apart from a tiny staging
+    /// vector of newly added locations.
+    fn merge_memory_into(&mut self, dst: PagNodeId, mem_loc: LocId) {
+        let Some(mem) = self.memory_pts.get(&mem_loc) else {
+            return;
+        };
+        let mut new_locs: Vec<LocId> = Vec::new();
+        {
+            let entry = self.pts.entry(dst).or_default();
+            for &loc in mem.iter() {
+                if !entry.contains(&loc) {
+                    new_locs.push(loc);
+                }
+            }
+        }
+        if new_locs.is_empty() {
+            return;
+        }
+        {
+            let entry = self.pts.get_mut(&dst).expect("pts entry exists");
+            for loc in &new_locs {
+                entry.insert(*loc);
+            }
+        }
+        for loc in new_locs {
+            self.loc_nodes.entry(loc).or_default().insert(dst);
+        }
+        self.push(dst);
+    }
+}
+
+/// A call site denotes a recoverable direct call when lowering recorded no
+/// callee variable (`callee_var`) and the callee text is a plain identifier.
+/// Cross-TU calls satisfy this: lowering marks them indirect only because the
+/// definition was not visible in the translation unit.
+fn direct_by_name(cs: &trace_ir::CallSite) -> bool {
+    cs.callee_var.is_none() && !cs.callee_name.contains("->") && !cs.callee_name.contains('.')
 }
 
 fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisResult {
@@ -72,7 +111,7 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
 
     let mut call_edges: Vec<CallGraphEdge> = Vec::new();
     let mut resolved_indirect: FxHashMap<CallSiteId, Vec<FnId>> = FxHashMap::default();
-    let mut wired_arg_flow: FxHashSet<(CallSiteId, u32)> = FxHashSet::default();
+    let mut wired_arg_flow: FxHashSet<(CallSiteId, u32, FnId)> = FxHashSet::default();
 
     for var in &program.symbols.variables {
         if !matches!(
@@ -88,19 +127,35 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
     }
 
     for cs in &program.symbols.call_sites {
-        if cs.is_direct {
-            if let Some(callee) = program
+        // Direct sites: lowering saw the TU-local binding, so scope-first
+        // resolution is exact per C visibility rules (file-`static` shadows
+        // same-name externals inside its own TU).
+        //
+        // Recovered cross-TU sites: no local binding existed at lowering, and
+        // merge erases which TU's view a name reflects — a name matching both
+        // a `static` def and an external def is genuinely ambiguous. May-
+        // approximation: consider every candidate.
+        let callees: Vec<FnId> = if cs.is_direct {
+            program
                 .symbols
                 .resolve_function_in_scope(&cs.callee_name, Some(cs.span.file))
-            {
-                call_edges.push(CallGraphEdge {
-                    call_site: cs.id,
-                    caller: cs.caller,
-                    callee,
-                    resolution: ResolutionKind::Direct,
-                });
-                wire_params(pag, program, cs, callee, &mut st, &mut wired_arg_flow);
-            }
+                .into_iter()
+                .collect()
+        } else if direct_by_name(cs) {
+            program
+                .symbols
+                .resolve_function_candidates(&cs.callee_name, Some(cs.span.file))
+        } else {
+            Vec::new()
+        };
+        for callee in callees {
+            call_edges.push(CallGraphEdge {
+                call_site: cs.id,
+                caller: cs.caller,
+                callee,
+                resolution: ResolutionKind::Direct,
+            });
+            wire_params(pag, program, cs, callee, &mut st, &mut wired_arg_flow);
         }
     }
 
@@ -134,8 +189,8 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
                     for &loc in &node_pts {
                         if fn_for_loc(pag, loc).is_some() {
                             add_pts(&mut st, dst, loc);
-                        } else if let Some(mem) = st.memory_pts.get(&loc).cloned() {
-                            propagate_pts(&mut st, dst, &mem);
+                        } else {
+                            st.merge_memory_into(dst, loc);
                         }
                     }
                 }
@@ -149,8 +204,7 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
         }
 
         if let Some(idxs) = pag.indices.store_src.get(&node) {
-            let src_pts = pts_for_var_or_loc(pag, &st.pts, node);
-            if !src_pts.is_empty() {
+            if pts_has_values_or_self_loc(pag, &st.pts, node) {
                 for &idx in idxs {
                     apply_store(pag, idx, &mut st);
                 }
@@ -170,16 +224,31 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
                 };
                 if !node_pts.is_empty() {
                     for loc in &node_pts {
+                        // Fn values parked in the base's points-to (e.g.
+                        // ArrayFnMember tables of structs with fn members)
+                        // flow through field accesses unchanged.
+                        if fn_for_loc(pag, *loc).is_some() {
+                            add_pts(&mut st, dst, *loc);
+                            continue;
+                        }
                         if let Some(field_loc) = pag.ensure_field_loc(program, *loc, field) {
-                            let mut targets = FxHashSet::default();
-                            targets.insert(field_loc);
-                            if let Some(summary) = pag.summary_for_field_loc(field_loc) {
-                                targets.insert(summary);
+                            // Field loc plus its instance-insensitive summary.
+                            let targets = [Some(field_loc), pag.summary_for_field_loc(field_loc)];
+                            propagate_locs(
+                                &mut st,
+                                dst,
+                                targets.iter().filter_map(|t| t.as_ref().copied()),
+                            );
+                            for fl in targets.into_iter().flatten() {
+                                st.merge_memory_into(dst, fl);
                             }
-                            propagate_pts(&mut st, dst, &targets);
-                            for fl in targets {
-                                if let Some(mem) = st.memory_pts.get(&fl).cloned() {
-                                    propagate_pts(&mut st, dst, &mem);
+                            // ArrayFnMember element fns: reachable through
+                            // the array itself or any pointer to an element.
+                            if let Some(owner) = pag.locations[loc.0 as usize].var {
+                                if let Some(fn_locs) = pag.array_fn_members.get(&owner) {
+                                    for fl in fn_locs.iter().copied() {
+                                        add_pts(&mut st, dst, fl);
+                                    }
                                 }
                             }
                         }
@@ -188,10 +257,8 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
                     if let Some(summary) =
                         pag.ensure_field_summary_for_var(program, base_var, field)
                     {
-                        propagate_pts(&mut st, dst, &FxHashSet::from_iter([summary]));
-                        if let Some(mem) = st.memory_pts.get(&summary).cloned() {
-                            propagate_pts(&mut st, dst, &mem);
-                        }
+                        propagate_locs(&mut st, dst, [summary]);
+                        st.merge_memory_into(dst, summary);
                     }
                 }
             }
@@ -247,62 +314,105 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
     }
 }
 
+fn propagate_locs(st: &mut SolverState, dst: PagNodeId, locs: impl IntoIterator<Item = LocId>) {
+    let mut new_locs: Vec<LocId> = Vec::new();
+    {
+        let entry = st.pts.entry(dst).or_default();
+        for loc in locs {
+            if !entry.contains(&loc) {
+                new_locs.push(loc);
+            }
+        }
+    }
+    if new_locs.is_empty() {
+        return;
+    }
+    let entry = st.pts.get_mut(&dst).expect("entry just created");
+    for loc in new_locs {
+        entry.insert(loc);
+        st.loc_nodes.entry(loc).or_default().insert(dst);
+    }
+    st.push(dst);
+}
+
 fn apply_store(pag: &Pag, idx: usize, st: &mut SolverState) {
     let c = &pag.constraints[idx];
-    let dst_pts = st.pts.get(&c.dst).cloned().unwrap_or_default();
+    // Clone-free store: `pts` and `memory_pts` are disjoint fields, so the
+    // destination set can be iterated by reference while memory is mutated.
+    let Some(dst_pts) = st.pts.get(&c.dst) else {
+        return;
+    };
     if dst_pts.is_empty() {
         return;
     }
-    let src_pts = pts_for_var_or_loc(pag, &st.pts, c.src);
-    if src_pts.is_empty() {
+    let src_set = st.pts.get(&c.src);
+    let self_loc = match pag.nodes[c.src.0 as usize].kind {
+        PagNodeKind::Var(v) => pag.var_location.get(&v).copied(),
+        _ => None,
+    };
+    if src_set.map(|s| s.is_empty()).unwrap_or(true) && self_loc.is_none() {
         return;
     }
-    for loc in dst_pts {
+    let mut requeues: Vec<LocId> = Vec::new();
+    for &loc in dst_pts.iter() {
         if fn_for_loc(pag, loc).is_some() {
             continue;
         }
         let mut changed = false;
-        let entry = st.memory_pts.entry(loc).or_default();
-        let before = entry.len();
-        for l in &src_pts {
-            entry.insert(*l);
-        }
-        if entry.len() > before {
-            changed = true;
+        {
+            let entry = st.memory_pts.entry(loc).or_default();
+            let before = entry.len();
+            if let Some(s) = src_set {
+                for l in s {
+                    entry.insert(*l);
+                }
+            }
+            if let Some(sl) = self_loc {
+                entry.insert(sl);
+            }
+            changed |= entry.len() > before;
         }
         let mut summary_loc = None;
         if let Some(summary) = pag.summary_for_field_loc(loc) {
             summary_loc = Some(summary);
             let summary_entry = st.memory_pts.entry(summary).or_default();
             let before_summary = summary_entry.len();
-            for l in &src_pts {
-                summary_entry.insert(*l);
+            if let Some(s) = src_set {
+                for l in s {
+                    summary_entry.insert(*l);
+                }
             }
-            if summary_entry.len() > before_summary {
-                changed = true;
+            if let Some(sl) = self_loc {
+                summary_entry.insert(sl);
             }
+            changed |= summary_entry.len() > before_summary;
         }
         if changed {
-            st.requeue_loc(loc);
+            requeues.push(loc);
             if let Some(summary) = summary_loc {
-                st.requeue_loc(summary);
+                requeues.push(summary);
             }
         }
+    }
+    for loc in requeues {
+        st.requeue_loc(loc);
     }
 }
 
-fn pts_for_var_or_loc(
+/// Cheap emptiness probe used by the store-src trigger: does the node hold any
+/// pointee, or (for variables) at least its own abstract storage location?
+fn pts_has_values_or_self_loc(
     pag: &Pag,
     pts: &FxHashMap<PagNodeId, FxHashSet<LocId>>,
     node: PagNodeId,
-) -> FxHashSet<LocId> {
-    let mut set = pts.get(&node).cloned().unwrap_or_default();
-    if let PagNodeKind::Var(v) = pag.nodes[node.0 as usize].kind {
-        if let Some(&loc) = pag.var_location.get(&v) {
-            set.insert(loc);
-        }
+) -> bool {
+    if pts.get(&node).map(|s| !s.is_empty()).unwrap_or(false) {
+        return true;
     }
-    set
+    match pag.nodes[node.0 as usize].kind {
+        PagNodeKind::Var(v) => pag.var_location.contains_key(&v),
+        _ => false,
+    }
 }
 
 fn wire_params(
@@ -311,7 +421,7 @@ fn wire_params(
     cs: &trace_ir::CallSite,
     callee: FnId,
     st: &mut SolverState,
-    wired: &mut FxHashSet<(CallSiteId, u32)>,
+    wired: &mut FxHashSet<(CallSiteId, u32, FnId)>,
 ) {
     let callee_fn = program.symbols.function(callee);
     for (i, formal) in callee_fn.params.iter().enumerate() {
@@ -322,34 +432,44 @@ fn wire_params(
             if let Some(actual_pts) = st.pts.get(&actual_node).cloned() {
                 propagate_pts(st, formal_node, &actual_pts);
             }
-            wired.insert((cs.id, idx));
+            wired.insert((cs.id, idx, callee));
         } else if let Some(fn_id) = cs.fn_args.iter().find(|(j, _)| *j == idx).map(|(_, f)| *f) {
             let formal_node = pag.var_node.get(formal).copied().expect("formal var node");
             if let Some(&fn_loc) = pag.fn_locations.get(&fn_id) {
                 add_pts(st, formal_node, fn_loc);
             }
-            wired.insert((cs.id, idx));
+            wired.insert((cs.id, idx, callee));
         }
     }
 }
 
 fn propagate_pts(st: &mut SolverState, dst: PagNodeId, src_pts: &FxHashSet<LocId>) {
-    let mut changed = false;
-    let entry = st.pts.entry(dst).or_default();
-    for &loc in src_pts {
-        if entry.insert(loc) {
-            st.loc_nodes.entry(loc).or_default().insert(dst);
-            changed = true;
+    let mut new_locs: Vec<LocId> = Vec::new();
+    {
+        let entry = st.pts.entry(dst).or_default();
+        for &loc in src_pts {
+            if !entry.contains(&loc) {
+                new_locs.push(loc);
+            }
         }
     }
-    if changed {
-        st.push(dst);
+    if new_locs.is_empty() {
+        return;
     }
+    let entry = st.pts.get_mut(&dst).expect("entry just created");
+    for loc in new_locs {
+        entry.insert(loc);
+        st.loc_nodes.entry(loc).or_default().insert(dst);
+    }
+    st.push(dst);
 }
 
 fn add_pts(st: &mut SolverState, node: PagNodeId, loc: LocId) {
-    let entry = st.pts.entry(node).or_default();
-    if entry.insert(loc) {
+    let inserted = {
+        let entry = st.pts.entry(node).or_default();
+        entry.insert(loc)
+    };
+    if inserted {
         st.loc_nodes.entry(loc).or_default().insert(node);
         st.push(node);
     }
@@ -367,7 +487,7 @@ fn fn_for_loc(pag: &Pag, loc: LocId) -> Option<FnId> {
 fn extract_arg_flow(
     program: &Program,
     call_edges: &[CallGraphEdge],
-    wired: &FxHashSet<(CallSiteId, u32)>,
+    wired: &FxHashSet<(CallSiteId, u32, FnId)>,
     result: &mut AnalysisResult,
 ) {
     for edge in call_edges {
@@ -380,7 +500,7 @@ fn extract_arg_flow(
         let callee = program.symbols.function(edge.callee);
         for (i, formal) in callee.params.iter().enumerate() {
             let idx = i as u32;
-            if wired.contains(&(edge.call_site, idx)) {
+            if wired.contains(&(edge.call_site, idx, edge.callee)) {
                 if let Some(actual) = cs.var_args.iter().find(|(j, _)| *j == idx).map(|(_, v)| *v) {
                     result.arg_flow_edges.push(ArgFlowEdge {
                         call_site: edge.call_site,
@@ -402,5 +522,33 @@ fn extract_arg_flow(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_by_name_classifies_plain_identifiers() {
+        let mk = |callee_name: &str, callee_var: Option<u32>, is_direct: bool| trace_ir::CallSite {
+            id: trace_ir::CallSiteId(0),
+            caller: trace_ir::FnId(0),
+            callee_name: callee_name.into(),
+            callee_var: callee_var.map(trace_ir::VarId),
+            var_args: Vec::new(),
+            fn_args: Vec::new(),
+            span: trace_ir::Span {
+                file: trace_ir::FileId(0),
+                line: 1,
+                col: 1,
+            },
+            is_direct,
+        };
+        assert!(direct_by_name(&mk("OsalMemCalloc", None, false)));
+        assert!(direct_by_name(&mk("f", None, true)));
+        assert!(!direct_by_name(&mk("ops->Dispatch", None, false)));
+        assert!(!direct_by_name(&mk("obj.fn", None, false)));
+        assert!(!direct_by_name(&mk("fp", Some(3), false)));
     }
 }

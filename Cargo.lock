@@ -626,6 +626,7 @@ name = "trace-ir"
 version = "0.1.0"
 dependencies = [
  "indexmap",
+ "rustc-hash",
  "serde",
  "thiserror",
 ]

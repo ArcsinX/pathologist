@@ -1,6 +1,7 @@
 use crate::{CallSiteId, FileId, FnId, Span, TypeId, VarId};
 use indexmap::IndexMap;
-use std::path::PathBuf;
+use rustc_hash::FxHashMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Linkage {
@@ -69,6 +70,16 @@ pub struct SymbolTable {
     pub call_sites: Vec<CallSite>,
     pub fn_by_name: IndexMap<String, FnId>,
     pub global_by_name: IndexMap<String, VarId>,
+    /// Internal-linkage definitions per file: `(file, name) -> FnId`.
+    /// In C, a file-`static` definition shadows any external definition of
+    /// the same name for references inside that file.
+    fn_by_scope: FxHashMap<FileId, FxHashMap<String, FnId>>,
+    /// Headers whose entities were attributed to this TU during lowering
+    /// (`#include`d code). Scope resolution consults them so a `static`
+    /// inline defined in a header stays visible to its includers after
+    /// cross-TU deduplication collapsed the per-TU copies.
+    headers_of: FxHashMap<FileId, std::collections::BTreeSet<FileId>>,
+    file_by_path: FxHashMap<PathBuf, FileId>,
     next_fn: u32,
     next_var: u32,
     next_call: u32,
@@ -79,6 +90,33 @@ impl SymbolTable {
         let id = FileId(self.files.len() as u32);
         self.files.push(FileInfo { id, path });
         id
+    }
+
+    /// Intern a file by path: repeated origins (the same header reached
+    /// through many TUs) map to one [`FileId`].
+    pub fn add_file_interned(&mut self, path: PathBuf) -> FileId {
+        if let Some(&id) = self.file_by_path.get(&path) {
+            return id;
+        }
+        let id = self.add_file(path.clone());
+        self.file_by_path.insert(path, id);
+        id
+    }
+
+    pub fn file_by_path(&self, path: &Path) -> Option<FileId> {
+        self.file_by_path.get(path).copied()
+    }
+
+    /// Register that `header` contributes entities lowered while indexing
+    /// `tu` (directly or transitively).
+    pub fn register_included_header(&mut self, tu: crate::FileId, header: crate::FileId) {
+        if tu != header {
+            self.headers_of.entry(tu).or_default().insert(header);
+        }
+    }
+
+    pub fn included_headers(&self, tu: crate::FileId) -> Option<&std::collections::BTreeSet<crate::FileId>> {
+        self.headers_of.get(&tu)
     }
 
     pub fn add_function(&mut self, func: Function) -> FnId {
@@ -99,6 +137,16 @@ impl SymbolTable {
                 }
             }
             self.fn_by_name.insert(func.name.clone(), func.id);
+        }
+        if func.linkage == Linkage::Internal {
+            // Index every internal-linkage entry, declarations included:
+            // lowering resolves identifiers against this table *while the
+            // file streams in*, so a designated initializer like
+            // `.Read = StaticFn` must bind before the definition is lowered.
+            self.fn_by_scope
+                .entry(func.file)
+                .or_default()
+                .insert(func.name.clone(), func.id);
         }
         let id = func.id;
         self.functions.push(func);
@@ -136,20 +184,81 @@ impl SymbolTable {
         self.fn_by_name.get(name).copied()
     }
 
-    /// Resolve by external name table first, then file-local/static definitions.
+    /// Resolve by C scoping rules: an internal-linkage (`static`) definition
+    /// in `file` shadows any external definition of the same name for
+    /// references inside that file; otherwise fall back to the external name
+    /// table. `#include`d headers contributing entities to `file` are part
+    /// of its scope (TU-local wins over header-defined on name collision).
     pub fn resolve_function_in_scope(
         &self,
         name: &str,
         file: Option<crate::FileId>,
     ) -> Option<FnId> {
-        if let Some(id) = self.fn_by_name.get(name) {
-            return Some(*id);
+        if let Some(file) = file {
+            if let Some(id) = self.lookup_in_scopes(name, file) {
+                return Some(id);
+            }
         }
-        let file = file?;
-        self.functions
-            .iter()
-            .find(|f| f.name == name && f.file == file)
-            .map(|f| f.id)
+        self.fn_by_name.get(name).copied()
+    }
+
+    fn lookup_in_scopes(&self, name: &str, file: crate::FileId) -> Option<FnId> {
+        if let Some(scope) = self.fn_by_scope.get(&file) {
+            if let Some(id) = scope.get(name) {
+                return Some(*id);
+            }
+        }
+        if let Some(headers) = self.headers_of.get(&file) {
+            for h in headers {
+                if let Some(scope) = self.fn_by_scope.get(h) {
+                    if let Some(id) = scope.get(name) {
+                        return Some(*id);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// All functions a post-merge name lookup may refer to.
+    ///
+    /// Name-based facts (`CallReturn`, `ReturnFlow::Call`, recovered direct
+    /// calls) lose the calling TU's visibility context at merge time, so a
+    /// name that matches both a file-`static` definition and an external
+    /// definition is genuinely ambiguous there. Per may-analysis semantics
+    /// (over-approximate when uncertain) callers must consider every
+    /// candidate. Paths that preserved callee ids through lowering + merge
+    /// should use those ids directly instead — they are exact.
+    pub fn resolve_function_candidates(
+        &self,
+        name: &str,
+        file: Option<crate::FileId>,
+    ) -> Vec<FnId> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(file) = file {
+            if let Some(scope) = self.fn_by_scope.get(&file) {
+                if let Some(&id) = scope.get(name) {
+                    out.push(id);
+                }
+            }
+            if let Some(headers) = self.headers_of.get(&file) {
+                for h in headers {
+                    if let Some(scope) = self.fn_by_scope.get(h) {
+                        if let Some(&id) = scope.get(name) {
+                            if !out.contains(&id) {
+                                out.push(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(&id) = self.fn_by_name.get(name) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
     }
 
     pub fn function_by_id(&self, id: FnId) -> Option<&Function> {

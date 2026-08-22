@@ -64,7 +64,7 @@ Functions record abstract return values in `program.fn_returns`:
 
 `return &local` is recorded as `AddrOfVar` but is **unsound** for stack locals (may-analysis may report escaped addresses). Prefer treating this as a known imprecision.
 
-At PAG build time, `CallReturn` resolves `callee_name` with **`resolve_function_in_scope(name, file)`** (external table first, then file-local / `static` definition in the same TU) and expands the callee's `ReturnFlow` facts into `AddrOf`/`Copy` constraints on `dst`.
+At PAG build time, `CallReturn` resolves `callee_name` with **`resolve_function_candidates(name, file)`** — every function the merged name may refer to: the query file's internal-linkage entries (`fn_by_scope`, declarations included) plus the canonical external definition. Name-based facts lose the calling TU's visibility context at merge time, so a name matching both a file-`static` def and an external def is genuinely ambiguous; per may-analysis semantics all candidates are expanded. Callee ids that survived lowering + merge (e.g. `AddrOfFn`) are used directly instead — they are exact.
 
 This models patterns like:
 
@@ -141,7 +141,13 @@ When `pts(base)` is empty (typical for pointer parameters with no incoming flow)
 
 **Direct calls**
 
-Resolved at solver start from `call_sites` with `is_direct = true`, using **`resolve_function_in_scope(callee_name, call_site.file)`** so **`static` / internal-linkage** callees in the same `.c` file match (not only the external `fn_by_name` table).
+Sites lowering marked `is_direct = true` saw the TU-local binding, so scope-first **`resolve_function_in_scope(callee_name, call_site.file)`** is exact per C visibility rules: a file-`static` definition shadows same-name external functions inside its own TU (backed by the `fn_by_scope` index, which includes internal *declarations* — lowering streams a file top-down and initializers like `.Read = StaticFn` must bind before the definition is lowered).
+
+Because header-defined functions are deduplicated to their header origin at merge time, `fn_by_scope` entries for them live under the header's `FileId`. Scope resolution therefore also consults **`headers_of(file)`** — the set of headers that contributed entities to a TU — so an includer still sees the header's internal-linkage definitions; TU-local definitions keep precedence on name collision.
+
+**Cross-TU direct-call recovery**
+
+A plain call whose definition lives in another TU is lowered with `is_direct = false` (the callee symbol is not visible in the calling TU). At solve time, sites that are *not* direct, have no `callee_var`, and whose callee text is a bare identifier are recovered as direct-by-name calls via `direct_by_name`, expanding **all** `resolve_function_candidates` (may-approximation — see `CallReturn` above). Without this, every cross-TU call to a function declared through a pointer-returning prototype (e.g. `T *f(void);`) would be dropped, because such prototypes previously also produced phantom variables — lowering now registers functions for pointer-wrapped declarators instead.
 
 ### Analyze options
 
@@ -165,6 +171,16 @@ When `retain_points_to` is false (default), points-to sets are discarded after s
 - **Constant index**: treated conservatively (element refinement is future work).
 - **Unknown subscript**: `ArraySummary` — all elements merged.
 - **`ArrayFnMember`**: each initializer function is merged into the array var's points-to; any subscript call may target **any** listed function.
+- **Nested initializer lists** (`{ {TYPE, Fn}, ... }`, `{ {.init = Fn}, ... }`): element expressions are visited recursively, so arrays of structs with fn-ptr members feed `ArrayFnMember` facts into the table var. Element fn values flow through field loads on the array itself *and* through pointers to elements (`m = &arr[i]; m->fn()`), regardless of worklist order.
+
+## Member subobject addressing
+
+`&outer.member` lowers to a gep-temp chain targeting the member's own abstract
+location, typed by the member's declared struct — not to a flattened address of
+the outer instance. Field loads through such pointers resolve fields against
+the member's type (`dev->service = &inst.service; ... service->Dispatch`
+resolves `Dispatch`, not same-index members of the outer struct). Arrays of
+structs peel to their element type for field resolution (`arr[i].field`).
 
 ## Indirect call resolution patterns
 
@@ -214,6 +230,11 @@ Registered in `trace-analysis/src/summaries.rs` (`apply_call_summary`). Current 
 - `free` does not invalidate pointers.
 - `FieldSummary` may connect unrelated struct instances.
 - Multiple vtable/ops targets reported for one indirect site (may-analysis).
+- **Casts of struct instances to another ops type** (`svc = (IOps *)&inst`):
+  the whole instance flows into the target-typed slot, so field loads on it
+  resolve against the *outer* layout plus its type-matched summary — sibling
+  fields at colliding positional indexes can cross into such loads (observed
+  as ~2% of Dispatch-site edges on HDF test drivers).
 - **`memcpy` / `memmove`**: invisible to analysis.
 - **C++ TUs** (`.cpp`) not indexed — impls only in C++ may be missing.
 - Macro-generated identifiers may be skipped when classified as macro-like callees.

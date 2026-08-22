@@ -123,7 +123,7 @@ Default job count: logical CPU count.
 
 ## Source locations
 
-Spans are taken from **tree-sitter positions on preprocessed source** (the `.c` file path, expanded line numbers). The preprocessor maintains a `LineMap` for mapping output offsets to original files, but **exported line numbers today match the preprocessed TU**, not necessarily the on-disk file before includes/macros.
+Spans are resolved through the preprocessor `LineMap`: entities lowered from `#include`d code are attributed to their **original file** with original line/column; TU-local code keeps tree-sitter positions on the preprocessed text (identical to the raw file when no preprocessing occurred). During merge, entities with the same origin (header file + name + line) are **deduplicated across translation units** — the first copy wins and later copies' references are redirected to it — so a header-defined function or its internal call sites appear once, attributed to the header, instead of once per including TU.
 
 ## Error handling
 

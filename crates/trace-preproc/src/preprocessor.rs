@@ -36,6 +36,9 @@ struct PreprocessorState {
     diagnostics: Vec<Diagnostic>,
     current_file: PathBuf,
     current_line: u32,
+    /// Interned index of `current_file` in `line_map.files`; `u32::MAX`
+    /// means "not interned yet" (re-interned lazily when the file changes).
+    lm_cur_file: u32,
 }
 
 impl PreprocessorState {
@@ -51,6 +54,7 @@ impl PreprocessorState {
             diagnostics: Vec::new(),
             current_file: file,
             current_line: 1,
+            lm_cur_file: u32::MAX,
         };
         if let Some(shared) = &state.opts.shared_macros {
             if let Ok(guard) = shared.read() {
@@ -113,21 +117,35 @@ impl PreprocessorState {
         self.conditional_stack.iter().all(|&b| b)
     }
 
+    /// Intern a path into the line-map file table (no-op if present).
+    fn lm_intern(&mut self, path: &Path) -> u32 {
+        self.line_map.intern_file(path)
+    }
+
+    /// Index of the current file in the line-map table, re-interned only
+    /// when `current_file` changed since the last call.
+    fn lm_current_file(&mut self) -> u32 {
+        if self.lm_cur_file == u32::MAX
+            || self.line_map.files.get(self.lm_cur_file as usize) != Some(&self.current_file)
+        {
+            self.lm_cur_file = self.line_map.intern_file(&self.current_file);
+        }
+        self.lm_cur_file
+    }
+
     fn emit_token(&mut self, tok: &Token) {
         if matches!(tok.kind, TokenKind::Eof) {
             return;
         }
-        if !matches!(tok.kind, TokenKind::Newline)
-            && needs_leading_space(&self.output, &tok.kind)
-        {
+        if !matches!(tok.kind, TokenKind::Newline) && needs_leading_space(&self.output, &tok.kind) {
             self.output.push(' ');
         }
         let offset = self.output.len();
         let text = token_to_string(&tok.kind);
         self.output.push_str(&text);
         if self.opts.track_line_map {
-            self.line_map
-                .push(offset, self.current_file.clone(), tok.line, tok.col);
+            let fid = self.lm_current_file();
+            self.line_map.push(offset, fid, tok.line, tok.col);
         }
         if matches!(tok.kind, TokenKind::Newline) {
             self.current_line += 1;
@@ -138,8 +156,8 @@ impl PreprocessorState {
         let offset = self.output.len();
         self.output.push_str(s);
         if self.opts.track_line_map {
-            self.line_map
-                .push(offset, self.current_file.clone(), line, col);
+            let fid = self.lm_current_file();
+            self.line_map.push(offset, fid, line, col);
         }
     }
 
@@ -175,7 +193,18 @@ impl PreprocessorState {
                 .ok()
                 .and_then(|guard| guard.get(&canonical).cloned());
             if let Some(entry) = cached {
-                self.emit_str(&entry.text, 1, 1);
+                let offset = self.output.len();
+                self.output.push_str(&entry.text);
+                if self.opts.track_line_map {
+                    // Renumber the cached expansion's file indices into this
+                    // run's intern table, then splice its entries.
+                    let mut remap = Vec::with_capacity(entry.line_map.files.len());
+                    for p in &entry.line_map.files {
+                        remap.push(self.lm_intern(p));
+                    }
+                    let sub = &entry.line_map;
+                    self.line_map.splice(sub, offset, &remap);
+                }
                 self.included_guard.extend(entry.files.iter().cloned());
                 return Ok(());
             }
@@ -223,7 +252,7 @@ impl PreprocessorState {
         self.include_stack.pop();
         self.current_file = prev_file;
 
-        if cache_header {
+        if cache_header && !self.opts.frozen_expansion_cache {
             if let Some(cache) = &self.opts.include_expansion_cache {
                 let text: Arc<str> = self.output[output_start..].into();
                 if !text.is_empty() {
@@ -232,10 +261,15 @@ impl PreprocessorState {
                         .difference(&guard_snapshot)
                         .cloned()
                         .collect();
+                    let line_map = Arc::new(
+                        self.line_map
+                            .slice_from(output_start),
+                    );
                     if let Ok(mut guard) = cache.write() {
                         guard.entry(canonical).or_insert(crate::IncludeExpansion {
                             text,
                             files: Arc::new(new_files),
+                            line_map,
                         });
                     }
                 }

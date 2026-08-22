@@ -7,7 +7,7 @@ int global_x;
 void init(int **pp) { *pp = &global_x; }
 void caller(void) { int *p; init(&p); }
 "#;
-    let parsed = parse_c_source(src.to_string()).unwrap();
+    let parsed = parse_c_source(src).unwrap();
     fn walk(node: tree_sitter::Node, depth: usize) {
         if depth <= 8 {
             println!("{}{}", "  ".repeat(depth), node.kind());

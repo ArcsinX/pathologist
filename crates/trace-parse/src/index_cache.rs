@@ -2,12 +2,22 @@ use crate::deps::IncludeGraph;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use trace_preproc::{preprocess_file, PreprocessOptions};
+use trace_preproc::{preprocess_file, LineMap, PreprocessOptions};
+
+/// Preprocessed text plus its origin map for one canonical file path.
+#[derive(Debug, Clone)]
+pub struct PreprocessedSource {
+    pub text: Arc<str>,
+    /// Maps preprocessed offsets back to original `(file, line, col)`.
+    /// Empty when the file was not preprocessed (raw source: tree-sitter
+    /// positions already refer to original locations).
+    pub line_map: Arc<LineMap>,
+}
 
 /// Preprocessed source text for indexing (one entry per canonical file path).
 #[derive(Debug, Clone, Default)]
 pub struct IndexSourceCache {
-    inner: Arc<RwLock<HashMap<PathBuf, Arc<str>>>>,
+    inner: Arc<RwLock<HashMap<PathBuf, Arc<PreprocessedSource>>>>,
 }
 
 impl IndexSourceCache {
@@ -22,22 +32,23 @@ impl IndexSourceCache {
         path: &Path,
         graph: &IncludeGraph,
         eff_opts: &PreprocessOptions,
-    ) -> Result<Arc<str>, String> {
+    ) -> Result<Arc<PreprocessedSource>, String> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if let Ok(guard) = self.inner.read() {
-            if let Some(text) = guard.get(&canonical) {
-                return Ok(Arc::clone(text));
+            if let Some(src) = guard.get(&canonical) {
+                return Ok(Arc::clone(src));
             }
         }
 
-        let text = read_index_source(path, graph, eff_opts)?;
-        let arc: Arc<str> = text.into();
+        let (text, line_map) = read_index_source(path, graph, eff_opts)?;
+        let src = Arc::new(PreprocessedSource {
+            text: text.into(),
+            line_map: Arc::new(line_map),
+        });
         if let Ok(mut guard) = self.inner.write() {
-            guard
-                .entry(canonical)
-                .or_insert_with(|| Arc::clone(&arc));
+            guard.entry(canonical).or_insert_with(|| Arc::clone(&src));
         }
-        Ok(arc)
+        Ok(src)
     }
 }
 
@@ -45,26 +56,26 @@ fn read_index_source(
     path: &Path,
     graph: &IncludeGraph,
     eff_opts: &PreprocessOptions,
-) -> Result<String, String> {
+) -> Result<(String, LineMap), String> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !should_preprocess(path, eff_opts, graph) {
         if let Some(s) = graph.source_cache.get(&canonical) {
-            return Ok(s.clone());
+            return Ok((s.clone(), LineMap::new()));
         }
-        return std::fs::read_to_string(path).map_err(|e| e.to_string());
+        return std::fs::read_to_string(path).map(|s| (s, LineMap::new())).map_err(|e| e.to_string());
     }
-    let preproc_result = preprocess_file(path, eff_opts).map_err(|e| e.to_string())?;
+    let preproc_result = preprocess_file(&canonical, eff_opts).map_err(|e| e.to_string())?;
     let preproc_failed = preproc_result.diagnostics.iter().any(|d| {
         matches!(d.severity, trace_preproc::DiagnosticSeverity::Error)
             || d.message.contains("preprocess stopped")
     });
     if preproc_failed {
         if let Some(s) = graph.source_cache.get(&canonical) {
-            return Ok(s.clone());
+            return Ok((s.clone(), LineMap::new()));
         }
-        std::fs::read_to_string(path).map_err(|e| e.to_string())
+        std::fs::read_to_string(path).map(|s| (s, LineMap::new())).map_err(|e| e.to_string())
     } else {
-        Ok(preproc_result.output)
+        Ok((preproc_result.output, preproc_result.line_map))
     }
 }
 
@@ -92,7 +103,8 @@ mod tests {
         let empty = PreprocessOptions::default();
         assert!(should_preprocess(&path, &empty, &graph));
 
-        let with_include = PreprocessOptions::default().with_include(PathBuf::from("/proj/include"));
+        let with_include =
+            PreprocessOptions::default().with_include(PathBuf::from("/proj/include"));
         assert!(should_preprocess(&path, &with_include, &graph));
     }
 
@@ -105,8 +117,6 @@ mod tests {
         };
         let opts = PreprocessOptions::default();
         let missing = PathBuf::from("/nonexistent/definitely_missing_trace_file.c");
-        assert!(cache
-            .get_or_preprocess(&missing, &graph, &opts)
-            .is_err());
+        assert!(cache.get_or_preprocess(&missing, &graph, &opts).is_err());
     }
 }
