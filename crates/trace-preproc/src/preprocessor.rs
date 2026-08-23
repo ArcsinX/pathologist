@@ -1,6 +1,6 @@
 use crate::macros::{MacroDef, MacroTable};
 use crate::{Diagnostic, DiagnosticSeverity, Lexer, LineMap, PreprocessOptions, Token, TokenKind};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,6 +36,11 @@ struct PreprocessorState {
     diagnostics: Vec<Diagnostic>,
     current_file: PathBuf,
     current_line: u32,
+    /// Bytes each processed file contributed to `output`. Files whose
+    /// expansion was fully skipped (e.g. by an already-defined include
+    /// guard) record 0 and must not be claimed as content-bearing by a
+    /// parent's cached `IncludeExpansion::files`.
+    emitted_bytes: HashMap<PathBuf, usize>,
     /// Interned index of `current_file` in `line_map.files`; `u32::MAX`
     /// means "not interned yet" (re-interned lazily when the file changes).
     lm_cur_file: u32,
@@ -54,6 +59,7 @@ impl PreprocessorState {
             diagnostics: Vec::new(),
             current_file: file,
             current_line: 1,
+            emitted_bytes: HashMap::new(),
             lm_cur_file: u32::MAX,
         };
         if let Some(shared) = &state.opts.shared_macros {
@@ -181,33 +187,60 @@ impl PreprocessorState {
         PreprocessError::Message { message: msg }
     }
 
+    /// Replay a cached expansion into the output. Returns false when no
+    /// entry exists for `canonical`.
+    fn splice_cached(&mut self, canonical: &Path) -> bool {
+        let Some(cache) = &self.opts.include_expansion_cache else {
+            return false;
+        };
+        let Some(entry) = cache
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(canonical).cloned())
+        else {
+            return false;
+        };
+        let offset = self.output.len();
+        self.output.push_str(&entry.text);
+        if self.opts.track_line_map {
+            // Renumber the cached expansion's file indices into this run's
+            // intern table, then splice its entries.
+            let mut remap = Vec::with_capacity(entry.line_map.files.len());
+            for p in &entry.line_map.files {
+                remap.push(self.lm_intern(p));
+            }
+            let sub = &entry.line_map;
+            self.line_map.splice(sub, offset, &remap);
+        }
+        self.included_guard.extend(entry.files.iter().cloned());
+        true
+    }
+
     fn process_file(&mut self, path: &Path) -> Result<(), PreprocessError> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if self.included_guard.contains(&canonical) {
+            // Already expanded earlier in this run — normally a silent skip.
+            // But cached expansions are flat text: an entry built while this
+            // file was skipped freezes WITHOUT its content, and consumers
+            // that reach these definitions only through that entry lose them
+            // permanently (verified FN-class loss on real corpora). So while
+            // entries are being CONSTRUCTED (non-frozen phases), re-splice
+            // the cached text to keep every entry self-contained; duplicate
+            // definitions are harmless downstream (merge deduplicates
+            // same-origin entities and re-declarations remain valid C).
+            //
+            // In frozen phases nothing is cached and every replayed entry is
+            // already self-contained, so the definitions are guaranteed to
+            // exist somewhere in this run's output — splicing there would
+            // only duplicate parse/lower work (measured +48% index time).
+            if !self.opts.frozen_expansion_cache {
+                self.splice_cached(&canonical);
+            }
             return Ok(());
         }
 
-        if let Some(cache) = &self.opts.include_expansion_cache {
-            let cached = cache
-                .read()
-                .ok()
-                .and_then(|guard| guard.get(&canonical).cloned());
-            if let Some(entry) = cached {
-                let offset = self.output.len();
-                self.output.push_str(&entry.text);
-                if self.opts.track_line_map {
-                    // Renumber the cached expansion's file indices into this
-                    // run's intern table, then splice its entries.
-                    let mut remap = Vec::with_capacity(entry.line_map.files.len());
-                    for p in &entry.line_map.files {
-                        remap.push(self.lm_intern(p));
-                    }
-                    let sub = &entry.line_map;
-                    self.line_map.splice(sub, offset, &remap);
-                }
-                self.included_guard.extend(entry.files.iter().cloned());
-                return Ok(());
-            }
+        if self.splice_cached(&canonical) {
+            return Ok(());
         }
 
         let cache_header = self.opts.include_expansion_cache.is_some()
@@ -246,19 +279,50 @@ impl PreprocessorState {
 
         let tokens = Lexer::new(&content).tokenize();
         if let Err(e) = self.process_tokens(&tokens) {
-            self.warn(1, format!("preprocess stopped: {e}"));
+            // Attribute the stop to the file being processed when it failed,
+            // not the including TU — downstream consumers key fallback and
+            // reporting decisions off this message.
+            self.warn(
+                1,
+                format!("preprocess stopped in {}: {e}", self.current_file.display()),
+            );
         }
 
         self.include_stack.pop();
         self.current_file = prev_file;
 
+        let emitted = self.output.len() - output_start;
+        self.emitted_bytes.insert(canonical.clone(), emitted);
+        if cache_header
+            && !self.opts.frozen_expansion_cache
+            && emitted == 0
+            && content.chars().any(|c| !c.is_whitespace())
+        {
+            // The include resolved but its entire body was skipped — almost
+            // always an include guard already defined in the shared macro
+            // environment. Content silently missing from a cached expansion
+            // is the failure mode that starves translation units later, so
+            // make it visible during the (sequential) warm/index phases.
+            self.diagnostics.push(Diagnostic {
+                severity: DiagnosticSeverity::Warning,
+                file: Some(path.to_path_buf()),
+                line: 1,
+                message: "resolved include expanded to nothing (guard already defined?)".into(),
+            });
+        }
+
         if cache_header && !self.opts.frozen_expansion_cache {
             if let Some(cache) = &self.opts.include_expansion_cache {
                 let text: Arc<str> = self.output[output_start..].into();
                 if !text.is_empty() {
+                    // Claim only files whose expansion actually contributed
+                    // bytes. Guard-skipped files emit nothing; claiming them
+                    // would make replaying consumers treat the paths as
+                    // already included while their content is absent.
                     let new_files: HashSet<PathBuf> = self
                         .included_guard
                         .difference(&guard_snapshot)
+                        .filter(|p| self.emitted_bytes.get(*p).copied().unwrap_or(usize::MAX) > 0)
                         .cloned()
                         .collect();
                     let line_map = Arc::new(
@@ -1085,6 +1149,8 @@ pub fn preprocess_string(source: &str, file: &Path, opts: &PreprocessOptions) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::options::IncludeExpansion;
+    use std::sync::RwLock;
 
     #[test]
     fn expands_function_like_macro() {
@@ -1259,5 +1325,129 @@ mod tests {
             .diagnostics
             .iter()
             .any(|d| { d.message.contains("expected identifier in directive") }));
+    }
+
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trace_preproc_{}_{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Regression: a nested include whose expansion is fully skipped by an
+    /// already-defined guard must (a) warn and (b) NOT be claimed as
+    /// content-bearing in the parent's cached `IncludeExpansion::files`.
+    /// Claiming it made replaying translation units treat the header as
+    /// already included while its content was silently absent.
+    #[test]
+    fn guard_skipped_include_not_claimed_and_warned() {
+        let dir = unique_tmp_dir("guard_starve");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+
+        // Same content, same guard, two paths: only one can be cached.
+        let list_src = "#ifndef LIST_H\n#define LIST_H\nstruct Node { int v; };\n#endif\n";
+        fs::write(a.join("list.h"), list_src).unwrap();
+        fs::write(b.join("list.h"), list_src).unwrap();
+        fs::write(
+            dir.join("outer.h"),
+            "#include \"list.h\"\nint outer_use(void);\n",
+        )
+        .unwrap();
+
+        let shared = Arc::new(RwLock::new(MacroTable::new()));
+        let cache: Arc<RwLock<HashMap<PathBuf, IncludeExpansion>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Warm-style pass over the first twin: defines LIST_H, caches text.
+        let warm_opts = PreprocessOptions::new()
+            .with_shared_macros(Arc::clone(&shared))
+            .with_accumulate_macros(true)
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_include(a.clone());
+        let r1 = preprocess_file(&a.join("list.h"), &warm_opts).unwrap();
+        assert!(r1.output.contains("Node"), "{}", r1.output);
+
+        // Second pass reaching the OTHER twin through outer.h: the guard is
+        // already defined in the shared table, so b/list.h expands to
+        // nothing inline.
+        let index_opts = PreprocessOptions::new()
+            .with_shared_macros(Arc::clone(&shared))
+            .with_accumulate_macros(true)
+            .with_include_expansion_cache(Arc::clone(&cache))
+            .with_include(b.clone());
+        let r2 = preprocess_file(&dir.join("outer.h"), &index_opts).unwrap();
+        // Documented consequence: content behind the leaked guard is absent.
+        assert!(
+            !r2.output.contains("Node"),
+            "starved expansion expected here"
+        );
+        // (a) the starvation is visible as a diagnostic
+        assert!(
+            r2.diagnostics
+                .iter()
+                .any(|d| d.message.contains("expanded to nothing")),
+            "{:?}",
+            r2.diagnostics
+        );
+        // (b) outer.h's cached entry must not claim b/list.h as content-bearing
+        let outer_entry = cache.read().unwrap().get(&dir.join("outer.h")).cloned();
+        let claimed_b = outer_entry
+            .as_ref()
+            .map(|e| e.files.iter().any(|f| *f == b.join("list.h")))
+            .unwrap_or(false);
+        assert!(
+            !claimed_b,
+            "claimed starved file: {:?}",
+            outer_entry.map(|e| e.files.clone())
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Frozen (TU-phase) preprocessing must stay silent about guard-skipped
+    /// includes: workers expand misses inline per TU and warnings there would
+    /// repeat per translation unit.
+    #[test]
+    fn frozen_cache_does_not_warn_on_guard_skip() {
+        let dir = unique_tmp_dir("frozen_quiet");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("g.h"), "#ifndef G_H\n#define G_H\nint g(void);\n#endif\n").unwrap();
+
+        let shared = Arc::new(RwLock::new(MacroTable::new()));
+        {
+            let mut t = shared.write().unwrap();
+            use crate::macros::MacroDef;
+            use crate::{Lexer, TokenKind};
+            let toks: Vec<_> = Lexer::new("1")
+                .tokenize()
+                .into_iter()
+                .filter(|t| !matches!(t.kind, TokenKind::Eof))
+                .collect();
+            t.insert("G_H".to_string(), MacroDef::Object { replacement: toks });
+        }
+        let cache: Arc<RwLock<HashMap<PathBuf, IncludeExpansion>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let opts = PreprocessOptions::new()
+            .with_shared_macros(Arc::clone(&shared))
+            .with_include_expansion_cache(cache)
+            .with_frozen_expansion_cache(true)
+            .with_include(dir.clone());
+        let src = "#include \"g.h\"\nint main(void){return 0;}\n";
+        let r = preprocess_string(src, &dir.join("m.c"), &opts);
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.message.contains("expanded to nothing")),
+            "{:?}",
+            r.diagnostics
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

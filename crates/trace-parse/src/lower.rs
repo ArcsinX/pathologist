@@ -4,6 +4,7 @@ use crate::index_cache::IndexSourceCache;
 use crate::merge::{merge_unit_index, UnitIndex};
 use crate::parse::{node_text, parse_c_source};
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,8 +12,30 @@ use trace_ir::{
     CallSite, Diagnostic, DiagnosticSeverity, FieldId, FlowConstraint, FnId, Function, Linkage,
     Program, ReturnFlow, Span, StorageClass, TypeDesc, VarId, Variable,
 };
-use trace_preproc::{macro_table_from_defines, PreprocessOptions};
+use trace_preproc::{macro_table_from_defines, MacroTable, PreprocessOptions};
 use tree_sitter::Node;
+
+/// A function-name reference whose resolution was deferred because the
+/// function is only defined later in the translation unit. C requires no
+/// forward declaration for these uses when the definition appears later
+/// in the same file, so lowering must not depend on encounter order.
+enum PendingFnRef {
+    /// `base.field = FnName`: emit `AddrOfFn` into a temp and `Store` it
+    /// into the already-materialized field address `dst`.
+    FieldStore {
+        dst: VarId,
+        name: String,
+        span: Span,
+    },
+    /// `dst = FnName` in an initializer/assignment RHS.
+    RhsIdent { dst: VarId, name: String },
+    /// `dst = &FnName`.
+    AddrOfIdent { dst: VarId, name: String },
+    /// `return FnName;` from function `owner`.
+    ReturnIdent { owner: FnId, name: String },
+    /// `return &FnName;` from function `owner`.
+    ReturnAddrOf { owner: FnId, name: String },
+}
 
 struct LowerContext {
     current_fn: Option<FnId>,
@@ -22,6 +45,10 @@ struct LowerContext {
     /// fall back to TU-anchored spans.
     line_map: Option<std::sync::Arc<trace_preproc::LineMap>>,
     primary_path: PathBuf,
+    /// Function references deferred to end-of-unit resolution.
+    /// `RefCell` keeps `&LowerContext` receivers usable in expression
+    /// helpers while still allowing deferred entries to be recorded.
+    pending: RefCell<Vec<PendingFnRef>>,
 }
 
 fn register_local(ctx: &mut LowerContext, name: String, id: VarId) {
@@ -69,9 +96,22 @@ pub fn build_program_with_jobs(
         .with_include_expansion_cache(Arc::clone(&include_expansion_cache))
         .with_basename_index(basename_index);
 
-    let shared_macros = Arc::new(std::sync::RwLock::new(macro_table_from_defines(
-        &opts.defines,
-    )));
+    // Warm each header under a FRESH macro environment seeded only from the
+    // command-line defines. Sharing one accumulating table across headers let
+    // include guards defined by earlier-warmed headers starve later headers'
+    // expansions: the starved (empty) text was frozen into the expansion cache
+    // and replayed to translation units, silently dropping every declaration
+    // behind those guards (verified FN class on real corpora). Dedup comes
+    // from the shared expansion cache instead; per-header tables only prevent
+    // cross-header guard leakage.
+    //
+    // Translation units still inherit a single table — the union of all
+    // headers' final macro states — because cached expansions are replayed
+    // without executing their #define directives, so TU-local code needs the
+    // macros those headers define.
+    let union_macros: Arc<std::sync::RwLock<MacroTable>> = Arc::new(std::sync::RwLock::new(
+        macro_table_from_defines(&opts.defines),
+    ));
     let project_headers: Vec<PathBuf> = include_graph
         .project_files
         .iter()
@@ -101,12 +141,18 @@ pub fn build_program_with_jobs(
     );
 
     let source_cache = IndexSourceCache::new();
-    let header_prep_opts = eff_opts
-        .clone()
-        .with_shared_macros(Arc::clone(&shared_macros))
-        .with_accumulate_macros(true);
     for path in &headers_for_macro_warm {
-        if let Err(e) = source_cache.get_or_preprocess(path, &include_graph, &header_prep_opts) {
+        let header_macros: Arc<std::sync::RwLock<MacroTable>> =
+            Arc::new(std::sync::RwLock::new(macro_table_from_defines(
+                &opts.defines,
+            )));
+        let header_prep_opts = eff_opts
+            .clone()
+            .with_shared_macros(Arc::clone(&header_macros))
+            .with_accumulate_macros(true);
+        if let Err(e) =
+            source_cache.get_or_preprocess(path, &include_graph, &header_prep_opts)
+        {
             program.add_diagnostic(Diagnostic {
                 severity: DiagnosticSeverity::Warning,
                 file: None,
@@ -114,6 +160,14 @@ pub fn build_program_with_jobs(
                 message: format!("macro warm preprocess failed for {}: {e}", path.display()),
                 stage: "preprocess".into(),
             });
+            continue;
+        }
+        if let Ok(mut union) = union_macros.write() {
+            if let Ok(done) = header_macros.read() {
+                for (name, def) in done.iter() {
+                    union.insert(name.clone(), def.clone());
+                }
+            }
         }
     }
 
@@ -122,7 +176,7 @@ pub fn build_program_with_jobs(
     // inserts are first-writer-wins races that make output scheduling-
     // dependent. Misses expand inline under each TU's own macro/guard state.
     let index_opts = eff_opts
-        .with_shared_macros(shared_macros)
+        .with_shared_macros(union_macros)
         .with_frozen_expansion_cache(true);
 
     let pool = rayon::ThreadPoolBuilder::new()
@@ -180,7 +234,71 @@ pub fn build_program_with_jobs(
         }
     }
 
+    finalize_extern_callees(&mut program);
+
     Ok(program)
+}
+
+/// Classify plain-identifier calls that resolve to no tree-local symbol
+/// (libc without tree headers, logging backends referenced only inside
+/// macros, vendor externs). Each unique name becomes one synthesized
+/// `Function` row with `is_defined: false`, and its call sites are marked
+/// resolved-to-external so the solver emits `External` edges instead of
+/// counting them as unresolved indirect noise. Synthesized entries are
+/// pushed directly (not via `add_function`) so they stay out of the name
+/// resolution maps and cannot shadow real definitions or feed param wiring.
+fn finalize_extern_callees(program: &mut Program) {
+    let mut names: Vec<(String, trace_ir::FileId, u32)> = program
+        .symbols
+        .call_sites
+        .iter()
+        .filter(|cs| {
+            !cs.is_direct
+                && cs.callee_var.is_none()
+                && cs.callee_fn_id.is_none()
+                && is_plain_ident(&cs.callee_name)
+        })
+        .map(|cs| (cs.callee_name.clone(), cs.span.file, cs.span.line))
+        .collect();
+    names.sort();
+    names.dedup_by(|a, b| a.0 == b.0);
+    for (name, file, line) in names {
+        // A symbol already exists for this name (in-tree prototype or
+        // definition): leave the site untouched so the solver's name-based
+        // recovery classifies it — defined-elsewhere resolves to a real
+        // Direct edge with param wiring; prototype-only becomes External.
+        // Synthesizing over it would orphan the real definition.
+        if program.symbols.resolve_function(&name).is_some() {
+            continue;
+        }
+        let fid = program.symbols.alloc_fn_id();
+        program.symbols.functions.push(trace_ir::Function {
+            id: fid,
+            name: name.clone(),
+            linkage: trace_ir::Linkage::External,
+            return_type: trace_ir::TypeId(0),
+            params: Vec::new(),
+            locals: Vec::new(),
+            span: trace_ir::Span { file, line, col: 0 },
+            file,
+            is_defined: false,
+        });
+        for cs in program.symbols.call_sites.iter_mut() {
+            if !cs.is_direct && cs.callee_var.is_none() && cs.callee_name == name {
+                cs.is_direct = true;
+                cs.callee_fn_id = Some(fid);
+            }
+        }
+    }
+}
+
+/// A call target that is syntactically a bare identifier — no field access,
+/// subscript, cast noise, or macro-artifact punctuation.
+fn is_plain_ident(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn normalize_discovered_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -217,7 +335,27 @@ fn index_source_file(
 ) -> UnitIndex {
     let mut program = Program::new(root.to_path_buf());
     match process_indexed_file(&mut program, path, graph, index_opts, source_cache) {
-        Ok(()) => program_into_unit(path.to_path_buf(), program),
+        Ok(()) => {
+            if std::env::var_os("TRACE_DEBUG_UNIT").is_some() {
+                let hdr = program
+                    .symbols
+                    .functions
+                    .iter()
+                    .filter(|f| {
+                        program.symbols.files.get(f.span.file.0 as usize).is_some_and(|fi| {
+                            fi.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("h"))
+                        })
+                    })
+                    .count();
+                eprintln!(
+                    "[unit] {} fns={} header_origin_fns={}",
+                    path.display(),
+                    program.symbols.functions.len(),
+                    hdr
+                );
+            }
+            program_into_unit(path.to_path_buf(), program)
+        }
         Err(e) => UnitIndex {
             path: path.to_path_buf(),
             diagnostics: vec![Diagnostic {
@@ -240,6 +378,13 @@ fn process_indexed_file(
     source_cache: &IndexSourceCache,
 ) -> Result<(), String> {
     let pre = source_cache.get_or_preprocess(path, graph, index_opts)?;
+    if let Some(dir) = std::env::var_os("TRACE_DUMP_TU_DIR") {
+        let fname = format!(
+            "tu_{}.i",
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or("x")
+        );
+        let _ = std::fs::write(std::path::Path::new(&dir).join(fname), pre.text.as_ref());
+    }
     let parsed = parse_c_source(pre.text.as_ref())?;
     if crate::parse::has_parse_errors(&parsed.tree) {
         program.add_diagnostic(Diagnostic {
@@ -258,9 +403,74 @@ fn process_indexed_file(
         locals: HashMap::new(),
         line_map: Some(std::sync::Arc::clone(&pre.line_map)),
         primary_path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+        pending: RefCell::new(Vec::new()),
     };
     lower_tree(program, &mut ctx, &parsed.source, parsed.tree.root_node());
+    resolve_pending_fn_refs(program, &ctx);
     Ok(())
+}
+
+/// Second-chance resolution for references recorded while lowering: the
+/// whole unit's symbol table is now populated, so definitions that appear
+/// after their use site are visible.
+fn resolve_pending_fn_refs(program: &mut Program, ctx: &LowerContext) {
+    let pending: Vec<PendingFnRef> = ctx.pending.borrow_mut().drain(..).collect();
+    for item in pending {
+        match item {
+            PendingFnRef::FieldStore { dst, name, span } => {
+                if let Some(callee) = resolve_function_named(program, ctx, &name) {
+                    let tmp = alloc_ret_temp_spanned(program, ctx, span);
+                    program.flow.push(FlowConstraint::AddrOfFn { dst: tmp, callee });
+                    program.flow.push(FlowConstraint::Store { dst, src: tmp });
+                }
+            }
+            PendingFnRef::RhsIdent { dst, name } => {
+                if let Some(callee) = resolve_function_named(program, ctx, &name) {
+                    program.flow.push(FlowConstraint::AddrOfFn { dst, callee });
+                } else if let Some(src) = lookup_var(ctx, program, &name) {
+                    // A tentative global defined after the use site.
+                    program.flow.push(FlowConstraint::Copy { dst, src });
+                }
+            }
+            PendingFnRef::AddrOfIdent { dst, name } => {
+                if let Some(callee) = resolve_function_named(program, ctx, &name) {
+                    program.flow.push(FlowConstraint::AddrOfFn { dst, callee });
+                } else if let Some(src) = lookup_var(ctx, program, &name) {
+                    program.flow.push(FlowConstraint::AddrOfVar { dst, src });
+                }
+            }
+            PendingFnRef::ReturnIdent { owner, name } => {
+                if let Some(callee) = resolve_function_named(program, ctx, &name) {
+                    program
+                        .fn_returns
+                        .entry(owner)
+                        .or_default()
+                        .push(ReturnFlow::AddrOfFn { callee });
+                } else if let Some(src) = lookup_var(ctx, program, &name) {
+                    program
+                        .fn_returns
+                        .entry(owner)
+                        .or_default()
+                        .push(ReturnFlow::Copy { src });
+                }
+            }
+            PendingFnRef::ReturnAddrOf { owner, name } => {
+                if let Some(callee) = resolve_function_named(program, ctx, &name) {
+                    program
+                        .fn_returns
+                        .entry(owner)
+                        .or_default()
+                        .push(ReturnFlow::AddrOfFn { callee });
+                } else if let Some(src) = lookup_var(ctx, program, &name) {
+                    program
+                        .fn_returns
+                        .entry(owner)
+                        .or_default()
+                        .push(ReturnFlow::AddrOfVar { src });
+                }
+            }
+        }
+    }
 }
 
 fn program_into_unit(path: PathBuf, program: Program) -> UnitIndex {
@@ -303,6 +513,8 @@ fn lower_typedef(program: &mut Program, source: &str, node: Node) {
                     };
                     program.types.intern(kind);
                 }
+            } else if let Some(desc) = typedef_underlying_desc(program, source, node) {
+                program.types.register_alias(&alias, desc);
             }
         }
     }
@@ -583,7 +795,9 @@ fn lower_one_declarator(
         });
         register_local(ctx, name, var_id);
         if let Some(init) = init_expr {
-            if init.kind() == "initializer_list" {
+            if init.kind() == "initializer_list"
+                && (is_array_type(program, type_id) || declarator_is_array(decl))
+            {
                 lower_fn_ptr_array_init(program, ctx, source, var_id, init);
             }
             extract_flow_from_expr(program, ctx, source, init, Some(var_id));
@@ -614,11 +828,39 @@ fn lower_one_declarator(
     });
     register_local(ctx, name, var_id);
     if let Some(init) = init_expr {
-        if init.kind() == "initializer_list" {
+        if init.kind() == "initializer_list"
+            && (is_array_type(program, type_id) || declarator_is_array(decl))
+        {
             lower_fn_ptr_array_init(program, ctx, source, var_id, init);
         }
         extract_flow_from_expr(program, ctx, source, init, Some(var_id));
     }
+}
+
+/// `ArrayFnMember` facts are only sound for array-typed tables (unknown-index
+/// element access merges all members). Parking members of a plain struct
+/// initializer into the variable node would let any field load observe every
+/// member function regardless of field identity.
+fn is_array_type(program: &Program, type_id: trace_ir::TypeId) -> bool {
+    matches!(
+        program.types.get(type_id).desc,
+        trace_ir::TypeDesc::Array { .. }
+    )
+}
+
+fn declarator_is_array(decl: Node) -> bool {
+    if decl.kind() == "array_declarator" {
+        return true;
+    }
+    let mut found = false;
+    let mut cursor = decl.walk();
+    for child in decl.children(&mut cursor) {
+        if declarator_is_array(child) {
+            found = true;
+            break;
+        }
+    }
+    found
 }
 
 fn lower_fn_ptr_array_init(
@@ -779,6 +1021,14 @@ fn collect_call_at_node(
     };
     let (callee_name, mut is_direct, callee_var) =
         resolve_callee_with_loads(program, ctx, source, func);
+    // Macro-expansion artifacts (stringified log fragments and similar
+    // token soup) surface as call sites whose "callee" text embeds string
+    // literals; real callees are plain identifiers or field paths. Note
+    // that whitespace is legitimate here — preprocessed text keeps token
+    // spacing (`tbl [ i ]->fn`) — so only quotes are rejected.
+    if callee_name.contains('"') {
+        return;
+    }
     if !is_direct && callee_var.is_none() {
         is_direct = resolve_function_named(program, ctx, &callee_name).is_some();
     }
@@ -792,6 +1042,19 @@ fn collect_call_at_node(
         for arg in args_node.children(&mut args_node.walk()) {
             if arg.kind() != "(" && arg.kind() != ")" && arg.kind() != "," {
                 if let Some(v) = resolve_expr_var(program, ctx, source, arg) {
+                    // A field/subscript argument passes the *value* stored in
+                    // that memory (e.g. `take(g_h.h, 0)` passes the fn-ptr in
+                    // `g_h.h`). `resolve_expr_var` yields the base object, so
+                    // materialize a load temp and pass that instead.
+                    if matches!(arg.kind(), "field_expression" | "subscript_expression") {
+                        let temp = alloc_ret_temp(program, ctx, arg);
+                        if let Some(flow) = expr_to_rhs_flow(program, ctx, source, arg, temp) {
+                            program.flow.push(flow);
+                            var_args.push((arg_index, temp));
+                            arg_index += 1;
+                            continue;
+                        }
+                    }
                     var_args.push((arg_index, v));
                     arg_index += 1;
                 } else if let Some(fn_id) = resolve_call_fn_arg(program, ctx, source, arg) {
@@ -808,6 +1071,7 @@ fn collect_call_at_node(
         caller,
         callee_name,
         callee_var,
+        callee_fn_id: None,
         var_args,
         fn_args,
         span,
@@ -1005,6 +1269,14 @@ fn emit_field_value_store(
                     program.flow.push(FlowConstraint::Store {
                         dst: gep,
                         src: src_temp,
+                    });
+                } else {
+                    // Defined later in the unit (no forward declaration):
+                    // defer until the whole symbol table is populated.
+                    ctx.pending.borrow_mut().push(PendingFnRef::FieldStore {
+                        dst: gep,
+                        name: name.to_string(),
+                        span: node_span(program, ctx, span_node),
                     });
                 }
             } else {
@@ -1213,8 +1485,14 @@ fn expr_to_rhs_flow(
                 .resolve_function_in_scope(name, Some(ctx.current_file))
             {
                 Some(FlowConstraint::AddrOfFn { dst, callee })
+            } else if let Some(src) = lookup_var(ctx, program, name) {
+                Some(FlowConstraint::Copy { dst, src })
             } else {
-                lookup_var(ctx, program, name).map(|src| FlowConstraint::Copy { dst, src })
+                // Might be a function defined later in the unit.
+                ctx.pending
+                    .borrow_mut()
+                    .push(PendingFnRef::RhsIdent { dst, name: name.to_string() });
+                None
             }
         }
         "pointer_expression" => {
@@ -1226,9 +1504,17 @@ fn expr_to_rhs_flow(
                 } else if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
                     // The gep temp's pts-to is the field's own location.
                     Some(FlowConstraint::Copy { dst, src: gep })
+                } else if let Some(src) = resolve_lvalue_var(program, ctx, source, arg) {
+                    Some(FlowConstraint::AddrOfVar { dst, src })
                 } else {
-                    resolve_lvalue_var(program, ctx, source, arg)
-                        .map(|src| FlowConstraint::AddrOfVar { dst, src })
+                    if arg.kind() == "identifier" {
+                        // Might be a function defined later in the unit.
+                        ctx.pending.borrow_mut().push(PendingFnRef::AddrOfIdent {
+                            dst,
+                            name: node_text(source, &arg).to_string(),
+                        });
+                    }
+                    None
                 }
             } else if op.as_deref() == Some("*") {
                 let ptr = resolve_lvalue_var(program, ctx, source, arg)?;
@@ -1295,7 +1581,7 @@ fn collect_return_flow(
     node: Node,
     fn_id: FnId,
 ) {
-    if let Some(flow) = return_flow_from_expr(program, ctx, source, node) {
+    if let Some(flow) = return_flow_from_expr(program, ctx, source, node, fn_id) {
         program.fn_returns.entry(fn_id).or_default().push(flow);
     }
 }
@@ -1305,6 +1591,7 @@ fn return_flow_from_expr(
     ctx: &LowerContext,
     source: &str,
     node: Node,
+    fn_id: FnId,
 ) -> Option<ReturnFlow> {
     let node = peel_expression(node);
     match node.kind() {
@@ -1320,8 +1607,16 @@ fn return_flow_from_expr(
                 if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
                     return Some(ReturnFlow::Copy { src: gep });
                 }
-                return resolve_lvalue_var(program, ctx, source, arg)
-                    .map(|src| ReturnFlow::AddrOfVar { src });
+                if let Some(src) = resolve_lvalue_var(program, ctx, source, arg) {
+                    return Some(ReturnFlow::AddrOfVar { src });
+                }
+                if arg.kind() == "identifier" {
+                    ctx.pending.borrow_mut().push(PendingFnRef::ReturnAddrOf {
+                        owner: fn_id,
+                        name: node_text(source, &arg).to_string(),
+                    });
+                }
+                return None;
             }
             None
         }
@@ -1329,8 +1624,14 @@ fn return_flow_from_expr(
             let name = node_text(source, &node);
             if resolve_function_named(program, ctx, name).is_some() {
                 None
+            } else if let Some(src) = lookup_var(ctx, program, name) {
+                Some(ReturnFlow::Copy { src })
             } else {
-                lookup_var(ctx, program, name).map(|src| ReturnFlow::Copy { src })
+                ctx.pending.borrow_mut().push(PendingFnRef::ReturnIdent {
+                    owner: fn_id,
+                    name: name.to_string(),
+                });
+                None
             }
         }
         "call_expression" => resolve_direct_call_name(source, node)
@@ -1338,10 +1639,10 @@ fn return_flow_from_expr(
         "cast_expression" => node
             .child_by_field_name("expression")
             .or_else(|| node.named_child(1))
-            .and_then(|inner| return_flow_from_expr(program, ctx, source, inner)),
+            .and_then(|inner| return_flow_from_expr(program, ctx, source, inner, fn_id)),
         "parenthesized_expression" => node
             .named_child(0)
-            .and_then(|inner| return_flow_from_expr(program, ctx, source, inner)),
+            .and_then(|inner| return_flow_from_expr(program, ctx, source, inner, fn_id)),
         _ => None,
     }
 }
@@ -1368,8 +1669,12 @@ fn resolve_direct_call(
 }
 
 fn alloc_ret_temp(program: &mut Program, ctx: &LowerContext, span_node: Node) -> VarId {
-    let var_id = program.symbols.alloc_var_id();
     let span = node_span(program, ctx, span_node);
+    alloc_ret_temp_spanned(program, ctx, span)
+}
+
+fn alloc_ret_temp_spanned(program: &mut Program, ctx: &LowerContext, span: Span) -> VarId {
+    let var_id = program.symbols.alloc_var_id();
     program.symbols.add_variable(Variable {
         id: var_id,
         name: format!("_ret{}", var_id.0),
@@ -1812,7 +2117,89 @@ fn type_desc_from_node(program: &mut Program, source: &str, node: Node) -> TypeD
     } else if text.contains("void") {
         TypeDesc::Void
     } else {
+        // Bare identifiers may be typedef aliases (`fn_t`, `SHandle`);
+        // resolving them keeps pointer-ness that would otherwise degrade
+        // to `Int` and mislead downstream type checks.
+        let alias = text.trim();
+        if !alias.contains(char::is_whitespace) && !alias.is_empty() {
+            if let Some(desc) = program.types.resolve_alias(alias) {
+                return desc.clone();
+            }
+        }
         TypeDesc::Int
+    }
+}
+
+/// Resolve a `typedef X *Name;` / `typedef void (*Name)(...);` underlying
+/// descriptor by walking the declarator chain for pointer/function/array
+/// nesting. Only the shape matters for analysis purposes.
+fn typedef_underlying_desc(program: &mut Program, source: &str, node: Node) -> Option<TypeDesc> {
+    let type_node = node.child_by_field_name("type")?;
+    let decl_node = node.child_by_field_name("declarator")?;
+    let base = type_desc_from_node(program, source, type_node);
+    Some(walk_declarator_shape(decl_node, base))
+}
+
+fn walk_declarator_shape(node: Node, base: TypeDesc) -> TypeDesc {
+    match node.kind() {
+        "pointer_declarator" => {
+            let inner = node
+                .child_by_field_name("declarator")
+                .map(|n| walk_declarator_shape(n, base.clone()))
+                .unwrap_or(base);
+            TypeDesc::Ptr(Box::new(inner))
+        }
+        "array_declarator" => {
+            let inner = node
+                .child_by_field_name("declarator")
+                .map(|n| walk_declarator_shape(n, base.clone()))
+                .unwrap_or(base);
+            TypeDesc::Array {
+                elem: Box::new(inner),
+                size: None,
+            }
+        }
+        "function_declarator" => {
+            let inner = node.child_by_field_name("declarator");
+            // `typedef void (*Name)(...)`: the pointer sits INSIDE the
+            // parenthesized declarator, so it binds to the identifier first
+            // and the function suffix applies outside it — the alias is
+            // pointer-to-function, not function-returning-pointer. A plain
+            // `typedef int f_t(int)` stays a bare FnPtr.
+            let ptr_wrapped = inner.and_then(peel_paren_declarator).and_then(|n| {
+                if n.kind() == "pointer_declarator" {
+                    n.child_by_field_name("declarator")
+                } else {
+                    None
+                }
+            });
+            if let Some(under) = ptr_wrapped {
+                let ret = walk_declarator_shape(under, base);
+                return TypeDesc::Ptr(Box::new(TypeDesc::FnPtr {
+                    ret: Box::new(ret),
+                    params: Vec::new(),
+                }));
+            }
+            let ret = inner
+                .map(|n| walk_declarator_shape(n, base.clone()))
+                .unwrap_or(base);
+            TypeDesc::FnPtr {
+                ret: Box::new(ret),
+                params: Vec::new(),
+            }
+        }
+        "parenthesized_declarator" => node
+            .named_child(0)
+            .map(|n| walk_declarator_shape(n, base.clone()))
+            .unwrap_or(base),
+        _ => base,
+    }
+}
+
+fn peel_paren_declarator(node: Node) -> Option<Node> {
+    match node.kind() {
+        "parenthesized_declarator" => node.named_child(0),
+        _ => Some(node),
     }
 }
 

@@ -173,8 +173,10 @@ fn arg_flow_pointer_param() {
         &program,
         &analysis,
         "provider",
+        // `consume` is prototype-only: statically resolved, but classified
+        // external because no definition exists under the fixture root.
         "consume",
-        ResolutionKind::Direct
+        ResolutionKind::External
     ));
     assert!(
         arg_flow_count(&analysis) >= 1,

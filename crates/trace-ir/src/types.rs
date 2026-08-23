@@ -83,6 +83,10 @@ pub struct FieldLayout {
 pub struct TypeTable {
     types: Vec<TypeInfo>,
     intern: IndexMap<TypeDesc, TypeId>,
+    /// Typedef alias name → resolved descriptor. Alias resolution is needed
+    /// because lowering sees bare identifiers (`fn_t`, `SHandle`) whose
+    /// pointer-ness is otherwise lost (they degrade to `Int`).
+    aliases: IndexMap<String, TypeDesc>,
 }
 
 impl Default for TypeTable {
@@ -96,6 +100,7 @@ impl TypeTable {
         let mut table = Self {
             types: Vec::new(),
             intern: IndexMap::new(),
+            aliases: IndexMap::new(),
         };
         table.intern(TypeDesc::Void);
         table.intern(TypeDesc::Char);
@@ -140,6 +145,22 @@ impl TypeTable {
 
     pub fn ptr_to(&mut self, inner: TypeDesc) -> TypeId {
         self.intern(TypeDesc::Ptr(Box::new(inner)))
+    }
+
+    /// Record a typedef alias (`typedef void (*fn_t)(int);` → `fn_t`) so that
+    /// later declarations using the bare alias keep their pointer-ness.
+    pub fn register_alias(&mut self, alias: &str, desc: TypeDesc) {
+        if !alias.is_empty() {
+            self.aliases.insert(alias.to_string(), desc);
+        }
+    }
+
+    pub fn resolve_alias(&self, alias: &str) -> Option<&TypeDesc> {
+        self.aliases.get(alias)
+    }
+
+    pub fn all_aliases(&self) -> &IndexMap<String, TypeDesc> {
+        &self.aliases
     }
 
     pub fn all(&self) -> &[TypeInfo] {

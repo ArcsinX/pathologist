@@ -265,3 +265,131 @@ fn header_inline_calls_deduplicate_to_header_attribution() {
         1
     );
 }
+
+/// Functions referenced before their definition (no forward declaration) —
+/// in a global designated initializer, in a function-body field store, and
+/// through a fn-ptr variable initializer — must still resolve. Lowering
+/// used to drop these silently when the definition had not been interned
+/// yet (verified FN class on a real corpus).
+#[test]
+fn later_defined_fn_resolves_from_initializer_and_store() {
+    let root = fixture("later_defined_init");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    // `g_tbl.init = LaterBody;` inside Bind(), defined after Bind.
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "Caller",
+            "LaterBody",
+            ResolutionKind::Indirect
+        ),
+        "call through g_tbl.init must reach LaterBody despite definition order"
+    );
+
+    // `g_fp = LaterInit;` where LaterInit is defined below BindFp.
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "UseFp",
+            "LaterInit",
+            ResolutionKind::Indirect
+        ),
+        "fn-ptr stored from a later-defined fn must flow"
+    );
+}
+
+/// Plain-identifier calls to functions with no definition under the root
+/// (declared-only or fully implicit) must be classified as External edges,
+/// not left as unresolved indirect noise. Synthesized extern entries carry
+/// `is_defined == false` and stay out of the variable table.
+#[test]
+fn unresolved_plain_ident_calls_become_external() {
+    let root = fixture("extern_call");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    for callee in ["ext_helper", "undeclared_stub"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                "local_wrap",
+                callee,
+                ResolutionKind::External
+            ),
+            "call to {callee} must produce an external edge"
+        );
+    }
+
+    // The synthesized entries exist as bodyless functions...
+    for callee in ["ext_helper", "undeclared_stub"] {
+        let f = program
+            .symbols
+            .functions
+            .iter()
+            .find(|f| f.name == callee)
+            .unwrap_or_else(|| panic!("{callee} must be interned"));
+        assert!(!f.is_defined, "{callee} is not defined in the tree");
+    }
+    // ...and none of these sites leak indirect edges or phantom variables.
+    for e in &analysis.call_edges {
+        if fn_name(&program, e.caller) == "local_wrap" {
+            assert_eq!(
+                e.resolution,
+                ResolutionKind::External,
+                "external calls must not degrade into other resolutions"
+            );
+        }
+    }
+    assert!(!program.symbols.variables.iter().any(|v| v.name == "ext_helper"));
+    assert!(!program
+        .symbols
+        .variables
+        .iter()
+        .any(|v| v.name == "undeclared_stub"));
+}
+
+/// A call whose target is defined in another TU but has no prototype in the
+/// caller must recover the REAL definition (Direct edge, arg-flow into its
+/// body) — not be swallowed by external-callee synthesis.
+#[test]
+fn cross_tu_no_proto_call_recovers_definition() {
+    let root = fixture("extern_call");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "caller",
+            "helper",
+            ResolutionKind::Direct
+        ),
+        "cross-TU call to a defined-but-undeclared function must produce a direct edge"
+    );
+    assert!(
+        !has_edge(
+            &program,
+            &analysis,
+            "caller",
+            "helper",
+            ResolutionKind::External
+        ),
+        "must not degrade into an external edge"
+    );
+
+    // The real definition keeps its identity: exactly one `helper`, defined.
+    let helpers: Vec<_> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name == "helper")
+        .collect();
+    assert_eq!(helpers.len(), 1, "no phantom duplicate rows for helper");
+    assert!(helpers[0].is_defined);
+}

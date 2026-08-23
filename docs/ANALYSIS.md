@@ -115,6 +115,10 @@ subDev.subDevOps->setConfig(subDev);
 
 Worklist algorithm with **constraint adjacency index** (`SolverIndices`) for O(1) lookup of affected constraints per node.
 
+### Work budget
+
+Solving is capped at a deterministic **200 000 pops** by default. Normal corpora converge far below the cap (the HDF framework corpus needs ~42k). The cap trades late-stage target recall for bounded runtime: on the HDF whole tree, fn-pointer-deref site coverage completes around ~300k pops, and past that returns collapse sharply (+110s for +21% indirect edges from 300k→500k; +176s for +4% more from 500k→700k). Raise `TRACE_SOLVE_BUDGET_POPS` when maximal target recall on very large trees matters more than runtime; `=0` restores unlimited solving. The budget is deterministic, so repeated runs produce identical databases.
+
 ### State
 
 | Map | Role |
@@ -193,6 +197,18 @@ Supported lowering patterns include:
 | Multi-hop field | `p->ops->setIpAddr()` |
 | Mixed `.` / `->` | `subDev.subDevOps->setConfig()` |
 | Designated init | `.handler = &Fn` |
+
+### External callees
+
+Plain-identifier calls that resolve to no definition under the analyzed root
+are classified as `external`, not left as unresolved indirect sites. Two
+sources feed this class: prototype-only declarations (the callee resolves
+statically but has no body here), and synthesized entries for names that are
+never declared in the tree at all (libc without tree headers, logging
+backends referenced only inside macros — `finalize_extern_callees`). Edges to
+bodyless functions never carry param wiring unless the prototype declares
+formals; unresolved fn-pointer sites (`ptr_expr` shapes) remain the only
+occupants of the "no target" indirect bucket.
 | Static ops struct | `g_ops = { .fn = Fn }` + `memcpy`-style assign via `SbufInterfaceAssign` (field store from global init) |
 | Call return | `p->field = Getter()` |
 

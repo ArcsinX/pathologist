@@ -65,18 +65,13 @@ fn read_index_source(
         return std::fs::read_to_string(path).map(|s| (s, LineMap::new())).map_err(|e| e.to_string());
     }
     let preproc_result = preprocess_file(&canonical, eff_opts).map_err(|e| e.to_string())?;
-    let preproc_failed = preproc_result.diagnostics.iter().any(|d| {
-        matches!(d.severity, trace_preproc::DiagnosticSeverity::Error)
-            || d.message.contains("preprocess stopped")
-    });
-    if preproc_failed {
-        if let Some(s) = graph.source_cache.get(&canonical) {
-            return Ok((s.clone(), LineMap::new()));
-        }
-        std::fs::read_to_string(path).map(|s| (s, LineMap::new())).map_err(|e| e.to_string())
-    } else {
-        Ok((preproc_result.output, preproc_result.line_map))
-    }
+    // Keep partial output even when preprocessing stopped mid-file. A stop
+    // usually happens inside ONE nested header; discarding everything and
+    // parsing raw source instead silently drops every `#include`d declaration
+    // from the unit (328/440 TUs on a real HDF tree) and feeds the parser
+    // unexpanded function-like macros, which is strictly less sound than a
+    // truncated-but-consistent prefix (spans stay LineMap-mappable).
+    Ok((preproc_result.output, preproc_result.line_map))
 }
 
 fn should_preprocess(path: &Path, opts: &PreprocessOptions, graph: &IncludeGraph) -> bool {

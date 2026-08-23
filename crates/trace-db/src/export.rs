@@ -214,7 +214,7 @@ fn export_one_variable(stmt: &mut rusqlite::Statement<'_>, var: &trace_ir::Varia
 
 fn export_functions(conn: &Connection, program: &Program) -> Result<()> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO functions (id, name, file_id, line_start, line_end, linkage, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO functions (id, name, file_id, line_start, line_end, linkage, signature, is_defined) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for func in &program.symbols.functions {
         let linkage = match func.linkage {
@@ -229,7 +229,8 @@ fn export_functions(conn: &Connection, program: &Program) -> Result<()> {
             func.span.line,
             func.span.line,
             linkage,
-            format!("fn_{}", func.name)
+            format!("fn_{}", func.name),
+            func.is_defined as i32
         ])?;
     }
     Ok(())
@@ -279,6 +280,7 @@ fn export_call_edges(conn: &Connection, analysis: &AnalysisResult) -> Result<()>
             trace_analysis::ResolutionKind::Direct => "direct",
             trace_analysis::ResolutionKind::Indirect => "indirect",
             trace_analysis::ResolutionKind::Ambiguous => "ambiguous",
+            trace_analysis::ResolutionKind::External => "external",
         };
         stmt.execute(params![
             i as i64 + 1,

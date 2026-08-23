@@ -50,6 +50,11 @@ pub struct CallSite {
     pub caller: FnId,
     pub callee_name: String,
     pub callee_var: Option<VarId>,
+    /// Callee fixed up after lowering: a definition/prototype resolved at
+    /// lowering time, or a synthesized external entry for a plain-identifier
+    /// call that no tree-local symbol declares (libc calls, macro-emitted
+    /// logging backends). `None` for indirect sites.
+    pub callee_fn_id: Option<FnId>,
     pub var_args: Vec<(u32, VarId)>,
     pub fn_args: Vec<(u32, FnId)>,
     pub span: Span,

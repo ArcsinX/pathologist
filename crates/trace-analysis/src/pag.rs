@@ -30,6 +30,10 @@ pub struct SolverIndices {
     pub indirect_by_target: FxHashMap<PagNodeId, Vec<trace_ir::CallSiteId>>,
 }
 
+/// Maximum nesting depth for instance-sensitive field locations. Deeper
+/// accesses fold into instance-insensitive summaries (see `ensure_field_loc`).
+const FIELD_LOC_DEPTH_CAP: u8 = 4;
+
 #[derive(Debug, Default)]
 pub struct Pag {
     pub nodes: Vec<PagNode>,
@@ -42,6 +46,10 @@ pub struct Pag {
     pub var_location: IndexMap<VarId, LocId>,
     /// Field abstract locations keyed by (parent object location, field id).
     pub field_loc: IndexMap<(LocId, FieldId), LocId>,
+    /// Nesting depth of each synthesized field location (var-rooted = 0
+    /// children start at 1). Bounds recursive `obj->next->next->...`
+    /// location synthesis once interprocedural flow reaches chained structs.
+    pub field_depth: FxHashMap<LocId, u8>,
     /// Per-(struct type, field) summary location for instance-insensitive field flow.
     pub field_summary: IndexMap<(trace_ir::TypeId, FieldId), LocId>,
     pub field_loc_to_summary: IndexMap<LocId, LocId>,
@@ -195,10 +203,17 @@ impl Pag {
             type_id: field_type,
             desc: name.to_string(),
         });
+        let depth = self.field_depth.get(&parent_loc).copied().unwrap_or(0) + 1;
+        self.field_depth.insert(loc_id, depth);
         self.field_loc.insert((parent_loc, field), loc_id);
         loc_id
     }
 
+    /// Instance-sensitive child location for `parent.field`. Past
+    /// [`FIELD_LOC_DEPTH_CAP`], further nesting is folded into the
+    /// instance-insensitive summary: unbounded recursive synthesis (linked
+    /// structures reached through interprocedural flow) would otherwise
+    /// diverge, while summaries stay bounded by (type, field).
     pub fn ensure_field_loc(
         &mut self,
         program: &Program,
@@ -210,6 +225,15 @@ impl Pag {
         }
         let parent_type = struct_type_for_loc(self, program, parent_loc)?;
         let field_layout = program.types.get(parent_type).layout.fields.get(&field)?;
+        if self.field_depth.get(&parent_loc).copied().unwrap_or(0) >= FIELD_LOC_DEPTH_CAP {
+            return Some(self.ensure_field_summary_loc(
+                program,
+                parent_type,
+                field,
+                field_layout.type_id,
+                &field_layout.name,
+            ));
+        }
         let field_loc =
             self.alloc_field_loc(parent_loc, field, field_layout.type_id, &field_layout.name);
         let summary = self.ensure_field_summary_loc(

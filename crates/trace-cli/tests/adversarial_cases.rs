@@ -35,7 +35,9 @@ fn macro_field_access_expands_to_store_flow() {
             &analysis,
             "macro_user",
             "sink",
-            ResolutionKind::Direct
+            // `sink` is prototype-only in this fixture: resolved statically,
+            // but classified external because no definition exists here.
+            ResolutionKind::External
         ),
         "macro_user -> sink"
     );

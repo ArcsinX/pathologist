@@ -208,6 +208,7 @@ Metadata for one `trace analyze` invocation.
 | `line_end` | INTEGER | End line (currently same as start in export). |
 | `linkage` | TEXT | `external`, `internal`, or `none`. |
 | `signature` | TEXT | Placeholder signature string (`fn_<name>`). |
+| `is_defined` | INTEGER | 1 if a body exists under the analyzed root; 0 covers prototypes and synthesized externals (libc, macro-referenced logging backends). |
 
 **Index:** `functions(name)`.
 
@@ -234,7 +235,7 @@ Resolved caller → callee edges (one row per target; indirect sites may have mu
 | `id` | INTEGER PK | Edge id. |
 | `call_site_id` | INTEGER FK → `call_sites` | Call site this edge resolves. |
 | `callee_fn_id` | INTEGER FK → `functions` | Resolved target function. |
-| `resolution` | TEXT | `direct`, `indirect`, or `ambiguous`. |
+| `resolution` | TEXT | `direct`, `indirect`, `ambiguous`, or `external` (statically resolved but bodyless under the analyzed root). |
 
 **Indexes:** `call_edges(callee_fn_id)`, `call_edges(call_site_id)`.
 

@@ -226,6 +226,13 @@ fn merge_types(
         };
         map.insert(info.id, new_id);
     }
+    // Typedef aliases resolve by name; identical headers lowered in many TUs
+    // produce identical descs, so first registration wins.
+    for (alias, desc) in src.all_aliases() {
+        if dst.resolve_alias(alias).is_none() {
+            dst.register_alias(alias, desc.clone());
+        }
+    }
     map
 }
 

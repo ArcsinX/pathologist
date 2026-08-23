@@ -3,7 +3,7 @@ use crate::pag::{Pag, PagNodeKind};
 use crate::summaries::apply_call_summary;
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
-use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass};
+use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, VarId};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnalyzeOptions {
@@ -34,10 +34,29 @@ pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, An
 
 struct SolverState {
     pts: FxHashMap<PagNodeId, FxHashSet<LocId>>,
+    /// Locations added to a node's points-to since it was last processed.
+    /// Difference propagation: only these flow onward on pop, which keeps
+    /// total work proportional to facts discovered rather than
+    /// `pops × |pts|` (the old full-set re-propagation was quadratic on hub
+    /// nodes and dominated solve time on large trees).
+    delta: FxHashMap<PagNodeId, Vec<LocId>>,
+    /// Dedup guard so repeated events (e.g. memory writes under a location
+    /// many nodes hold) append a given (node, loc) pair once per pending
+    /// cycle instead of unboundedly inflating delta vectors.
+    delta_pending: FxHashSet<(PagNodeId, LocId)>,
     memory_pts: FxHashMap<LocId, FxHashSet<LocId>>,
     loc_nodes: FxHashMap<LocId, FxHashSet<PagNodeId>>,
     worklist: Vec<PagNodeId>,
     queued: FxHashSet<PagNodeId>,
+    /// Nodes whose one-time, points-to-independent constraint effects
+    /// (addr-of seeding, GEP summary fallback) have already been applied.
+    seen_once: FxHashSet<PagNodeId>,
+    /// Summary locations that hit `SUMMARY_MEM_CAP` and stopped growing.
+    saturated_summaries: FxHashSet<LocId>,
+    /// Dedup for dynamically added parameter-copy constraints: the same
+    /// (actual → formal) pair recurs across many call sites and re-adding it
+    /// per discovered edge explodes constraint volume on large trees.
+    wired_copies: FxHashSet<(PagNodeId, PagNodeId)>,
 }
 
 impl SolverState {
@@ -47,10 +66,24 @@ impl SolverState {
         }
     }
 
-    fn requeue_loc(&mut self, loc: LocId) {
+    /// A memory write changed `memory_pts[loc]`: every node whose points-to
+    /// contains `loc` must reprocess it (loads re-merge the fresh content).
+    /// Under difference propagation an empty delta would make them skip, so
+    /// the location is appended to their delta explicitly (deduped).
+    fn touch_loc_holders(&mut self, loc: LocId) {
         if let Some(nodes) = self.loc_nodes.get(&loc).cloned() {
             for n in nodes {
+                self.record_delta(n, &[loc]);
                 self.push(n);
+            }
+        }
+    }
+
+    /// Record freshly inserted locations for difference propagation.
+    fn record_delta(&mut self, node: PagNodeId, new_locs: &[LocId]) {
+        for &loc in new_locs {
+            if self.delta_pending.insert((node, loc)) {
+                self.delta.entry(node).or_default().push(loc);
             }
         }
     }
@@ -80,9 +113,10 @@ impl SolverState {
                 entry.insert(*loc);
             }
         }
-        for loc in new_locs {
-            self.loc_nodes.entry(loc).or_default().insert(dst);
+        for loc in &new_locs {
+            self.loc_nodes.entry(*loc).or_default().insert(dst);
         }
+        self.record_delta(dst, &new_locs);
         self.push(dst);
     }
 }
@@ -95,13 +129,27 @@ fn direct_by_name(cs: &trace_ir::CallSite) -> bool {
     cs.callee_var.is_none() && !cs.callee_name.contains("->") && !cs.callee_name.contains('.')
 }
 
+fn st_pts_stats_max(pts: &IndexMap<PagNodeId, FxHashSet<LocId>>) -> usize {
+    pts.values().map(|s| s.len()).max().unwrap_or(0)
+}
+
+/// Maximum distinct locations remembered per instance-insensitive summary
+/// location. Past this, further stores are dropped (see saturation note in
+/// `apply_store_to_targets`).
+const SUMMARY_MEM_CAP: usize = 1024;
+
 fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisResult {
     let mut st = SolverState {
         pts: FxHashMap::default(),
+        delta: FxHashMap::default(),
+        delta_pending: FxHashSet::default(),
         memory_pts: FxHashMap::default(),
         loc_nodes: FxHashMap::default(),
         worklist: Vec::new(),
         queued: FxHashSet::default(),
+        seen_once: FxHashSet::default(),
+        saturated_summaries: FxHashSet::default(),
+        wired_copies: FxHashSet::default(),
     };
 
     for c in &pag.constraints {
@@ -135,7 +183,13 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
         // merge erases which TU's view a name reflects — a name matching both
         // a `static` def and an external def is genuinely ambiguous. May-
         // approximation: consider every candidate.
-        let callees: Vec<FnId> = if cs.is_direct {
+        // Synthesized externals carry their FnId on the call site; other
+        // sites resolve by name as before. Any callee without a definition
+        // under the analyzed root (prototype-only or synthesized) yields an
+        // External edge and no param wiring — there is no body to wire into.
+        let callees: Vec<FnId> = if let Some(fid) = cs.callee_fn_id {
+            vec![fid]
+        } else if cs.is_direct {
             program
                 .symbols
                 .resolve_function_in_scope(&cs.callee_name, Some(cs.span.file))
@@ -149,26 +203,141 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
             Vec::new()
         };
         for callee in callees {
+            let f = program.symbols.function(callee);
+            let external = !f.is_defined;
+            let has_formals = !f.params.is_empty();
             call_edges.push(CallGraphEdge {
                 call_site: cs.id,
                 caller: cs.caller,
                 callee,
-                resolution: ResolutionKind::Direct,
+                resolution: if external {
+                    ResolutionKind::External
+                } else {
+                    ResolutionKind::Direct
+                },
             });
-            wire_params(pag, program, cs, callee, &mut st, &mut wired_arg_flow);
+            // Wire argument flow whenever the callee declares formals —
+            // prototype-only targets still carry parameter information.
+            // Synthesized externals have none, so this skips them for free.
+            if has_formals {
+                wire_params(pag, program, cs, callee, &mut st, &mut wired_arg_flow);
+            }
         }
     }
 
+    let t0 = std::time::Instant::now();
+    let mut pops: u64 = 0;
+    let mut w_copy: u64 = 0;
+    let mut w_load: u64 = 0;
+    let mut w_store: u64 = 0;
+    let mut w_gep: u64 = 0;
+    // Work budget: on huge corpora the dynamic param-copy wiring can make
+    // solving diverge in practice (points-to sets keep growing for hours).
+    // A deterministic pop cap converts a hang into a partial result plus a
+    // visible warning; normal corpora converge far below it. Override with
+    // TRACE_SOLVE_BUDGET_POPS=<n>; =0 restores unlimited solving.
+    const DEFAULT_SOLVE_BUDGET_POPS: u64 = 200_000;
+    let solve_budget: Option<u64> = match std::env::var("TRACE_SOLVE_BUDGET_POPS") {
+        Ok(v) if v.trim() == "0" => None,
+        Ok(v) => v.parse::<u64>().ok().or(Some(DEFAULT_SOLVE_BUDGET_POPS)),
+        Err(_) => Some(DEFAULT_SOLVE_BUDGET_POPS),
+    };
+
+    if std::env::var("TRACE_SOLVER_STATS").is_ok() {
+        eprintln!(
+            "[solver] START constraints={} vars={}",
+            pag.constraints.len(),
+            program.symbols.variables.len()
+        );
+    }
+    let stats_enabled = std::env::var("TRACE_SOLVER_STATS").is_ok();
+
     while let Some(node) = st.worklist.pop() {
         st.queued.remove(&node);
+        pops += 1;
+        if let Some(budget) = solve_budget {
+            if pops > budget {
+                eprintln!(
+                    "[solver] pop budget {} exhausted after {} pops / {:?}; stopping, results are partial \
+                     (set TRACE_SOLVE_BUDGET_POPS to raise, or 0 for unlimited)",
+                    budget,
+                    pops,
+                    t0.elapsed()
+                );
+                break;
+            }
+        }
+        if stats_enabled && pops.is_multiple_of(100_000) {
+            let biggest = st
+                .pts
+                .values()
+                .map(|s| s.len())
+                .max()
+                .unwrap_or(0);
+            eprintln!(
+                "[solver] pops={} elapsed={:?} constraints={} queued={} max_pts={} total_pts={} locs={} copy={} load={} store={} gep={}",
+                pops,
+                t0.elapsed(),
+                pag.constraints.len(),
+                st.worklist.len(),
+                biggest,
+                st.pts.values().map(|s| s.len()).sum::<usize>(),
+                pag.locations.len(),
+                w_copy,
+                w_load,
+                w_store,
+                w_gep
+            );
+        }
+
+        // Difference propagation: process only locations added since the
+        // node was last popped. Hub nodes pop thousands of times as they grow;
+        // re-scanning the full set each time made solve time quadratic.
+        let delta = std::mem::take(st.delta.get_mut(&node).unwrap_or(&mut Vec::new()));
+        for &loc in delta.iter() {
+            st.delta_pending.remove(&(node, loc));
+        }
+        if delta.is_empty() {
+            // First touch with no pointees: apply constraints whose effect
+            // does not depend on points-to content (addr-of seeding and the
+            // instance-insensitive GEP field-summary fallback). Once.
+            if st.seen_once.insert(node) {
+                if let Some(idxs) = pag.indices.addr_of_dst.get(&node) {
+                    for &idx in idxs {
+                        let c = &pag.constraints[idx];
+                        if let PagNodeKind::Loc(loc) = pag.nodes[c.src.0 as usize].kind {
+                            add_pts(&mut st, node, loc);
+                        }
+                    }
+                }
+                if let Some(idxs) = pag.indices.gep_src.get(&node).cloned() {
+                    for idx in idxs {
+                        let (dst, src, field) = {
+                            let c = &pag.constraints[idx];
+                            (c.dst, c.src, c.field)
+                        };
+                        let Some(field) = field else {
+                            continue;
+                        };
+                        if let PagNodeKind::Var(base_var) = pag.nodes[src.0 as usize].kind {
+                            if let Some(summary) =
+                                pag.ensure_field_summary_for_var(program, base_var, field)
+                            {
+                                propagate_locs(&mut st, dst, [summary]);
+                                st.merge_memory_into(dst, summary);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
 
         if let Some(idxs) = pag.indices.copy_src.get(&node) {
-            let node_pts = st.pts.get(&node).cloned().unwrap_or_default();
-            if !node_pts.is_empty() {
-                for &idx in idxs {
-                    let dst = pag.constraints[idx].dst;
-                    propagate_pts(&mut st, dst, &node_pts);
-                }
+            for &idx in idxs {
+                let dst = pag.constraints[idx].dst;
+                w_copy += delta.len() as u64;
+                propagate_slice(&mut st, dst, &delta);
             }
         }
 
@@ -182,39 +351,39 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
         }
 
         if let Some(idxs) = pag.indices.load_src.get(&node) {
-            let node_pts = st.pts.get(&node).cloned().unwrap_or_default();
-            if !node_pts.is_empty() {
-                for &idx in idxs {
-                    let dst = pag.constraints[idx].dst;
-                    for &loc in &node_pts {
-                        if fn_for_loc(pag, loc).is_some() {
-                            add_pts(&mut st, dst, loc);
-                        } else {
-                            st.merge_memory_into(dst, loc);
-                        }
+            for &idx in idxs {
+                let dst = pag.constraints[idx].dst;
+                for &loc in delta.iter() {
+                    if fn_for_loc(pag, loc).is_some() {
+                        add_pts(&mut st, dst, loc);
+                    } else {
+                        w_load += 1;
+                        st.merge_memory_into(dst, loc);
                     }
                 }
             }
         }
 
-        if let Some(idxs) = pag.indices.store_dst.get(&node) {
-            for &idx in idxs {
-                apply_store(pag, idx, &mut st);
+        if !delta.is_empty() {
+            if let Some(idxs) = pag.indices.store_dst.get(&node).cloned() {
+                for idx in idxs {
+                    w_store += delta.len() as u64;
+                    apply_store_to_targets(pag, idx, &mut st, Some(delta.as_slice()));
+                }
             }
-        }
 
-        if let Some(idxs) = pag.indices.store_src.get(&node) {
-            if pts_has_values_or_self_loc(pag, &st.pts, node) {
-                for &idx in idxs {
-                    apply_store(pag, idx, &mut st);
+            if let Some(idxs) = pag.indices.store_src.get(&node).cloned() {
+                for idx in idxs {
+                    w_store += 1;
+                    apply_store_to_targets(pag, idx, &mut st, None);
                 }
             }
         }
 
         if let Some(idxs) = pag.indices.gep_src.get(&node) {
-            let node_pts = st.pts.get(&node).cloned().unwrap_or_default();
             let idxs = idxs.clone();
-            for idx in idxs {
+            w_gep += delta.len() as u64 * idxs.len() as u64;
+            'gep: for idx in idxs {
                 let (dst, src, field) = {
                     let c = &pag.constraints[idx];
                     (c.dst, c.src, c.field)
@@ -222,54 +391,55 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
                 let Some(field) = field else {
                     continue;
                 };
-                if !node_pts.is_empty() {
-                    for loc in &node_pts {
-                        // Fn values parked in the base's points-to (e.g.
-                        // ArrayFnMember tables of structs with fn members)
-                        // flow through field accesses unchanged.
-                        if fn_for_loc(pag, *loc).is_some() {
-                            add_pts(&mut st, dst, *loc);
-                            continue;
+                for &loc in delta.iter() {
+                    // Fn values parked in the base's points-to (e.g.
+                    // ArrayFnMember tables of structs with fn members)
+                    // flow through field accesses unchanged.
+                    if fn_for_loc(pag, loc).is_some() {
+                        add_pts(&mut st, dst, loc);
+                        continue;
+                    }
+                    if let Some(field_loc) = pag.ensure_field_loc(program, loc, field) {
+                        // Field loc plus its instance-insensitive summary.
+                        let targets = [Some(field_loc), pag.summary_for_field_loc(field_loc)];
+                        propagate_locs(
+                            &mut st,
+                            dst,
+                            targets.iter().filter_map(|t| t.as_ref().copied()),
+                        );
+                        for fl in targets.into_iter().flatten() {
+                            st.merge_memory_into(dst, fl);
                         }
-                        if let Some(field_loc) = pag.ensure_field_loc(program, *loc, field) {
-                            // Field loc plus its instance-insensitive summary.
-                            let targets = [Some(field_loc), pag.summary_for_field_loc(field_loc)];
-                            propagate_locs(
-                                &mut st,
-                                dst,
-                                targets.iter().filter_map(|t| t.as_ref().copied()),
-                            );
-                            for fl in targets.into_iter().flatten() {
-                                st.merge_memory_into(dst, fl);
-                            }
-                            // ArrayFnMember element fns: reachable through
-                            // the array itself or any pointer to an element.
-                            if let Some(owner) = pag.locations[loc.0 as usize].var {
-                                if let Some(fn_locs) = pag.array_fn_members.get(&owner) {
-                                    for fl in fn_locs.iter().copied() {
-                                        add_pts(&mut st, dst, fl);
-                                    }
+                        // ArrayFnMember element fns: reachable through
+                        // the array itself or any pointer to an element.
+                        if let Some(owner) = pag.locations[loc.0 as usize].var {
+                            if let Some(fn_locs) = pag.array_fn_members.get(&owner) {
+                                for fl in fn_locs.iter().copied() {
+                                    add_pts(&mut st, dst, fl);
                                 }
                             }
                         }
                     }
-                } else if let PagNodeKind::Var(base_var) = pag.nodes[src.0 as usize].kind {
-                    if let Some(summary) =
-                        pag.ensure_field_summary_for_var(program, base_var, field)
-                    {
-                        propagate_locs(&mut st, dst, [summary]);
-                        st.merge_memory_into(dst, summary);
+                }
+                // First-time GEP on a var with no pointees yet: fall back to
+                // the instance-insensitive field summary so loads through the
+                // destination still see something.
+                if st.pts.get(&node).map(|p| p.is_empty()).unwrap_or(true) {
+                    if let PagNodeKind::Var(base_var) = pag.nodes[src.0 as usize].kind {
+                        if let Some(summary) =
+                            pag.ensure_field_summary_for_var(program, base_var, field)
+                        {
+                            propagate_locs(&mut st, dst, [summary]);
+                            st.merge_memory_into(dst, summary);
+                        }
                     }
+                    continue 'gep;
                 }
             }
         }
 
-        if let Some(call_sites) = pag.indices.indirect_by_target.get(&node) {
-            let target_pts = st.pts.get(&node).cloned().unwrap_or_default();
-            if target_pts.is_empty() {
-                continue;
-            }
-            for &cs_id in call_sites {
+        if let Some(call_sites) = pag.indices.indirect_by_target.get(&node).cloned() {
+            for cs_id in call_sites {
                 let cs = program
                     .symbols
                     .call_sites
@@ -277,7 +447,7 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
                     .filter(|c| c.id == cs_id)
                     .expect("call site id in index");
                 let mut new_callees = Vec::new();
-                for &loc in &target_pts {
+                for &loc in delta.iter() {
                     if let Some(fn_id) = fn_for_loc(pag, loc) {
                         new_callees.push(fn_id);
                     }
@@ -306,6 +476,18 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
         IndexMap::new()
     };
 
+    if std::env::var("TRACE_SOLVER_STATS").is_ok() {
+        let biggest = st_pts_stats_max(&points_to);
+        eprintln!(
+            "[solver] DONE pops={} elapsed={:?} constraints={} max_pts={} resolved_sites={}",
+            pops,
+            t0.elapsed(),
+            pag.constraints.len(),
+            biggest,
+            resolved_indirect.len()
+        );
+    }
+
     AnalysisResult {
         points_to,
         call_edges,
@@ -327,24 +509,52 @@ fn propagate_locs(st: &mut SolverState, dst: PagNodeId, locs: impl IntoIterator<
     if new_locs.is_empty() {
         return;
     }
-    let entry = st.pts.get_mut(&dst).expect("entry just created");
-    for loc in new_locs {
-        entry.insert(loc);
-        st.loc_nodes.entry(loc).or_default().insert(dst);
+    {
+        let entry = st.pts.get_mut(&dst).expect("entry just created");
+        for loc in &new_locs {
+            entry.insert(*loc);
+            st.loc_nodes.entry(*loc).or_default().insert(dst);
+        }
     }
+    st.record_delta(dst, &new_locs);
     st.push(dst);
 }
 
-fn apply_store(pag: &Pag, idx: usize, st: &mut SolverState) {
+fn propagate_slice(st: &mut SolverState, dst: PagNodeId, src: &[LocId]) {
+    let mut new_locs: Vec<LocId> = Vec::new();
+    {
+        let entry = st.pts.entry(dst).or_default();
+        for &loc in src {
+            if !entry.contains(&loc) {
+                new_locs.push(loc);
+            }
+        }
+    }
+    if new_locs.is_empty() {
+        return;
+    }
+    {
+        let entry = st.pts.get_mut(&dst).expect("entry just created");
+        for loc in &new_locs {
+            entry.insert(*loc);
+        }
+    }
+    for loc in &new_locs {
+        st.loc_nodes.entry(*loc).or_default().insert(dst);
+    }
+    st.record_delta(dst, &new_locs);
+    st.push(dst);
+}
+
+/// Store `*ptr = value`: write the value side's current points-to (plus its
+/// own storage location for var nodes) into the memories of the given target
+/// locations. `targets == None` means every location currently in the pointer
+/// node's set; `Some(delta)` restricts writes to newly gained targets
+/// (difference propagation — their memory is written for the first time).
+fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: Option<&[LocId]>) {
     let c = &pag.constraints[idx];
     // Clone-free store: `pts` and `memory_pts` are disjoint fields, so the
     // destination set can be iterated by reference while memory is mutated.
-    let Some(dst_pts) = st.pts.get(&c.dst) else {
-        return;
-    };
-    if dst_pts.is_empty() {
-        return;
-    }
     let src_set = st.pts.get(&c.src);
     let self_loc = match pag.nodes[c.src.0 as usize].kind {
         PagNodeKind::Var(v) => pag.var_location.get(&v).copied(),
@@ -353,8 +563,22 @@ fn apply_store(pag: &Pag, idx: usize, st: &mut SolverState) {
     if src_set.map(|s| s.is_empty()).unwrap_or(true) && self_loc.is_none() {
         return;
     }
+    let owned_targets: Vec<LocId>;
+    let target_iter: &[LocId] = match targets {
+        // `ts` borrows the caller-owned delta vector, disjoint from `st`:
+        // iterate it directly, no copy needed.
+        Some(ts) => ts,
+        None => {
+            owned_targets = st
+                .pts
+                .get(&c.dst)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            &owned_targets
+        }
+    };
     let mut requeues: Vec<LocId> = Vec::new();
-    for &loc in dst_pts.iter() {
+    for &loc in target_iter.iter() {
         if fn_for_loc(pag, loc).is_some() {
             continue;
         }
@@ -377,13 +601,23 @@ fn apply_store(pag: &Pag, idx: usize, st: &mut SolverState) {
             summary_loc = Some(summary);
             let summary_entry = st.memory_pts.entry(summary).or_default();
             let before_summary = summary_entry.len();
-            if let Some(s) = src_set {
-                for l in s {
-                    summary_entry.insert(*l);
+            if summary_entry.len() < SUMMARY_MEM_CAP {
+                if let Some(s) = src_set {
+                    for l in s {
+                        summary_entry.insert(*l);
+                    }
                 }
-            }
-            if let Some(sl) = self_loc {
-                summary_entry.insert(sl);
+                if let Some(sl) = self_loc {
+                    summary_entry.insert(sl);
+                }
+            } else if !st.saturated_summaries.contains(&summary) {
+                // Instance-insensitive summaries are the unbounded resource of
+                // this solver: with interprocedural param flow their content
+                // grows toward "everything stored through any instance".
+                // Saturation stops the growth (documented imprecision: reads
+                // past saturation may miss targets); ordinary per-object
+                // field locations stay exact.
+                st.saturated_summaries.insert(summary);
             }
             changed |= summary_entry.len() > before_summary;
         }
@@ -395,28 +629,67 @@ fn apply_store(pag: &Pag, idx: usize, st: &mut SolverState) {
         }
     }
     for loc in requeues {
-        st.requeue_loc(loc);
+        st.touch_loc_holders(loc);
     }
 }
 
-/// Cheap emptiness probe used by the store-src trigger: does the node hold any
-/// pointee, or (for variables) at least its own abstract storage location?
-fn pts_has_values_or_self_loc(
-    pag: &Pag,
-    pts: &FxHashMap<PagNodeId, FxHashSet<LocId>>,
-    node: PagNodeId,
-) -> bool {
-    if pts.get(&node).map(|s| !s.is_empty()).unwrap_or(false) {
-        return true;
+/// Add a persistent `Copy { dst: formal, src: actual }` constraint and wire it
+/// into the solver adjacency index so later growth of `pts(actual)` still
+/// reaches the formal during this solve.
+fn ensure_param_copy(
+    pag: &mut Pag,
+    st: &mut SolverState,
+    actual_node: PagNodeId,
+    formal_node: PagNodeId,
+) {
+    let constraint_idx = pag.constraints.len();
+    pag.constraints.push(crate::constraints::Constraint {
+        kind: crate::constraints::ConstraintKind::Copy,
+        dst: formal_node,
+        src: actual_node,
+        field: None,
+    });
+    pag.indices
+        .copy_src
+        .entry(actual_node)
+        .or_default()
+        .push(constraint_idx);
+    // Only enqueue when the actual already carries pointees; future growth
+    // re-fires this copy through the `copy_src` index automatically.
+    if st.pts.get(&actual_node).is_some_and(|p| !p.is_empty()) {
+        st.push(actual_node);
     }
-    match pag.nodes[node.0 as usize].kind {
-        PagNodeKind::Var(v) => pag.var_location.contains_key(&v),
+}
+
+/// Only parameters whose pointees can influence call-target resolution get
+/// persistent interprocedural copy constraints: function pointers directly,
+/// opaque/unknown pointees that may hide them, and aggregates (op tables,
+/// entry structures) whose fields carry callbacks. Opaque *buffer* pointers
+/// (`char *`, `int *`, sized-value pointers) are excluded: their flow is
+/// over-approximated by FieldSummary fallbacks and wiring them eagerly makes
+/// solve time explode on large trees.
+fn var_may_hold_pointee(program: &Program, var: VarId) -> bool {
+    use trace_ir::TypeDesc as TD;
+    let Some(v) = program.symbols.variable_by_id(var) else {
+        return false;
+    };
+    let desc = &program.types.get(v.type_id).desc;
+    match desc {
+        TD::FnPtr { .. } => true,
+        TD::Ptr(inner) => matches!(
+            inner.as_ref(),
+            TD::FnPtr { .. } | TD::Unknown | TD::Struct { .. } | TD::Union { .. }
+        ),
+        // Pointer-flagged variable whose recorded shape degraded to a scalar
+        // (e.g. synthesized load temps typed `int`): participate
+        // conservatively.
+        _ if v.is_pointer => true,
         _ => false,
     }
 }
 
 fn wire_params(
-    pag: &Pag,
+    pag: &mut Pag,
     program: &Program,
     cs: &trace_ir::CallSite,
     callee: FnId,
@@ -429,6 +702,18 @@ fn wire_params(
         if let Some(actual) = cs.var_args.iter().find(|(j, _)| *j == idx).map(|(_, v)| *v) {
             let formal_node = pag.var_node.get(formal).copied().expect("formal var node");
             let actual_node = pag.var_node.get(&actual).copied().expect("actual var node");
+            // Persistent copy constraint: the actual's points-to may still be
+            // growing when the edge is first discovered (direct sites are
+            // wired before the first propagation round). A one-shot snapshot
+            // here loses interprocedural flow (observed as missed indirect
+            // targets passed through parameters). Scalars cannot contribute
+            // pointees and are skipped to bound constraint volume.
+            if var_may_hold_pointee(program, actual)
+                && var_may_hold_pointee(program, *formal)
+                && st.wired_copies.insert((actual_node, formal_node))
+            {
+                ensure_param_copy(pag, st, actual_node, formal_node);
+            }
             if let Some(actual_pts) = st.pts.get(&actual_node).cloned() {
                 propagate_pts(st, formal_node, &actual_pts);
             }
@@ -456,11 +741,16 @@ fn propagate_pts(st: &mut SolverState, dst: PagNodeId, src_pts: &FxHashSet<LocId
     if new_locs.is_empty() {
         return;
     }
-    let entry = st.pts.get_mut(&dst).expect("entry just created");
-    for loc in new_locs {
-        entry.insert(loc);
-        st.loc_nodes.entry(loc).or_default().insert(dst);
+    {
+        let entry = st.pts.get_mut(&dst).expect("entry just created");
+        for loc in &new_locs {
+            entry.insert(*loc);
+        }
     }
+    for loc in &new_locs {
+        st.loc_nodes.entry(*loc).or_default().insert(dst);
+    }
+    st.record_delta(dst, &new_locs);
     st.push(dst);
 }
 
@@ -471,6 +761,7 @@ fn add_pts(st: &mut SolverState, node: PagNodeId, loc: LocId) {
     };
     if inserted {
         st.loc_nodes.entry(loc).or_default().insert(node);
+        st.record_delta(node, &[loc]);
         st.push(node);
     }
 }
@@ -536,6 +827,7 @@ mod tests {
             caller: trace_ir::FnId(0),
             callee_name: callee_name.into(),
             callee_var: callee_var.map(trace_ir::VarId),
+            callee_fn_id: None,
             var_args: Vec::new(),
             fn_args: Vec::new(),
             span: trace_ir::Span {

@@ -114,6 +114,32 @@ fn run_analyze(
         }
     }
 
+    // Include paths pointing outside the analyzed tree make twin headers
+    // (same basename, different tree) resolve to the wrong copy, which
+    // silently starves translation units. Warn loudly — this misconfiguration
+    // previously produced silent false negatives.
+    let root_canon = target.canonicalize().unwrap_or_else(|_| target.clone());
+    let outside: Vec<PathBuf> = opts
+        .include_paths
+        .iter()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .filter(|c| !(c.starts_with(&root_canon) || root_canon.starts_with(c)))
+        .collect();
+    if !outside.is_empty() {
+        eprintln!(
+            "warning: {} include path(s) lie outside the analysis tree {};",
+            outside.len(),
+            root_canon.display()
+        );
+        eprintln!("         headers may resolve to twins in another tree and lose definitions:");
+        for p in outside.iter().take(5) {
+            eprintln!("           {}", p.display());
+        }
+        if outside.len() > 5 {
+            eprintln!("           ... and {} more", outside.len() - 5);
+        }
+    }
+
     let t0 = Instant::now();
     let program = build_program_with_jobs(&target, &opts, jobs).map_err(|e| anyhow::anyhow!(e))?;
     eprintln!(
@@ -162,10 +188,34 @@ fn run_analyze(
     .with_context(|| format!("failed to export to {}", output.display()))?;
     eprintln!("export: {:.1}s", t2.elapsed().as_secs_f64());
 
+    let mut direct_edges = 0usize;
+    let mut indirect_edges = 0usize;
+    let mut external_edges = 0usize;
+    for e in &analysis.call_edges {
+        match e.resolution {
+            // Ambiguous groups with direct in the summary: both are
+            // statically-name-resolved; ambiguity only means several
+            // same-name candidates, not pointer indirection.
+            trace_analysis::ResolutionKind::Direct | trace_analysis::ResolutionKind::Ambiguous => {
+                direct_edges += 1
+            }
+            trace_analysis::ResolutionKind::Indirect => indirect_edges += 1,
+            trace_analysis::ResolutionKind::External => external_edges += 1,
+        }
+    }
     eprintln!(
-        "analysis complete: {} functions, {} call edges, {} arg-flow edges -> {}",
+        "analysis complete: {} functions ({} external), {} call edges ({} direct, {} indirect, {} external), {} arg-flow edges -> {}",
         program.symbols.functions.len(),
+        program
+            .symbols
+            .functions
+            .iter()
+            .filter(|f| !f.is_defined)
+            .count(),
         analysis.call_edges.len(),
+        direct_edges,
+        indirect_edges,
+        external_edges,
         analysis.arg_flow_edges.len(),
         output.display()
     );

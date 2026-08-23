@@ -59,8 +59,10 @@ fn anonymous_struct_field_flow() {
         &program,
         &analysis,
         "anon_user",
+        // `touch` is prototype-only: statically resolved, but classified
+        // external because no definition exists under the fixture root.
         "touch",
-        ResolutionKind::Direct
+        ResolutionKind::External
     ));
 }
 

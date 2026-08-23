@@ -22,6 +22,10 @@ pub enum ResolutionKind {
     Direct,
     Indirect,
     Ambiguous,
+    /// Plain-identifier call to a function with no definition under the
+    /// analyzed root (libc, logging backends, vendor externs). Resolved to
+    /// a synthesized bodyless entry — not an unresolved indirect site.
+    External,
 }
 
 #[derive(Debug, Clone)]

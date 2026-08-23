@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS functions (
     line_start INTEGER NOT NULL,
     line_end INTEGER NOT NULL,
     linkage TEXT NOT NULL,
-    signature TEXT NOT NULL
+    signature TEXT NOT NULL,
+    is_defined INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS types (

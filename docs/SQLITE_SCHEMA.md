@@ -74,6 +74,7 @@ diagnostics
 | `line_end` | INTEGER | End line (currently ≈ start) |
 | `linkage` | TEXT | `external`, `internal`, `none` |
 | `signature` | TEXT | Placeholder `fn_<name>` |
+| `is_defined` | INTEGER | 1 if a body exists under the analyzed root. 0 rows include prototype-only declarations and synthesized externals (libc/logging backends never declared in-tree) |
 
 **Index:** `functions(name)`
 
@@ -102,7 +103,7 @@ Call sites inside header-defined functions are deduplicated by
 | `id` | INTEGER PK | Edge id |
 | `call_site_id` | INTEGER FK → `call_sites` | Call site |
 | `callee_fn_id` | INTEGER FK → `functions` | Resolved target |
-| `resolution` | TEXT | `direct`, `indirect`, `ambiguous` |
+| `resolution` | TEXT | `direct`, `indirect`, `ambiguous`, `external` (callee statically resolved but bodyless under the analyzed root — see `functions.is_defined`) |
 
 Multiple rows per call site are allowed (may-analysis indirect targets).
 
