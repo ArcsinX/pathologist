@@ -17,6 +17,8 @@ Analysis of 1,198 files (7,096 defined + 2,065 external functions) produced:
 
 All 30 evaluated functions below were analyzed successfully. Indirect call resolution via function-pointer analysis resolved every dispatch pattern tested, including array-of-function-pointers (138 targets), vtable dispatch (78 targets), and driver entry tables (125 targets).
 
+**C++ support** (new) adds namespaces, overloads (arity-based), classes with virtual dispatch, ctors/dtors, templates (name-stripping), constructor-initializer lists, and cross-C/C++ interop. The C++ implementation files (`.cpp`) are now indexed as translation units alongside `.c` files, enabling analysis of mixed C/C++ driver stacks such as the HDF framework where C++ IPC backends extend C interfaces.
+
 ## Overall Metrics
 
 | Metric | Value |
@@ -90,6 +92,15 @@ All 30 evaluated functions below were analyzed successfully. Indirect call resol
 | 28 | RunDispatcher (wifi message loop) | `RunDispatcher` |
 | 29 | HandleRequestMessage (wifi command dispatch) | `HandleRequestMessage` |
 | 30 | HdfDeviceLaunchNode (driver init) | `HdfDeviceLaunchNode` |
+| 31 | C++ virtual dispatch (Shape/Circle) | `main.cpp` (cpp_basic) |
+| 32 | C++ overload resolution (arity-based) | `main.cpp` (cpp_basic, cpp_more) |
+| 33 | C++ namespace + anonymous namespace | `util::tag`, `hidden()` |
+| 34 | C++ ctor/dtor sites (`new`/`delete`) | `new Circle()`, `delete s` |
+| 35 | C++ ctor-initializer list (base + member) | `D(int v) : Base(v), m()` |
+| 36 | C++ template (name-stripping) | `Box<Widget>`, `b.put()`, `b.get()` |
+| 37 | C++ multiple inheritance + virtual dispatch | `AB : A, B` — `pa->fa()` resolves to `A::fa` override |
+| 38 | C++ static member function | `S::Make()` |
+| 39 | C++ cross-C/C++ interop (extern "C" + ops table) | `cpp_flow` — C++ impl registers into C ops, C caller resolves both |
 
 ---
 
@@ -731,3 +742,32 @@ After: **3/3** resolved, with **+16 call edges** and **+12 arg-flow edges** (neg
 6. **No false positives observed.** All resolved indirect targets are semantically valid — e.g., `device->ops->read` correctly resolves to ADC read implementations only, not unrelated read functions.
 
 7. **Parse warnings are non-blocking.** 442 parse warnings (likely from missing headers or preprocessor edge cases) did not prevent analysis of any target function.
+
+8. **C++ support is functional.** The `cpp_basic`, `cpp_flow`, and `cpp_more` test fixtures demonstrate C++ analysis covering namespaces, overloads, virtual dispatch, inheritance, templates, ctor/dtor sites, and cross-language interop. The C++ grammar (tree-sitter-cpp) parses `.cpp`/`.cc`/`.cxx` files while `.c` files continue to use the C grammar.
+
+### C++ Feature Coverage
+
+| Feature | Pattern | Status | Documented Imprecision |
+|---------|---------|--------|----------------------|
+| Namespaces | `ns::f`, anonymous ns → internal linkage | Working | `using` directives not used for qualification |
+| Overloads | Same-name, different arity | Working | Arity-only resolution (no type ranking) |
+| Classes | Layout under qualified tag, inheritance chain | Working | — |
+| Virtual dispatch | `virtual` methods expand to subclass closure | Working | Single-inheritance assumed for upward walk |
+| Ctors / dtors | `new T(...)`, `delete p`, ctor-init lists | Working | Default-construct `Cls o;` emits no site |
+| Templates | Stripped to primary name `<T>` → `<T>` removed | Working | No dependent-type modeling |
+| Multiple inheritance | `AB : A, B` — nearest declarer wins | Working | — |
+| Static members | `S::Make()` | Working | — |
+| Cross-C/C++ | `extern "C"` functions in C++ TU, C caller resolves both | Working | — |
+
+### C++ Interop Pattern: `cpp_flow` Fixture
+
+The `cpp_flow` fixture models the real-world HDF pattern where C++ IPC implementations extend C interfaces:
+
+```
+main.c (C caller) → Read() → s->impl->read()
+                                     ↓
+                    ops.c:  RawImplRead    (C implementation)
+                    impl.cpp: MParcelImplRead  (C++ implementation)
+```
+
+The C++ `RegisterOps()` function (declared `extern "C"`) stores `&parcel_ops` into `s->impl`. The C `Read()` function dereferences `s->impl->read` — the solver correctly resolves this indirect call to **both** `RawImplRead` (from C) and `MParcelImplRead` (from C++), demonstrating that cross-language function-pointer flows work through the shared ops table pattern.
