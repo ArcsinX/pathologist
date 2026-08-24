@@ -67,7 +67,9 @@ impl LineMap {
     /// Entries at or after `start`, re-based so `start` becomes offset 0 and
     /// with the file table reduced to the files actually referenced.
     pub fn slice_from(&self, start: usize) -> LineMap {
-        let idx = self.entries.partition_point(|e| (e.output_offset as usize) < start);
+        let idx = self
+            .entries
+            .partition_point(|e| (e.output_offset as usize) < start);
         let mut out = LineMap::new();
         let mut remap: Vec<u32> = Vec::with_capacity(self.files.len());
         for _ in 0..self.files.len() {

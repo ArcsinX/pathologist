@@ -465,7 +465,11 @@ fn header_chain_reachable_from_c_attributed_to_headers() {
     // Headers reachable from a .c are no longer separate indexing units,
     // but they must appear as origin files for their lowered entities.
     assert!(
-        program.symbols.files.iter().any(|f| f.path.ends_with("chain_b.h")),
+        program
+            .symbols
+            .files
+            .iter()
+            .any(|f| f.path.ends_with("chain_b.h")),
         "chain_b.h must be an attributed origin file"
     );
     let b_caller = program

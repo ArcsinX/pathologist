@@ -70,7 +70,7 @@ diagnostics
 | `id` | INTEGER PK | Function id |
 | `name` | TEXT | Linkage-visible name |
 | `file_id` | INTEGER FK → `files` | Defining file (original header if include-originated) |
-| `line_start` | INTEGER | Start line (original file for header-origin entities; preprocessed otherwise) |
+| `line_start` | INTEGER | Start line (always original-file coordinates via LineMap) |
 | `line_end` | INTEGER | End line (currently ≈ start) |
 | `linkage` | TEXT | `external`, `internal`, `none` |
 | `signature` | TEXT | Placeholder `fn_<name>` |
@@ -88,7 +88,7 @@ wins, later copies redirect), so they appear once per origin.
 | `id` | INTEGER PK | Call site id |
 | `caller_fn_id` | INTEGER FK → `functions` | Containing function |
 | `file_id` | INTEGER FK → `files` | Call location file |
-| `line` | INTEGER | Line (original file for header-origin sites; preprocessed otherwise) |
+| `line` | INTEGER | Line (always original-file coordinates via LineMap; macro-expansion sites map to the expansion origin) |
 | `col` | INTEGER | Column |
 | `callee_text` | TEXT | Surface syntax (`foo`, `p->handler`, …) |
 | `is_direct` | INTEGER | `1` direct by name; `0` indirect |

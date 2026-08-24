@@ -137,6 +137,15 @@ When `pts(base)` is empty (typical for pointer parameters with no incoming flow)
 
 `apply_store` propagates into both concrete field locs and their `FieldSummary`, keeping summary memory in sync with instance stores.
 
+**Signature-guarded function-value propagation**
+
+Wrong-type pointer casts put unrelated objects into a pointer's points-to; a store through such a pointer would otherwise write callback addresses into alien layouts, where later field loads surface them as bogus indirect-call targets. The solver therefore filters **function values only** (all non-function flow stays unfiltered, preserving soundness):
+
+- A fn value may enter `memory_pts[cell]` / a summary cell only when the cell's declared type accepts it: `FnPtr` slots require the same parameter count; concrete non-fn-pointer cells (`struct`, array, scalar-pointer, union) reject all fn values; unknown/untyped cells stay writable.
+- The same guard applies when `merge_memory_into` lifts cell contents into points-to sets, and when a `Gep` passes fn values from the base node's set into the field node — except registered `array_fn_members` table members, which always pass (see "Arrays and function-pointer tables").
+
+Consequence: callbacks stored through correctly-typed ops assignments resolve exactly as before, while cross-signature leaks (e.g. a 2-param `AddService` callback surfacing at 4-param `Dispatch` sites) are cut. Documented imprecision: old-style casts that stash fn pointers in `void *`-typed cells then call them through typed loads still work (unknown cells accept everything), but calls through cells whose declared type is structurally wrong for the stored fn are no longer reported.
+
 **Indirect calls**
 
 1. Each indirect call site gets a `CallTarget` node.
@@ -261,6 +270,16 @@ Registered in `trace-analysis/src/summaries.rs` (`apply_call_summary`). Current 
   resolve against the *outer* layout plus its type-matched summary — sibling
   fields at colliding positional indexes can cross into such loads (observed
   as ~2% of Dispatch-site edges on HDF test drivers).
+- **Signature-guarded propagation drops cross-signature fn values** (see
+  "Signature-guarded function-value propagation"): calls through cells whose
+  declared fn-pointer arity mismatches the stored function are not reported.
+  Sites whose only reachable "targets" arrived via such wrong-type flow now
+  report none (e.g. stub-side `super->X` calls behind the unmodeled IPC
+  boundary in HDF — their baseline targets were cross-object pollution, not
+  real resolutions).
+- **IPC / process boundaries are unmodeled**: `HdfRemoteServiceObtain`-style
+  registrations that hand a dispatcher to an external broker do not connect
+  client proxies to server-side handler objects.
 - **`memcpy` / `memmove`**: invisible to analysis.
 - **C++ TUs** (`.cpp`) not indexed — impls only in C++ may be missing.
 - Macro-generated identifiers may be skipped when classified as macro-like callees.

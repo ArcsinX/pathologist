@@ -62,7 +62,9 @@ fn read_index_source(
         if let Some(s) = graph.source_cache.get(&canonical) {
             return Ok((s.clone(), LineMap::new()));
         }
-        return std::fs::read_to_string(path).map(|s| (s, LineMap::new())).map_err(|e| e.to_string());
+        return std::fs::read_to_string(path)
+            .map(|s| (s, LineMap::new()))
+            .map_err(|e| e.to_string());
     }
     let preproc_result = preprocess_file(&canonical, eff_opts).map_err(|e| e.to_string())?;
     // Keep partial output even when preprocessing stopped mid-file. A stop

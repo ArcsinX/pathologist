@@ -27,7 +27,7 @@ Each stage must remain independently testable.
 
 ## Invariants
 
-1. **LineMap**: Preprocessor must preserve mappable `(original_file, line, col)` for output offsets. Exported spans for `#include`d code use **original** file/line (resolved via LineMap, cached expansions included); TU-local spans use preprocessed coordinates. Header-origin entities are deduplicated across TUs at merge time.
+1. **LineMap**: Preprocessor must preserve mappable `(original_file, line, col)` for output offsets. All exported spans use **original** file/line/col (resolved via LineMap, cached expansions included); code inside macro expansions attributes to the expansion site's origin. Header-origin entities are deduplicated across TUs at merge time.
 2. **Soundness**: May-analysis — over-approximate when uncertain (unknown index → array summary; instance-insensitive **`FieldSummary`** for struct fields).
 3. **Phase boundaries**: Preprocessor must not depend on analysis. IR must not depend on SQLite.
 4. **IDs**: Use newtype IDs from `trace-ir` (`FnId`, `VarId`, etc.). Do not use raw integers in public APIs.

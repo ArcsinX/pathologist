@@ -304,6 +304,24 @@ impl Pag {
         self.field_loc.get(&(parent_loc, field)).copied()
     }
 
+    /// Declared parameter count of the function-pointer slot `base.field`,
+    /// used by the solver to keep signature-incompatible function values out
+    /// of typed slots under wrong-type pointer flow. `None` = slot is not
+    /// (known to be) a fn pointer.
+    pub fn field_slot_arity(
+        &self,
+        program: &Program,
+        base_loc: LocId,
+        field: FieldId,
+    ) -> Option<usize> {
+        let parent_type = struct_type_for_loc(self, program, base_loc)?;
+        let layout = program.types.get(parent_type).layout.fields.get(&field)?;
+        match &program.types.get(layout.type_id).desc {
+            trace_ir::TypeDesc::FnPtr { params, .. } => Some(params.len()),
+            _ => None,
+        }
+    }
+
     fn build_function_locations(&mut self, program: &Program) {
         for func in &program.symbols.functions {
             if self.fn_locations.contains_key(&func.id) {
@@ -371,7 +389,10 @@ impl Pag {
                         self.add_addr_of(array_n, loc_n);
                         // Also record for element-field loads through
                         // pointers to the array (order-independent).
-                        self.array_fn_members.entry(*array).or_default().push(fn_loc);
+                        self.array_fn_members
+                            .entry(*array)
+                            .or_default()
+                            .push(fn_loc);
                     }
                 }
                 FlowConstraint::CallReturn { dst, callee_name } => {

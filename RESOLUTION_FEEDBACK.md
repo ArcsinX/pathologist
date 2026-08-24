@@ -378,3 +378,108 @@ sqlite3 /tmp/opencode/hdf_new.db "SELECT cs.line, group_concat(c.name) FROM call
  GROUP BY cs.line;"
 cargo test --workspace   # 85 passed
 ```
+
+---
+
+# Round R+1 — GpioManagerAdd FP root cause & signature-guarded propagation fix
+
+Date: 2026-08-24 · Build: workspace @ e1f04b8 + local solver/pag changes (uncommitted).
+Corpus DBs: baseline `/tmp/opencode/hdf_r4.db`, final `/tmp/opencode/hdf_final.db` (both: `analyze ~/drivers_hdf_core -o <db> --jobs 8 -D __LITEOS__`, unlimited budget via `TRACE_SOLVE_BUDGET_POPS=0`).
+
+## 1. The reported FP and its full derivation
+
+Site: `FinishEvent` — `service->dispatcher->Dispatch(...)` at
+`~/drivers_hdf_core/adapter/uhdf2/osal/src/osal_sysevent.c:74`.
+Baseline resolved **24 targets; 19 were FPs**, including the suspicious
+**`GpioManagerAdd`** (2-param ops callback from gpio_manager.c) plus 10
+`*TestEntry`/`*IoDispatch` functions of unrelated subsystems.
+
+Derivation (traced with a temporary solver instrumentation, since removed):
+
+1. **Legit store**: `GpioManagerGet` (`framework/support/platform/src/gpio/gpio_manager.c:90-96`)
+   stores `manager->add = GpioManagerAdd` into the `PlatformManager.add` slot.
+2. **Wrong-type object flow**: unrelated pointers polluted by casts reach the
+   same nodes; the solver's **GEP handler passed any function-kind location in
+   the base node's points-to through every field access unchanged** ("fn
+   passthrough"), so `fn(GpioManagerAdd)` rode field reads of arbitrary bases.
+3. **Memory-content merge**: `merge_memory_into` merged cell *contents* into
+   field-*address* nodes, lifting fn locs further; param wiring + casts spread
+   them. Pre-fix, 987 distinct nodes held `fn(GpioManagerAdd)`; the static
+   dispatcher object cell (`HdfIoDispatcher` object, loc#977) had it written by
+   stray stores through wrong-typed pointer sets.
+4. **Positional FieldId collisions** then surfaced it wherever a Dispatch-ish
+   field was read off a polluted base.
+
+## 2. The fix (implemented)
+
+All in `crates/trace-analysis/src/solver.rs` (+ one helper in `pag.rs`), guarded by declared types only:
+
+- **Store-time cell guard**: a fn value is written into `memory_pts[cell]`
+  (and its summary cell) only if the cell accepts it:
+  `FnPtr{params}` → same arity; concrete non-fn-pointer cells → reject;
+  unknown/untyped cells → accept (conservative).
+- **`merge_memory_into` guard**: same predicate when lifting contents.
+- **GEP fn passthrough restricted**: registered `array_fn_members` table
+  members always pass (HDMI pattern); other fn values pass only when the
+  destination field slot's declared FnPtr arity matches
+  (`Pag::field_slot_arity`, pag.rs).
+- Load fn-passthrough kept unchanged.
+
+Documented in `docs/ANALYSIS.md` (Solver → "Signature-guarded function-value
+propagation" + Known imprecision entries).
+
+## 3. Results (baseline → final)
+
+| Metric | Baseline | Final |
+|---|---|---|
+| Indirect edges | 6494 | **4278** (−2216) |
+| Indirect sites with ≥1 target | 1406 | 1390 |
+| Arg-flow edges | 16588 | 11983 |
+
+- **FinishEvent** (osal_sysevent.c:74): 24 targets → **exactly**
+  `{DeviceManagerDispatch, DeviceNodeExtDispatch, DeviceSvcMgrDispatch,
+  HdfKIoServiceDispatch, HdfSyscallAdapterDispatch}`. `GpioManagerAdd`,
+  all `*TestEntry`, all `*IoDispatch` gone.
+- **HDMI TP preserved**: `HdmiIoDispatch` (`hdmi_dispatch.c`) set identical to
+  baseline, all 15 targets.
+- **New precision wins**: `cdev->opsImpl->{open,ioctl,poll,release}` now
+  resolve to exactly `HdfVNodeAdapter{Open,Ioctl,Poll,Close}`;
+  `task->SendMessage → HdfMessageTaskSendMessage`;
+  `devmgrService->PowerStateChange → DevmgrServicePowerStateChange`.
+
+### Audited removals (A/B over all sites)
+
+- 131 sites lost some targets (1782 edges). Sampled top losses are all
+  cross-family soup (e.g. `opsCall->SetOption` → `GpioDevSetDir`,
+  `DevSvcManagerAddService`, Dispatch-family...).
+- 22 sites went to zero — investigated individually; **all are stub-side
+  calls behind the unmodeled IPC boundary**, e.g.
+  `DevSvcManagerStubAddService :: super->AddService`
+  (`adapter/uhdf2/manager/src/devsvc_manager_stub.c:289`). Their baseline
+  "targets" were provably pollution, not resolution:
+  - baseline gave `super->GetObject` → `DevSvcManagerAddService` (wrong impl;
+    true impl would be `DevSvcManagerGetObject`);
+  - the handler object is reached only via
+    `HdfRemoteServiceObtain(inst, &dispatcher)` (external summary) — client
+    proxies (`hostClnt->remote->dispatcher->Dispatch`, 13 sites) still resolve
+    to `DevSvcManagerStubDispatch` correctly, but no in-process fact links a
+    proxy remote to the server stub instance;
+  - same class for `DevmgrServiceStubDispatch*` (`devmgr_service_stub.c`),
+    `Dispatch{Add,Del}Device` (`devhost_service_stub.c`; DelDevice baseline
+    had **101** "targets"), and the two PPG sensor sites whose sole baseline
+    target was `DevSvcManagerOnServiceDied` for an `Enable` slot.
+  These need an explicit IPC/registration summary design decision, not a
+  solver relaxation. Listed as known imprecision in docs/ANALYSIS.md.
+- No plausible TP was observed to disappear.
+
+## 4. Verification
+
+```bash
+cargo build --workspace && cargo test --workspace   # all pass, clippy clean
+TRACE_SOLVE_BUDGET_POPS=0 ./target/release/trace analyze ~/drivers_hdf_core \
+  -o /tmp/opencode/hdf_final.db --jobs 8 -D __LITEOS__
+# A/B scripts over call_edges keyed by (caller,file,line,callee_text)
+```
+
+Note: default 200k budget truncates late sites on this corpus; runs above use
+`TRACE_SOLVE_BUDGET_POPS=0`. Deterministic either way.

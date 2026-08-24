@@ -120,7 +120,10 @@ impl SymbolTable {
         }
     }
 
-    pub fn included_headers(&self, tu: crate::FileId) -> Option<&std::collections::BTreeSet<crate::FileId>> {
+    pub fn included_headers(
+        &self,
+        tu: crate::FileId,
+    ) -> Option<&std::collections::BTreeSet<crate::FileId>> {
         self.headers_of.get(&tu)
     }
 

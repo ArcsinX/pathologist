@@ -184,7 +184,13 @@ fn member_address_of_preserves_field_identity() {
         "dev.service Dispatch call must resolve to RealDispatch"
     );
     assert!(
-        !has_edge(&program, &analysis, "CoreRun", "EntryFn", ResolutionKind::Indirect),
+        !has_edge(
+            &program,
+            &analysis,
+            "CoreRun",
+            "EntryFn",
+            ResolutionKind::Indirect
+        ),
         "Dispatch load must not see fns stored in sibling fields of the outer struct"
     );
 }
@@ -246,7 +252,11 @@ fn header_inline_calls_deduplicate_to_header_attribution() {
     );
 
     let (_pag, analysis) = analyze(&program);
-    for (caller, callee) in [("use_a", "hdr_add"), ("use_b", "hdr_add"), ("hdr_add", "hdr_helper")] {
+    for (caller, callee) in [
+        ("use_a", "hdr_add"),
+        ("use_b", "hdr_add"),
+        ("hdr_add", "hdr_helper"),
+    ] {
         assert!(
             has_edge(&program, &analysis, caller, callee, ResolutionKind::Direct),
             "{caller} -> {callee} direct edge must survive dedup"
@@ -345,7 +355,11 @@ fn unresolved_plain_ident_calls_become_external() {
             );
         }
     }
-    assert!(!program.symbols.variables.iter().any(|v| v.name == "ext_helper"));
+    assert!(!program
+        .symbols
+        .variables
+        .iter()
+        .any(|v| v.name == "ext_helper"));
     assert!(!program
         .symbols
         .variables

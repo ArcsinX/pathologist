@@ -57,6 +57,40 @@ struct SolverState {
     /// (actual → formal) pair recurs across many call sites and re-adding it
     /// per discovered edge explodes constraint volume on large trees.
     wired_copies: FxHashSet<(PagNodeId, PagNodeId)>,
+    /// Signature-aware propagation guards (see `SlotGuard`).
+    slot_guard: FxHashMap<LocId, SlotGuard>,
+    /// Parameter count per function location (only when > 0; old-style `()`
+    /// declarations stay unfiltered).
+    fn_arity: FxHashMap<LocId, usize>,
+}
+
+/// Declared content type of a memory cell / points-to slot, as far as it is
+/// known, used to keep incompatible function values out under wrong-type
+/// pointer flow.
+#[derive(Clone, Copy)]
+enum SlotGuard {
+    /// Slot is a `FnPtr` taking `n` parameters.
+    FnParams(usize),
+    /// Slot is a concrete non-fn-pointer type (e.g. a struct object);
+    /// storing a bare function address there cannot occur in valid C.
+    NotFnPtr,
+}
+
+impl SolverState {
+    /// May a function value enter the slot `slot`? Typed fn-pointer slots
+    /// accept only same-arity functions; concrete non-fn slots reject all;
+    /// unknown slots accept everything (conservative over-approximation).
+    #[inline]
+    fn arity_allows(&self, slot: LocId, fn_loc: LocId) -> bool {
+        match self.slot_guard.get(&slot) {
+            Some(SlotGuard::FnParams(n)) => match self.fn_arity.get(&fn_loc) {
+                Some(p) => p == n,
+                None => true,
+            },
+            Some(SlotGuard::NotFnPtr) => false,
+            None => true,
+        }
+    }
 }
 
 impl SolverState {
@@ -97,10 +131,15 @@ impl SolverState {
         };
         let mut new_locs: Vec<LocId> = Vec::new();
         {
+            let mem: Vec<LocId> = mem
+                .iter()
+                .copied()
+                .filter(|&loc| self.arity_allows(mem_loc, loc))
+                .collect();
             let entry = self.pts.entry(dst).or_default();
-            for &loc in mem.iter() {
-                if !entry.contains(&loc) {
-                    new_locs.push(loc);
+            for loc in mem.iter() {
+                if !entry.contains(loc) {
+                    new_locs.push(*loc);
                 }
             }
         }
@@ -150,7 +189,29 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
         seen_once: FxHashSet::default(),
         saturated_summaries: FxHashSet::default(),
         wired_copies: FxHashSet::default(),
+        slot_guard: FxHashMap::default(),
+        fn_arity: FxHashMap::default(),
     };
+    // Per-location slot guards and per-function parameter counts for
+    // signature-aware propagation.
+    use trace_ir::TypeDesc as TD;
+    for loc in &pag.locations {
+        let g = match &program.types.get(loc.type_id).desc {
+            TD::FnPtr { params, .. } if !params.is_empty() => SlotGuard::FnParams(params.len()),
+            TD::Void | TD::Char | TD::Int | TD::Long | TD::SizeT | TD::Unknown => continue,
+            TD::Struct { .. } | TD::Union { .. } | TD::Ptr(_) | TD::Array { .. } => {
+                SlotGuard::NotFnPtr
+            }
+            TD::FnPtr { .. } => continue,
+        };
+        st.slot_guard.insert(loc.id, g);
+    }
+    for (&fn_id, &loc) in &pag.fn_locations {
+        let f = program.symbols.function(fn_id);
+        if !f.params.is_empty() {
+            st.fn_arity.insert(loc, f.params.len());
+        }
+    }
 
     for c in &pag.constraints {
         st.push(c.dst);
@@ -268,12 +329,7 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
             }
         }
         if stats_enabled && pops.is_multiple_of(100_000) {
-            let biggest = st
-                .pts
-                .values()
-                .map(|s| s.len())
-                .max()
-                .unwrap_or(0);
+            let biggest = st.pts.values().map(|s| s.len()).max().unwrap_or(0);
             eprintln!(
                 "[solver] pops={} elapsed={:?} constraints={} queued={} max_pts={} total_pts={} locs={} copy={} load={} store={} gep={}",
                 pops,
@@ -392,21 +448,48 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
                     continue;
                 };
                 for &loc in delta.iter() {
-                    // Fn values parked in the base's points-to (e.g.
-                    // ArrayFnMember tables of structs with fn members)
-                    // flow through field accesses unchanged.
-                    if fn_for_loc(pag, loc).is_some() {
-                        add_pts(&mut st, dst, loc);
+                    // Function values reach a base node's points-to either as
+                    // `ArrayFnMember` table initializers (flow through element
+                    // accesses unchanged) or via opaque/wrong-type parameter
+                    // flow. Table members always pass; other fn values pass
+                    // only when their declared arity matches the field slot's
+                    // signature — otherwise a stray callback rides every
+                    // field access of whatever pointer it polluted.
+                    if let Some(fn_id) = fn_for_loc(pag, loc) {
+                        let mut passed = false;
+                        if let PagNodeKind::Var(base_var) = pag.nodes[src.0 as usize].kind {
+                            if let Some(fn_locs) = pag.array_fn_members.get(&base_var) {
+                                for fl in fn_locs.iter().copied() {
+                                    add_pts(&mut st, dst, fl);
+                                }
+                                passed = true;
+                            }
+                        }
+                        // Non-table function values ride a field access only
+                        // when the destination slot's declared signature
+                        // matches; anything else is wrong-type flow that must
+                        // not surface as an indirect-call target.
+                        if !passed {
+                            let n = program.symbols.function(fn_id).params.len();
+                            if n > 0 && pag.field_slot_arity(program, loc, field) == Some(n) {
+                                add_pts(&mut st, dst, loc);
+                            }
+                        }
                         continue;
                     }
                     if let Some(field_loc) = pag.ensure_field_loc(program, loc, field) {
-                        // Field loc plus its instance-insensitive summary.
+                        // Field loc plus its instance-insensitive summary:
+                        // the GEP result points AT these cells.
                         let targets = [Some(field_loc), pag.summary_for_field_loc(field_loc)];
                         propagate_locs(
                             &mut st,
                             dst,
                             targets.iter().filter_map(|t| t.as_ref().copied()),
                         );
+                        // Cell contents reach the address node so that uses of
+                        // the field lvalue (`&obj.f` passed onward, then
+                        // loaded) still observe stores that lowering recorded
+                        // against the cell without an intervening load temp.
                         for fl in targets.into_iter().flatten() {
                             st.merge_memory_into(dst, fl);
                         }
@@ -582,13 +665,30 @@ fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: 
         if fn_for_loc(pag, loc).is_some() {
             continue;
         }
+        // Signature guard: never plant a function value into a cell whose
+        // declared type is an incompatible fn pointer (or a concrete
+        // non-fn-pointer object). Wrong-type casts put unrelated objects into
+        // a pointer's points-to; without this guard a store through such a
+        // pointer writes callbacks into alien layouts, where later field
+        // loads surface them as bogus indirect-call targets. Untyped cells
+        // (`void *`, unknown layouts) stay writable — conservative.
         let mut changed = false;
+        // Signature-guarded view of the source set (see comment above).
+        let filtered_src: Vec<LocId> = match src_set {
+            Some(s) => s
+                .iter()
+                .copied()
+                .filter(|&l| fn_for_loc(pag, l).is_none() || st.arity_allows(loc, l))
+                .collect(),
+            None => Vec::new(),
+        };
+        let filtered_ref: Option<&[LocId]> = src_set.map(|_| filtered_src.as_slice());
         {
             let entry = st.memory_pts.entry(loc).or_default();
             let before = entry.len();
-            if let Some(s) = src_set {
-                for l in s {
-                    entry.insert(*l);
+            if let Some(s) = filtered_ref {
+                for &l in s.iter() {
+                    entry.insert(l);
                 }
             }
             if let Some(sl) = self_loc {
@@ -602,9 +702,18 @@ fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: 
             let summary_entry = st.memory_pts.entry(summary).or_default();
             let before_summary = summary_entry.len();
             if summary_entry.len() < SUMMARY_MEM_CAP {
+                // Same signature guard for the instance-insensitive summary
+                // cell (its declared type mirrors the field's).
+                let accepts_fns = matches!(
+                    st.slot_guard.get(&summary),
+                    None | Some(SlotGuard::FnParams(_))
+                );
                 if let Some(s) = src_set {
-                    for l in s {
-                        summary_entry.insert(*l);
+                    for &l in s.iter() {
+                        if !accepts_fns && fn_for_loc(pag, l).is_some() {
+                            continue;
+                        }
+                        summary_entry.insert(l);
                     }
                 }
                 if let Some(sl) = self_loc {

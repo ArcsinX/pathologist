@@ -142,17 +142,14 @@ pub fn build_program_with_jobs(
 
     let source_cache = IndexSourceCache::new();
     for path in &headers_for_macro_warm {
-        let header_macros: Arc<std::sync::RwLock<MacroTable>> =
-            Arc::new(std::sync::RwLock::new(macro_table_from_defines(
-                &opts.defines,
-            )));
+        let header_macros: Arc<std::sync::RwLock<MacroTable>> = Arc::new(std::sync::RwLock::new(
+            macro_table_from_defines(&opts.defines),
+        ));
         let header_prep_opts = eff_opts
             .clone()
             .with_shared_macros(Arc::clone(&header_macros))
             .with_accumulate_macros(true);
-        if let Err(e) =
-            source_cache.get_or_preprocess(path, &include_graph, &header_prep_opts)
-        {
+        if let Err(e) = source_cache.get_or_preprocess(path, &include_graph, &header_prep_opts) {
             program.add_diagnostic(Diagnostic {
                 severity: DiagnosticSeverity::Warning,
                 file: None,
@@ -295,10 +292,7 @@ fn finalize_extern_callees(program: &mut Program) {
 /// A call target that is syntactically a bare identifier — no field access,
 /// subscript, cast noise, or macro-artifact punctuation.
 fn is_plain_ident(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn normalize_discovered_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -342,9 +336,15 @@ fn index_source_file(
                     .functions
                     .iter()
                     .filter(|f| {
-                        program.symbols.files.get(f.span.file.0 as usize).is_some_and(|fi| {
-                            fi.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("h"))
-                        })
+                        program
+                            .symbols
+                            .files
+                            .get(f.span.file.0 as usize)
+                            .is_some_and(|fi| {
+                                fi.path
+                                    .extension()
+                                    .is_some_and(|e| e.eq_ignore_ascii_case("h"))
+                            })
                     })
                     .count();
                 eprintln!(
@@ -420,7 +420,9 @@ fn resolve_pending_fn_refs(program: &mut Program, ctx: &LowerContext) {
             PendingFnRef::FieldStore { dst, name, span } => {
                 if let Some(callee) = resolve_function_named(program, ctx, &name) {
                     let tmp = alloc_ret_temp_spanned(program, ctx, span);
-                    program.flow.push(FlowConstraint::AddrOfFn { dst: tmp, callee });
+                    program
+                        .flow
+                        .push(FlowConstraint::AddrOfFn { dst: tmp, callee });
                     program.flow.push(FlowConstraint::Store { dst, src: tmp });
                 }
             }
@@ -1532,9 +1534,10 @@ fn expr_to_rhs_flow(
                 Some(FlowConstraint::Copy { dst, src })
             } else {
                 // Might be a function defined later in the unit.
-                ctx.pending
-                    .borrow_mut()
-                    .push(PendingFnRef::RhsIdent { dst, name: name.to_string() });
+                ctx.pending.borrow_mut().push(PendingFnRef::RhsIdent {
+                    dst,
+                    name: name.to_string(),
+                });
                 None
             }
         }
@@ -2310,18 +2313,23 @@ fn find_params(decl: Node) -> Option<Node> {
 }
 
 fn node_span(program: &mut Program, ctx: &LowerContext, node: Node) -> Span {
-    let line = node.start_position().row as u32 + 1;
-    let col = node.start_position().column as u32 + 1;
     if let Some(line_map) = &ctx.line_map {
         if let Some(entry) = line_map.lookup(node.start_byte()) {
             let origin = line_map.path_of(entry);
-            if origin != ctx.primary_path {
-                // Code from an `#include`d file: attribute the entity to its
-                // original header (AGENTS.md LineMap invariant).
-                let fid = program.symbols.add_file_interned(origin.to_path_buf());
-                return Span::new(fid, entry.line, entry.col);
-            }
+            // Always report original-file coordinates. Code from an
+            // `#include`d file is attributed to its original header;
+            // TU-local code keeps the primary file but gets its original
+            // (pre-expansion) line/col, so reported lines match what a
+            // user sees in their editor (AGENTS.md LineMap invariant).
+            let fid = if origin != ctx.primary_path {
+                program.symbols.add_file_interned(origin.to_path_buf())
+            } else {
+                ctx.current_file
+            };
+            return Span::new(fid, entry.line, entry.col);
         }
     }
+    let line = node.start_position().row as u32 + 1;
+    let col = node.start_position().column as u32 + 1;
     Span::new(ctx.current_file, line, col)
 }

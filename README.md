@@ -81,7 +81,7 @@ trace analyze ./my_app -o /tmp/debug.db --debug-points-to --full-export
 **Notes**
 
 - Only **`.c` files** are indexed as translation units. Headers are pulled in via `#include` during preprocessing, not analyzed as standalone TUs.
-- Line numbers in the database refer to **preprocessed** source (after includes and macro expansion), not always the line in the original `.c` file on disk.
+- Line numbers in the database refer to **original** files on disk (resolved through the preprocessor's `LineMap`); call sites inside macro expansions attribute to the expansion site.
 - Pass include paths that match your build; there is no `compile_commands.json` integration yet.
 - **`static` functions** (internal linkage) and **file-scope `static` variables** are resolved within the defining translation unit. **`static` locals** inside functions are tracked as `fn_static` storage.
 
@@ -204,7 +204,7 @@ Metadata for one `trace analyze` invocation.
 | `id` | INTEGER PK | Internal function id. |
 | `name` | TEXT | Linkage-visible name (may duplicate across TUs before merge; ids differ). |
 | `file_id` | INTEGER FK → `files` | Defining or primary declaration file. |
-| `line_start` | INTEGER | Start line (preprocessed). |
+| `line_start` | INTEGER | Start line (original file). |
 | `line_end` | INTEGER | End line (currently same as start in export). |
 | `linkage` | TEXT | `external`, `internal`, or `none`. |
 | `signature` | TEXT | Placeholder signature string (`fn_<name>`). |
@@ -221,7 +221,7 @@ One row per collected call (direct name call or indirect/function-pointer syntax
 | `id` | INTEGER PK | Call site id (matches IR `CallSiteId`). |
 | `caller_fn_id` | INTEGER FK → `functions` | Containing function. |
 | `file_id` | INTEGER FK → `files` | File containing the call. |
-| `line` | INTEGER | Line (preprocessed). |
+| `line` | INTEGER | Line (original file). |
 | `col` | INTEGER | Column. |
 | `callee_text` | TEXT | Surface syntax, e.g. `foo`, `p->handler`, `ndImpl->interFace->setIpAddr`. |
 | `is_direct` | INTEGER | `1` = direct call by name; `0` = indirect / fn-ptr / unresolved name. |

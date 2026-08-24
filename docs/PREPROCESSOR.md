@@ -66,7 +66,7 @@ flowchart LR
 
 The preprocessor records mappings from **output byte offsets** to original `(file, line, col)` in `LineMap`.
 
-**Current behavior:** tree-sitter parses **preprocessed** source; IR spans (`Span` in `trace-ir`) are resolved through the `LineMap`: code from `#include`d files is attributed to its original file with original line/column, while TU-local code uses positions on the preprocessed text (identical to the raw file when nothing was expanded). Cached `#include` expansions store their own sub-`LineMap`, which is spliced back on replay so origins survive caching.
+**Current behavior:** tree-sitter parses **preprocessed** source; IR spans (`Span` in `trace-ir`) are resolved through the `LineMap` to original `(file, line, col)` — `#include`d code attributes to its header, TU-local code keeps its original pre-expansion position, and macro-expanded code attributes to the expansion site's origin (identical coordinates when nothing was expanded). Cached `#include` expansions store their own sub-`LineMap`, which is spliced back on replay so origins survive caching.
 
 The `LineMap` must keep byte-accurate offset mapping when extending the preprocessor.
 

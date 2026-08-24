@@ -325,10 +325,7 @@ impl PreprocessorState {
                         .filter(|p| self.emitted_bytes.get(*p).copied().unwrap_or(usize::MAX) > 0)
                         .cloned()
                         .collect();
-                    let line_map = Arc::new(
-                        self.line_map
-                            .slice_from(output_start),
-                    );
+                    let line_map = Arc::new(self.line_map.slice_from(output_start));
                     if let Ok(mut guard) = cache.write() {
                         guard.entry(canonical).or_insert(crate::IncludeExpansion {
                             text,
@@ -1328,11 +1325,8 @@ mod tests {
     }
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "trace_preproc_{}_{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("trace_preproc_{}_{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1418,7 +1412,11 @@ mod tests {
     fn frozen_cache_does_not_warn_on_guard_skip() {
         let dir = unique_tmp_dir("frozen_quiet");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("g.h"), "#ifndef G_H\n#define G_H\nint g(void);\n#endif\n").unwrap();
+        fs::write(
+            dir.join("g.h"),
+            "#ifndef G_H\n#define G_H\nint g(void);\n#endif\n",
+        )
+        .unwrap();
 
         let shared = Arc::new(RwLock::new(MacroTable::new()));
         {
