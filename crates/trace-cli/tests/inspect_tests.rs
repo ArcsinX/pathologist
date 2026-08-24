@@ -25,14 +25,19 @@ fn unique_db(name: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("trace_inspect_{name}_{}_{n}_{nanos}.db", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "trace_inspect_{name}_{}_{n}_{nanos}.db",
+        std::process::id()
+    ))
 }
 
 fn build_and_export(name: &str) -> PathBuf {
     let root = fixture(name);
     let opts = PreprocessOptions::new()
         .with_include(root.clone())
-        .with_include(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/include"));
+        .with_include(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/include"),
+        );
     let program = build_program(&root, &opts).expect("build program");
     let (pag, analysis) = analyze(&program);
     let out = unique_db(name);
@@ -90,10 +95,7 @@ fn function_line_ranges_exported() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(
-        rows,
-        vec![("helper".into(), 1, 3), ("caller".into(), 5, 7)]
-    );
+    assert_eq!(rows, vec![("helper".into(), 1, 3), ("caller".into(), 5, 7)]);
     let _ = std::fs::remove_file(db);
 }
 
@@ -108,11 +110,15 @@ fn callgraph_down_from_containing_line() {
 
     // A file-static callee must resolve through scope-aware edges.
     let helper_id: i64 = conn
-        .query_row("SELECT id FROM functions WHERE name = 'helper'", [], |r| r.get(0))
+        .query_row("SELECT id FROM functions WHERE name = 'helper'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     let g = call_graph(&conn, start.id, Direction::Down, 3).unwrap();
     assert!(
-        g.edges.iter().any(|e| e.to == helper_id && e.label == "direct"),
+        g.edges
+            .iter()
+            .any(|e| e.to == helper_id && e.label == "direct"),
         "{:?}",
         g.edges
     );
@@ -129,11 +135,17 @@ fn indirect_call_up_edges_are_labeled_indirect() {
     let db = build_and_export("indirect_call");
     let conn = open_db(&db).unwrap();
     let run_id: i64 = conn
-        .query_row("SELECT id FROM functions WHERE name = 'run'", [], |r| r.get(0))
+        .query_row("SELECT id FROM functions WHERE name = 'run'", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     // Down from run reaches target through the fn-pointer call.
     let down = call_graph(&conn, run_id, Direction::Down, 5).unwrap();
-    assert!(down.edges.iter().any(|e| e.label == "indirect"), "{:?}", down.edges);
+    assert!(
+        down.edges.iter().any(|e| e.label == "indirect"),
+        "{:?}",
+        down.edges
+    );
 
     // Up from defined target shows the caller with the same annotation.
     let target_id: i64 = conn
@@ -249,7 +261,11 @@ fn end_to_end_binary_inspect_commands() {
         ])
         .output()
         .expect("analyze runs");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // callgraph down from inside caller.
     let out = Command::new(bin)
@@ -268,7 +284,11 @@ fn end_to_end_binary_inspect_commands() {
         ])
         .output()
         .expect("callgraph runs");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("callgraph from caller"), "{stdout}");
     assert!(stdout.contains("-direct-> helper"), "{stdout}");
@@ -289,7 +309,11 @@ fn end_to_end_binary_inspect_commands() {
         ])
         .output()
         .expect("callgraph up runs");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("callers"), "{stdout}");
     assert!(stdout.contains("* helper"), "{stdout}");
@@ -310,7 +334,11 @@ fn end_to_end_binary_inspect_commands() {
         ])
         .output()
         .expect("dataflow runs");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("dataflow for v"), "{stdout}");
     assert!(

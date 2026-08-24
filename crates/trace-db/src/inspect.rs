@@ -173,20 +173,18 @@ fn load_call_adjacency(conn: &Connection, dir: Direction) -> Result<Adjacency> {
     })?;
     for r in rows {
         let (caller, callee, resolution, path, line) = r?;
-        let site = format!(
-            "{}:{}",
-            path.rsplit('/').next().unwrap_or(&path),
-            line
-        );
+        let site = format!("{}:{}", path.rsplit('/').next().unwrap_or(&path), line);
         match dir {
-            Direction::Down => adj
-                .entry(caller)
-                .or_default()
-                .push((callee, leak_resolution(&resolution), site)),
-            Direction::Up => adj
-                .entry(callee)
-                .or_default()
-                .push((caller, leak_resolution(&resolution), site)),
+            Direction::Down => {
+                adj.entry(caller)
+                    .or_default()
+                    .push((callee, leak_resolution(&resolution), site))
+            }
+            Direction::Up => {
+                adj.entry(callee)
+                    .or_default()
+                    .push((caller, leak_resolution(&resolution), site))
+            }
         }
     }
     Ok(adj)
@@ -200,6 +198,36 @@ fn leak_resolution(resolution: &str) -> &'static str {
         "external" => "external",
         _ => "call",
     }
+}
+
+/// True when `table` exists. Table names here are compile-time constants.
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |r| r.get(0),
+    )?;
+    Ok(n != 0)
+}
+
+/// True when `table` has a `column`. Table names are compile-time constants;
+/// the column name is bound as a parameter.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let sql = format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1");
+    let n: i64 = conn.query_row(&sql, [column], |r| r.get(0))?;
+    Ok(n != 0)
+}
+
+fn require_flow_tables(conn: &Connection) -> Result<()> {
+    for t in ["flow_nodes", "flow_edges"] {
+        if !table_exists(conn, t)? {
+            bail!(
+                "`{t}` missing: database predates flow-graph export; \
+                 re-run `trace analyze` with this binary"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Bounded BFS over the call graph from `root_fn_id`. Down follows caller →
@@ -233,8 +261,12 @@ pub fn call_graph(
         graph.nodes.insert(id, labels[&id].clone());
         graph.order.push((id, depth));
         if depth == max_depth {
-            if adj.contains_key(&id) {
-                graph.truncated = true;
+            // Truncated only if an actually-unvisited neighbor was cut off;
+            // neighbors already reached earlier in the BFS don't count.
+            if let Some(neighbors) = adj.get(&id) {
+                if neighbors.iter().any(|(to, _, _)| !visited.contains(to)) {
+                    graph.truncated = true;
+                }
             }
             continue;
         }
@@ -256,7 +288,9 @@ pub fn call_graph(
         }
     }
     // Collapse exact duplicates (same pair, same annotation).
-    graph.edges.dedup_by(|a, b| a.from == b.from && a.to == b.to && a.site == b.site);
+    graph
+        .edges
+        .dedup_by(|a, b| a.from == b.from && a.to == b.to && a.site == b.site);
     Ok(graph)
 }
 
@@ -295,6 +329,12 @@ pub fn find_symbols_at(
 ) -> Result<Vec<SymbolRef>> {
     if file_substring.is_empty() {
         bail!("file filter must not be empty");
+    }
+    if !column_exists(conn, "variables", "col")? {
+        bail!(
+            "`variables.col` missing: database predates declaration-column export; \
+             re-run `trace analyze` with this binary"
+        );
     }
     let mut stmt = conn.prepare(
         "SELECT v.id, v.name, v.kind, v.line, v.col, p.path, f.name \
@@ -339,8 +379,8 @@ pub fn find_symbols_at(
 }
 
 /// Rank a declaration against the queried position; lower wins.
-/// 0 = on this line inside the identifier, 1..3 = same line by column
-/// distance bucket, 10/11/12 = one/two lines away.
+/// 0 = on this line inside the identifier, 1..5 = same line by column
+/// distance bucket (25-column bands), 10/11/12 = one/two lines away.
 fn rank_symbol(line: i64, col: i64, vline: i64, vcol: i64, name_len: i64) -> u32 {
     let line_dist = (vline - line).abs();
     if line_dist == 0 {
@@ -364,6 +404,7 @@ pub fn dataflow_graph(
     dir: Direction,
     max_depth: u32,
 ) -> Result<QueryGraph> {
+    require_flow_tables(conn)?;
     let var_ids: Vec<i64> = symbols.iter().map(|s| s.var_id).collect();
     let mut starts: Vec<i64> = Vec::new();
     for vid in &var_ids {
@@ -374,22 +415,14 @@ pub fn dataflow_graph(
             starts.push(r?);
         }
     }
-    if starts.is_empty() {
-        bail!(
-            "no value-flow node for symbol(s): {}; \
-             the database may predate flow-graph export",
-            symbols
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
     // Parameter twins: the same C parameter is lowered once per TU that sees
     // its declaration, so arg-flow wiring may attach to the header-prototype
     // copy while the user queried the definition-site copy (or vice versa).
-    // If nothing flows through the queried twins, widen to same-name params
-    // of same-name enclosing functions.
+    // After merge all copies share one canonical function record, so twins
+    // are same-name params under the *same* fn_id — widening must not reach
+    // unrelated same-name functions (e.g. file-`static`s in other files).
+    // Runs before the empty-start bail: a queried copy may lack flow nodes
+    // entirely while its twin carries the graph.
     let touches_any = starts.iter().any(|&n| {
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM flow_edges WHERE src_node = ?1 OR dst_node = ?1)",
@@ -403,9 +436,8 @@ pub fn dataflow_graph(
         for vid in &var_ids {
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT v2.id FROM variables v1 \
-                 JOIN functions f1 ON f1.id = v1.fn_id \
-                 JOIN variables v2 ON v2.name = v1.name AND v2.kind = 'param' \
-                 JOIN functions f2 ON f2.id = v2.fn_id AND f2.name = f1.name \
+                 JOIN variables v2 \
+                   ON v2.fn_id = v1.fn_id AND v2.name = v1.name AND v2.kind = 'param' \
                  WHERE v1.id = ?1 AND v2.id != v1.id",
             )?;
             let rows = stmt.query_map([vid], |row| row.get::<_, i64>(0))?;
@@ -422,15 +454,30 @@ pub fn dataflow_graph(
             }
         }
     }
+    if starts.is_empty() {
+        bail!(
+            "no value-flow node for symbol(s): {}; \
+             the database may predate flow-graph export",
+            symbols
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // Load adjacency (both directions of every edge once).
     let mut fwd: Adjacency = FxHashMap::default();
     let mut rev: Adjacency = FxHashMap::default();
     {
-        let mut stmt =
-            conn.prepare("SELECT src_node, dst_node, kind FROM flow_edges")?;
-        let rows =
-            stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))?;
+        let mut stmt = conn.prepare("SELECT src_node, dst_node, kind FROM flow_edges")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
         for r in rows {
             let (src, dst, kind) = r?;
             let kind_static: &'static str = match kind.as_str() {
@@ -443,16 +490,19 @@ pub fn dataflow_graph(
                 "call_arg" => "call_arg",
                 _ => "flow",
             };
-            fwd.entry(src).or_default().push((dst, kind_static, String::new()));
-            rev.entry(dst).or_default().push((src, kind_static, String::new()));
+            fwd.entry(src)
+                .or_default()
+                .push((dst, kind_static, String::new()));
+            rev.entry(dst)
+                .or_default()
+                .push((src, kind_static, String::new()));
         }
     }
 
     // Node labels.
     let mut labels: FxHashMap<i64, GraphNode> = FxHashMap::default();
     {
-        let mut stmt =
-            conn.prepare("SELECT id, kind, label, detail FROM flow_nodes")?;
+        let mut stmt = conn.prepare("SELECT id, kind, label, detail FROM flow_nodes")?;
         let rows = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
             let kind: String = row.get(1)?;
@@ -515,8 +565,12 @@ pub fn dataflow_graph(
         }
         graph.order.push((id, depth));
         if depth == max_depth {
-            if adj.contains_key(&id) {
-                graph.truncated = true;
+            // Truncated only if an actually-unvisited neighbor was cut off;
+            // neighbors already reached earlier in the BFS don't count.
+            if let Some(neighbors) = adj.get(&id) {
+                if neighbors.iter().any(|(to, _, _)| !visited.contains(to)) {
+                    graph.truncated = true;
+                }
             }
             continue;
         }
@@ -545,11 +599,7 @@ pub fn dataflow_graph(
 
 /// Convenience wrapper used by tests and the CLI: resolve position → best
 /// function, with a helpful error when nothing matches.
-pub fn require_function_at(
-    conn: &Connection,
-    file: &str,
-    line: i64,
-) -> Result<FunctionRef> {
+pub fn require_function_at(conn: &Connection, file: &str, line: i64) -> Result<FunctionRef> {
     let mut cands = find_functions_at(conn, file, line)?;
     if cands.is_empty() {
         let nearest = nearest_functions(conn, file, line, 3)?;
@@ -615,8 +665,7 @@ mod tests {
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = OFF;")
-            .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         conn.execute_batch(SCHEMA_V1).unwrap();
         // files: 1 = /proj/main.c
         conn.execute(
@@ -704,7 +753,10 @@ mod tests {
         assert!(hits[0].is_defined);
 
         // Boundary lines belong to the function.
-        assert_eq!(find_functions_at(&conn, "main.c", 20).unwrap()[0].name, "main");
+        assert_eq!(
+            find_functions_at(&conn, "main.c", 20).unwrap()[0].name,
+            "main"
+        );
         assert!(find_functions_at(&conn, "main.c", 21).unwrap().is_empty());
         assert!(find_functions_at(&conn, "main.c", 9).unwrap().is_empty());
     }
@@ -721,7 +773,11 @@ mod tests {
     fn call_graph_down_respects_depth_and_flags_truncation() {
         let conn = test_conn();
         let g = call_graph(&conn, 10, Direction::Down, 1).unwrap();
-        let names: Vec<&str> = g.order.iter().map(|&(id, _)| g.nodes[&id].label.as_str()).collect();
+        let names: Vec<&str> = g
+            .order
+            .iter()
+            .map(|&(id, _)| g.nodes[&id].label.as_str())
+            .collect();
         assert_eq!(names, ["main", "helper"]);
         assert!(g.truncated, "helper has an unvisited external edge");
 
@@ -731,7 +787,10 @@ mod tests {
         // Edge annotations carry resolution + call site.
         let e = format!("{:?}", g.edges);
         assert!(
-            g.edges.iter().any(|e| e.from == 10 && e.to == 11 && e.label == "direct" && e.site == "main.c:15"),
+            g.edges.iter().any(|e| e.from == 10
+                && e.to == 11
+                && e.label == "direct"
+                && e.site == "main.c:15"),
             "edges: {e}"
         );
     }
@@ -741,11 +800,19 @@ mod tests {
         let conn = test_conn();
         // Reverse reachability: helper <- main.
         let g = call_graph(&conn, 11, Direction::Up, 3).unwrap();
-        let names: Vec<&str> = g.order.iter().map(|&(id, _)| g.nodes[&id].label.as_str()).collect();
+        let names: Vec<&str> = g
+            .order
+            .iter()
+            .map(|&(id, _)| g.nodes[&id].label.as_str())
+            .collect();
         assert_eq!(names, ["helper", "main"]);
         // proto <- helper <- main (a full "how do we reach proto" path).
         let g = call_graph(&conn, 12, Direction::Up, 3).unwrap();
-        let names: Vec<&str> = g.order.iter().map(|&(id, _)| g.nodes[&id].label.as_str()).collect();
+        let names: Vec<&str> = g
+            .order
+            .iter()
+            .map(|&(id, _)| g.nodes[&id].label.as_str())
+            .collect();
         assert_eq!(names, ["proto", "helper", "main"]);
     }
 
@@ -794,7 +861,10 @@ mod tests {
             vec![(300, 0), (301, 1), (302, 2)],
             "down follows copy then store"
         );
-        assert!(down.edges.iter().any(|e| e.from == 301 && e.to == 302 && e.label == "store"));
+        assert!(down
+            .edges
+            .iter()
+            .any(|e| e.from == 301 && e.to == 302 && e.label == "store"));
 
         let up = dataflow_graph(&conn, &syms, Direction::Up, 4).unwrap();
         // The synthetic graph is cyclic (g→x→cell→g), so reverse traversal
@@ -830,6 +900,142 @@ mod tests {
         };
         let err = dataflow_graph(&conn, &[orphan], Direction::Down, 3).unwrap_err();
         assert!(err.to_string().contains("no value-flow node"));
+    }
+
+    #[test]
+    fn truncated_only_when_boundary_neighbors_unvisited() {
+        let conn = test_conn();
+        // Pure two-node cycle: at the depth limit every neighbor is already
+        // visited, so nothing was actually cut off.
+        for (id, name, ls) in [(13, "c1", 40), (14, "c2", 42)] {
+            conn.execute(
+                "INSERT INTO functions (id, name, file_id, line_start, line_end, linkage, signature, is_defined) \
+                 VALUES (?1, ?2, 1, ?3, ?4, 'external', 'fn', 1)",
+                rusqlite::params![id, name, ls, ls + 1],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, callee_text, is_direct) VALUES (103, 13, 1, 41, 5, 'c2', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO call_sites (id, caller_fn_id, file_id, line, col, callee_text, is_direct) VALUES (104, 14, 1, 43, 5, 'c1', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO call_edges (id, call_site_id, callee_fn_id, resolution) VALUES (203, 103, 14, 'direct')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO call_edges (id, call_site_id, callee_fn_id, resolution) VALUES (204, 104, 13, 'direct')",
+            [],
+        )
+        .unwrap();
+
+        let g = call_graph(&conn, 13, Direction::Down, 1).unwrap();
+        assert_eq!(g.order.len(), 2);
+        assert!(
+            !g.truncated,
+            "cycle back-edge to a visited node is not truncation"
+        );
+
+        // Cutting off before an unvisited node still reports truncation.
+        let g = call_graph(&conn, 13, Direction::Down, 0).unwrap();
+        assert!(g.truncated);
+    }
+
+    #[test]
+    fn dataflow_widens_to_same_function_param_twins_only() {
+        let conn = test_conn();
+        // Twin A of param `p` in main (fn 10): has flow wiring.
+        conn.execute(
+            "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line, col) \
+             VALUES (23, 'p', 'param', 10, 0, 1, 4, 18)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO flow_nodes (id, kind, label, detail, var_id, fn_id) VALUES (304, 'var', 'p', '', 23, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO flow_edges (id, src_node, dst_node, kind) VALUES (504, 304, 300, 'copy')",
+            [],
+        )
+        .unwrap();
+        // Twin B: same function, no flow nodes — the queried copy.
+        conn.execute(
+            "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line, col) \
+             VALUES (24, 'p', 'param', 10, 0, 1, 13, 7)",
+            [],
+        )
+        .unwrap();
+        // Decoy: same-name param in a DIFFERENT function record — widening
+        // must not reach it even though it has flow wiring.
+        conn.execute(
+            "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line, col) \
+             VALUES (25, 'p', 'param', 11, 0, 1, 50, 3)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO flow_nodes (id, kind, label, detail, var_id, fn_id) VALUES (305, 'var', 'p', '', 25, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO flow_edges (id, src_node, dst_node, kind) VALUES (505, 305, 300, 'copy')",
+            [],
+        )
+        .unwrap();
+
+        let syms = require_symbols_at(&conn, "main.c", 13, 7).unwrap();
+        assert_eq!(syms[0].var_id, 24, "exact position selects twin B");
+
+        let g = dataflow_graph(&conn, std::slice::from_ref(&syms[0]), Direction::Down, 4).unwrap();
+        let ids: Vec<i64> = g.order.iter().map(|&(id, _)| id).collect();
+        assert!(ids.contains(&304), "same-function twin widened: {ids:?}");
+        assert!(ids.contains(&300), "twin's edge traversed into g");
+        assert!(
+            !ids.contains(&305),
+            "same-name param of another function must stay out: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn stale_schema_errors_are_actionable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE variables ( \
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, \
+                fn_id INTEGER, type_id INTEGER NOT NULL, file_id INTEGER NOT NULL, \
+                line INTEGER NOT NULL );",
+        )
+        .unwrap();
+
+        let err = find_symbols_at(&conn, "main.c", 12, 9).unwrap_err();
+        assert!(err.to_string().contains("variables.col"), "{err}");
+        assert!(err.to_string().contains("re-run"), "{err}");
+
+        let orphan = SymbolRef {
+            var_id: 999,
+            name: "orphan".into(),
+            kind: "local".into(),
+            fn_name: None,
+            path: "/proj/main.c".into(),
+            line: 50,
+            col: 1,
+        };
+        let err = dataflow_graph(&conn, &[orphan], Direction::Down, 3).unwrap_err();
+        assert!(
+            err.to_string().contains("predates flow-graph export"),
+            "{err}"
+        );
     }
 
     #[test]

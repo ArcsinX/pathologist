@@ -218,8 +218,9 @@ fn export_flow_graph(
     let mut nodes = conn.prepare_cached(
         "INSERT INTO flow_nodes (id, kind, label, detail, var_id, fn_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
-    let mut edges =
-        conn.prepare_cached("INSERT INTO flow_edges (id, src_node, dst_node, kind) VALUES (?1, ?2, ?3, ?4)")?;
+    let mut edges = conn.prepare_cached(
+        "INSERT INTO flow_edges (id, src_node, dst_node, kind) VALUES (?1, ?2, ?3, ?4)",
+    )?;
 
     for node in &pag.nodes {
         let (kind, label, detail, var_id, fn_id) = match node.kind {
@@ -271,7 +272,13 @@ fn export_flow_graph(
                     None,
                     None,
                 ),
-                None => ("call_target", format!("cs{}", cs.0), String::new(), None, None),
+                None => (
+                    "call_target",
+                    format!("cs{}", cs.0),
+                    String::new(),
+                    None,
+                    None,
+                ),
             },
         };
         nodes.execute(params![
@@ -310,7 +317,10 @@ fn export_flow_graph(
     // params), so traversal sees each hop once.
     let mut wired_pairs: FxHashSet<(u32, u32)> = FxHashSet::default();
     for c in &pag.constraints {
-        if matches!(c.kind, ConstraintKind::Copy | ConstraintKind::Load | ConstraintKind::Gep) {
+        if matches!(
+            c.kind,
+            ConstraintKind::Copy | ConstraintKind::Load | ConstraintKind::Gep
+        ) {
             wired_pairs.insert((c.src.0, c.dst.0));
         }
     }

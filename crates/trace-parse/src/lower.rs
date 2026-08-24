@@ -269,7 +269,7 @@ fn finalize_extern_callees(program: &mut Program) {
             continue;
         }
         let fid = program.symbols.alloc_fn_id();
-        program.symbols.functions.push(trace_ir::Function {
+        program.symbols.push_synthetic_function(trace_ir::Function {
             id: fid,
             name: name.clone(),
             linkage: trace_ir::Linkage::External,
@@ -1036,7 +1036,8 @@ fn reassign_fn_id(program: &mut Program, from: FnId, to: FnId) {
             cs.caller = to;
         }
     }
-    if let Some(func) = program.symbols.functions.iter_mut().find(|f| f.id == to) {
+    if let Some(idx) = program.symbols.function_index(to) {
+        let func = &mut program.symbols.functions[idx];
         func.params = program
             .symbols
             .variables

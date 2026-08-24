@@ -44,6 +44,8 @@ pub struct Function {
     /// Last line of the definition body in original-file coordinates.
     /// Equal to `span.line` for prototypes, synthesized externals, and
     /// bodies whose end could not be mapped back (e.g. cross-header ends).
+    /// On merge, overwritten together with `file`/`span` so the range always
+    /// describes the surviving definition row in its own file's coordinates.
     pub end_line: u32,
     pub file: FileId,
     pub is_defined: bool,
@@ -90,6 +92,9 @@ pub struct SymbolTable {
     /// cross-TU deduplication collapsed the per-TU copies.
     headers_of: FxHashMap<FileId, std::collections::BTreeSet<FileId>>,
     file_by_path: FxHashMap<PathBuf, FileId>,
+    /// `FnId -> slot in functions`. Ids are not dense (merged duplicates and
+    /// superseded rows leave gaps), so lookups need this index to stay O(1).
+    fn_slots: FxHashMap<FnId, u32>,
     next_fn: u32,
     next_var: u32,
     next_call: u32,
@@ -135,12 +140,12 @@ impl SymbolTable {
     pub fn add_function(&mut self, func: Function) -> FnId {
         if func.linkage == Linkage::External {
             if let Some(existing_id) = self.fn_by_name.get(&func.name).copied() {
-                if let Some(existing) = self.functions.iter_mut().find(|f| f.id == existing_id) {
+                if let Some(existing) = self.function_mut(existing_id) {
                     if func.is_defined {
                         existing.is_defined = true;
                         existing.file = func.file;
                         existing.span = func.span;
-                        existing.end_line = existing.end_line.max(func.end_line);
+                        existing.end_line = func.end_line;
                         if !func.params.is_empty() {
                             existing.params = func.params.clone();
                         }
@@ -162,9 +167,35 @@ impl SymbolTable {
                 .or_default()
                 .insert(func.name.clone(), func.id);
         }
+        self.push_indexed(func)
+    }
+
+    /// Push a synthesized `Function` (e.g. extern-callee stubs) without
+    /// registering it in the name/scope resolution maps, so it cannot shadow
+    /// real definitions. Only the id index is maintained.
+    pub fn push_synthetic_function(&mut self, func: Function) -> FnId {
+        debug_assert!(
+            !self.fn_by_name.contains_key(&func.name),
+            "synthetic function must not shadow a registered name"
+        );
+        self.push_indexed(func)
+    }
+
+    fn push_indexed(&mut self, func: Function) -> FnId {
         let id = func.id;
+        self.fn_slots.insert(id, self.functions.len() as u32);
         self.functions.push(func);
         id
+    }
+
+    fn function_mut(&mut self, id: FnId) -> Option<&mut Function> {
+        let slot = *self.fn_slots.get(&id)?;
+        self.functions.get_mut(slot as usize)
+    }
+
+    /// Slot of `id` in [`SymbolTable::functions`], O(1).
+    pub fn function_index(&self, id: FnId) -> Option<usize> {
+        self.fn_slots.get(&id).map(|&s| s as usize)
     }
 
     pub fn add_variable(&mut self, var: Variable) -> VarId {
@@ -276,7 +307,8 @@ impl SymbolTable {
     }
 
     pub fn function_by_id(&self, id: FnId) -> Option<&Function> {
-        self.functions.iter().find(|f| f.id == id)
+        let slot = *self.fn_slots.get(&id)?;
+        self.functions.get(slot as usize).filter(|f| f.id == id)
     }
 
     pub fn function(&self, id: FnId) -> &Function {

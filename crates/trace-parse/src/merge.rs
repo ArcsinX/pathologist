@@ -92,14 +92,8 @@ pub fn merge_unit_index(program: &mut Program, unit: UnitIndex) {
                     .symbols
                     .fn_by_name
                     .get(&f.name)
-                    .and_then(|&eid| {
-                        program
-                            .symbols
-                            .functions
-                            .iter()
-                            .find(|x| x.id == eid)
-                            .map(|x| x.params.is_empty())
-                    })
+                    .and_then(|&eid| program.symbols.function_index(eid))
+                    .map(|idx| program.symbols.functions[idx].params.is_empty())
                     .unwrap_or(false));
         let merged = program.symbols.add_function(f);
         if merged == new_id {
@@ -135,15 +129,8 @@ pub fn merge_unit_index(program: &mut Program, unit: UnitIndex) {
         var_map.insert(old, new_id);
     }
 
-    let fn_index: HashMap<FnId, usize> = program
-        .symbols
-        .functions
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (f.id, i))
-        .collect();
     for merged_id in &remap_locals {
-        if let Some(&idx) = fn_index.get(merged_id) {
+        if let Some(idx) = program.symbols.function_index(*merged_id) {
             let func = &mut program.symbols.functions[idx];
             func.locals = func
                 .locals
@@ -153,7 +140,7 @@ pub fn merge_unit_index(program: &mut Program, unit: UnitIndex) {
         }
     }
     for merged_id in &remap_params {
-        if let Some(&idx) = fn_index.get(merged_id) {
+        if let Some(idx) = program.symbols.function_index(*merged_id) {
             let func = &mut program.symbols.functions[idx];
             func.params = func
                 .params

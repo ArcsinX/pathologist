@@ -324,8 +324,7 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
                 anyhow::bail!("depth must be >= 1");
             }
             let start = trace_db::require_function_at(&conn, &file, line)?;
-            let graph =
-                trace_db::call_graph(&conn, start.id, dir, depth)?;
+            let graph = trace_db::call_graph(&conn, start.id, dir, depth)?;
             let dir_word = match dir {
                 trace_db::Direction::Down => "callees",
                 trace_db::Direction::Up => "callers",
@@ -361,12 +360,15 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             }
             let cands = trace_db::require_symbols_at(&conn, &file, line, col)?;
             let best = &cands[0];
-            let exact = best.line == line && col >= best.col && col <= best.col + best.name.len() as i64;
+            let exact =
+                best.line == line && col >= best.col && col <= best.col + best.name.len() as i64;
             if !exact {
-                eprintln!("note: no declaration exactly at {file}:{line}:{col}; using {}", best);
+                eprintln!(
+                    "note: no declaration exactly at {file}:{line}:{col}; using {}",
+                    best
+                );
             } else if cands.len() > 1 {
-                let mut others: Vec<String> =
-                    cands[1..].iter().map(|s| s.name.clone()).collect();
+                let mut others: Vec<String> = cands[1..].iter().map(|s| s.name.clone()).collect();
                 others.dedup();
                 let shown = if others.len() > 5 {
                     format!("{} … (+{} more)", others[..5].join(", "), others.len() - 5)
@@ -455,15 +457,7 @@ fn print_tree(graph: &trace_db::QueryGraph, fmt: &mut dyn FnMut(i64, &mut String
         seen.insert(id);
         if let Some(kids) = children.get(&id) {
             for kid in kids.clone() {
-                walk(
-                    kid.to,
-                    level + 1,
-                    Some(kid),
-                    children,
-                    seen,
-                    fmt,
-                    buf,
-                );
+                walk(kid.to, level + 1, Some(kid), children, seen, fmt, buf);
             }
         }
     }

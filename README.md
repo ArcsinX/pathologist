@@ -181,7 +181,8 @@ callee formal). Function-pointer values appear as `fn:<name>` nodes.
 
 The same C parameter may exist as several IR variables (one per TU that sees
 its declaration). If nothing flows through the queried copy, the traversal
-automatically widens to same-name parameters of same-name functions.
+automatically widens to same-name parameters of the same function record
+(after merge all copies share one function entry).
 
 **Examples**
 
