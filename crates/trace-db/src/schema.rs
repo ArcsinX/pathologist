@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS variables (
     fn_id INTEGER REFERENCES functions(id),
     type_id INTEGER NOT NULL REFERENCES types(id),
     file_id INTEGER NOT NULL REFERENCES files(id),
-    line INTEGER NOT NULL
+    line INTEGER NOT NULL,
+    col INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS call_sites (
@@ -94,4 +95,28 @@ CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_fn_id);
 CREATE INDEX IF NOT EXISTS idx_call_edges_callsite ON call_edges(call_site_id);
 CREATE INDEX IF NOT EXISTS idx_arg_flow_callsite ON arg_flow_edges(call_site_id);
 CREATE INDEX IF NOT EXISTS idx_functions_name ON functions(name);
+
+-- Value-flow graph (PAG) for `inspect dataflow`. Nodes mirror PAG nodes;
+-- edges are the post-solve constraint set, including parameter copies wired
+-- dynamically during solving (so the table is the interprocedural
+-- value-flow view, not just the lowering-time constraints).
+CREATE TABLE IF NOT EXISTS flow_nodes (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    label TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    var_id INTEGER REFERENCES variables(id),
+    fn_id INTEGER REFERENCES functions(id)
+);
+
+CREATE TABLE IF NOT EXISTS flow_edges (
+    id INTEGER PRIMARY KEY,
+    src_node INTEGER NOT NULL REFERENCES flow_nodes(id),
+    dst_node INTEGER NOT NULL REFERENCES flow_nodes(id),
+    kind TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_edges_src ON flow_edges(src_node);
+CREATE INDEX IF NOT EXISTS idx_flow_edges_dst ON flow_edges(dst_node);
+CREATE INDEX IF NOT EXISTS idx_flow_nodes_var ON flow_nodes(var_id);
 "#;

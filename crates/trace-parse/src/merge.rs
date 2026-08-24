@@ -53,6 +53,17 @@ pub fn merge_unit_index(program: &mut Program, unit: UnitIndex) {
     };
     let mut fn_map: HashMap<FnId, FnId> = HashMap::new();
     let mut dropped_fns: HashSet<FnId> = HashSet::new();
+    // Functions whose params/locals still carry unit-local VarIds and therefore
+    // need remapping once `var_map` is complete:
+    // - freshly inserted rows (their own params/locals),
+    // - canonical rows whose params add_function just backfilled with this
+    //   unit's definition params.
+    // Redirect targets that were NOT modified must stay untouched: remapping
+    // them against this unit's var_map would silently drop their existing
+    // global-id params (observed as missing arg-flow for every callee that a
+    // later TU re-declares).
+    let mut remap_params: HashSet<FnId> = HashSet::new();
+    let mut remap_locals: HashSet<FnId> = HashSet::new();
     for func in unit.functions {
         let old_id = func.id;
         let span_file = map_file(func.span.file);
@@ -70,7 +81,35 @@ pub fn merge_unit_index(program: &mut Program, unit: UnitIndex) {
         f.span.file = span_file;
         f.file = span_file;
         f.return_type = remap_type(f.return_type, &type_map);
+        let carries_params = !f.params.is_empty();
+        let is_definition = f.is_defined;
+        // Will add_function backfill these unit-local params onto an existing
+        // canonical entry? True when the incoming row defines the body, or
+        // when it carries params and the canonical has none so far.
+        let backfills_params = carries_params
+            && (is_definition
+                || program
+                    .symbols
+                    .fn_by_name
+                    .get(&f.name)
+                    .and_then(|&eid| {
+                        program
+                            .symbols
+                            .functions
+                            .iter()
+                            .find(|x| x.id == eid)
+                            .map(|x| x.params.is_empty())
+                    })
+                    .unwrap_or(false));
         let merged = program.symbols.add_function(f);
+        if merged == new_id {
+            remap_params.insert(merged);
+            remap_locals.insert(merged);
+        } else if backfills_params {
+            // add_function copied these unit-local params onto the canonical
+            // entry; remap them below.
+            remap_params.insert(merged);
+        }
         fn_map.insert(old_id, merged);
         program.dedup.fn_keys.insert(key, merged);
     }
@@ -103,21 +142,25 @@ pub fn merge_unit_index(program: &mut Program, unit: UnitIndex) {
         .enumerate()
         .map(|(i, f)| (f.id, i))
         .collect();
-    for &merged_id in fn_map.values() {
-        let Some(&idx) = fn_index.get(&merged_id) else {
-            continue;
-        };
-        let func = &mut program.symbols.functions[idx];
-        func.params = func
-            .params
-            .iter()
-            .filter_map(|v| var_map.get(v).copied())
-            .collect();
-        func.locals = func
-            .locals
-            .iter()
-            .filter_map(|v| var_map.get(v).copied())
-            .collect();
+    for merged_id in &remap_locals {
+        if let Some(&idx) = fn_index.get(merged_id) {
+            let func = &mut program.symbols.functions[idx];
+            func.locals = func
+                .locals
+                .iter()
+                .filter_map(|v| var_map.get(v).copied())
+                .collect();
+        }
+    }
+    for merged_id in &remap_params {
+        if let Some(&idx) = fn_index.get(merged_id) {
+            let func = &mut program.symbols.functions[idx];
+            func.params = func
+                .params
+                .iter()
+                .filter_map(|v| var_map.get(v).copied())
+                .collect();
+        }
     }
 
     let mut call_map: HashMap<CallSiteId, CallSiteId> = HashMap::new();

@@ -277,6 +277,7 @@ fn finalize_extern_callees(program: &mut Program) {
             params: Vec::new(),
             locals: Vec::new(),
             span: trace_ir::Span { file, line, col: 0 },
+            end_line: line,
             file,
             is_defined: false,
         });
@@ -638,6 +639,7 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
     let is_static = declaration_is_static(source, node);
 
     let span = node_span(program, ctx, node);
+    let end_line = node_end_line(program, ctx, node, span);
     let fn_id = program.symbols.add_function(Function {
         id: provisional_id,
         name: name.clone(),
@@ -650,6 +652,7 @@ fn lower_function(program: &mut Program, ctx: &mut LowerContext, source: &str, n
         params: params.clone(),
         locals: Vec::new(),
         span,
+        end_line,
         file: ctx.current_file,
         is_defined: true,
     });
@@ -1011,6 +1014,8 @@ fn lower_function_decl(
         params,
         locals: Vec::new(),
         span,
+        // Prototypes have no body: the range is the declaration itself.
+        end_line: span.line,
         file: ctx.current_file,
         is_defined: false,
     });
@@ -2386,4 +2391,37 @@ fn node_span(program: &mut Program, ctx: &LowerContext, node: Node) -> Span {
     let line = node.start_position().row as u32 + 1;
     let col = node.start_position().column as u32 + 1;
     Span::new(ctx.current_file, line, col)
+}
+
+/// Original-file end line of `node`, for range queries like "which function
+/// contains this line". The end maps back through the LineMap only when the
+/// last byte originates from the same file as `span.file` — a body that ends
+/// inside a different `#include` origin has no meaningful single-file range,
+/// and falls back to the start line. Falls back to raw tree-sitter
+/// positions for unpreprocessed sources (no LineMap).
+fn node_end_line(program: &Program, ctx: &LowerContext, node: Node, span: Span) -> u32 {
+    match ctx.line_map.as_ref() {
+        None => node.end_position().row as u32 + 1,
+        Some(line_map) => {
+            let entry = line_map.lookup(node.end_byte().saturating_sub(1));
+            let same_origin = entry
+                .map(|entry| {
+                    let origin = line_map.path_of(entry);
+                    let fid = if origin != ctx.primary_path {
+                        program.symbols.file_by_path(origin)
+                    } else {
+                        Some(ctx.current_file)
+                    };
+                    fid == Some(span.file)
+                })
+                .unwrap_or(false);
+            if same_origin {
+                entry.map(|e| e.line).unwrap_or(span.line)
+            } else {
+                // End originates in another file (or is unmappable): a body
+                // has no meaningful single-file range, so report the start.
+                span.line
+            }
+        }
+    }
 }

@@ -4,7 +4,7 @@ use rusqlite::{params, Connection};
 use rustc_hash::FxHashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use trace_analysis::{AnalysisResult, Pag};
+use trace_analysis::{AnalysisResult, ConstraintKind, LocKind, Pag, PagNodeKind};
 use trace_ir::{Linkage, Program, StorageClass, TypeDesc, VarId, TRACE_VERSION};
 
 pub struct ExportOptions {
@@ -27,7 +27,7 @@ impl ExportOptions {
 
 pub fn export_to_sqlite(
     program: &Program,
-    pag: Option<&Pag>,
+    pag: &Pag,
     analysis: &AnalysisResult,
     opts: &ExportOptions,
 ) -> Result<()> {
@@ -71,15 +71,13 @@ pub fn export_to_sqlite(
         if opts.full_detail {
             export_types(&conn, program)?;
             export_variables(&conn, program)?;
-            if let Some(pag) = pag {
-                export_locations(&conn, pag)?;
-            }
+            export_locations(&conn, pag)?;
         } else {
-            export_arg_flow_vars(&conn, program, analysis)?;
+            export_flow_and_arg_flow_vars(&conn, program, pag, analysis)?;
         }
         export_arg_flow(&conn, analysis)?;
+        export_flow_graph(&conn, program, pag, analysis)?;
         if opts.include_points_to {
-            let pag = pag.context("points-to export requires PAG")?;
             export_points_to(&conn, pag, analysis)?;
         }
         export_diagnostics(&conn, program)?;
@@ -158,7 +156,7 @@ fn type_name(desc: &TypeDesc) -> String {
 
 fn export_variables(conn: &Connection, program: &Program) -> Result<()> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line, col) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for var in &program.symbols.variables {
         export_one_variable(&mut stmt, var)?;
@@ -166,14 +164,12 @@ fn export_variables(conn: &Connection, program: &Program) -> Result<()> {
     Ok(())
 }
 
-fn export_arg_flow_vars(
+fn export_flow_and_arg_flow_vars(
     conn: &Connection,
     program: &Program,
+    pag: &Pag,
     analysis: &AnalysisResult,
 ) -> Result<()> {
-    if analysis.arg_flow_edges.is_empty() {
-        return Ok(());
-    }
     let mut needed: FxHashSet<VarId> = FxHashSet::default();
     for edge in &analysis.arg_flow_edges {
         if let Some(v) = edge.actual_var {
@@ -181,13 +177,171 @@ fn export_arg_flow_vars(
         }
         needed.insert(edge.formal);
     }
+    // The flow graph must be self-contained for inspect queries: every
+    // variable with a PAG node is exported, not just arg-flow participants.
+    for node in &pag.nodes {
+        if let PagNodeKind::Var(v) = node.kind {
+            needed.insert(v);
+        }
+    }
+    for loc in &pag.locations {
+        if let Some(v) = loc.var {
+            needed.insert(v);
+        }
+    }
+    if needed.is_empty() {
+        return Ok(());
+    }
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO variables (id, name, kind, fn_id, type_id, file_id, line, col) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for var in &program.symbols.variables {
         if needed.contains(&var.id) {
             export_one_variable(&mut stmt, var)?;
         }
+    }
+    Ok(())
+}
+
+/// Export the value-flow graph derived from the post-solve PAG. Edges are
+/// the constraint set including parameter copies wired dynamically during
+/// solving; implicit `points_to` edges connect each global/static var node
+/// to its storage location so traversal crosses memory cells. Interprocedural
+/// argument flow is added as `call_arg` edges (covering parameters the solver
+/// did not wire as persistent copies, e.g. scalar buffer pointers).
+fn export_flow_graph(
+    conn: &Connection,
+    program: &Program,
+    pag: &Pag,
+    analysis: &AnalysisResult,
+) -> Result<()> {
+    let mut nodes = conn.prepare_cached(
+        "INSERT INTO flow_nodes (id, kind, label, detail, var_id, fn_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    let mut edges =
+        conn.prepare_cached("INSERT INTO flow_edges (id, src_node, dst_node, kind) VALUES (?1, ?2, ?3, ?4)")?;
+
+    for node in &pag.nodes {
+        let (kind, label, detail, var_id, fn_id) = match node.kind {
+            PagNodeKind::Var(v) => match program.symbols.variable_by_id(v) {
+                Some(var) => {
+                    let storage = match var.storage {
+                        StorageClass::Global => "global",
+                        StorageClass::FileStatic => "file_static",
+                        StorageClass::FnStatic => "fn_static",
+                        StorageClass::Param => "param",
+                        StorageClass::Local => "local",
+                    };
+                    let mut detail = format!("{storage} @{}", var.span.line);
+                    if let Some(f) = var.fn_id {
+                        detail.push_str(&format!(" in {}", program.symbols.function(f).name));
+                    }
+                    ("var", var.name.clone(), detail, Some(v), var.fn_id)
+                }
+                None => ("var", format!("var{}", v.0), String::new(), Some(v), None),
+            },
+            PagNodeKind::Loc(loc_id) => {
+                let loc = &pag.locations[loc_id.0 as usize];
+                let kind_str = match loc.kind {
+                    LocKind::Global => "global",
+                    LocKind::FileStatic => "file_static",
+                    LocKind::FnStatic => "fn_static",
+                    LocKind::Local => "local",
+                    LocKind::Heap => "heap",
+                    LocKind::Field => "field",
+                    LocKind::FieldSummary => "field_summary",
+                    LocKind::ArraySummary => "array_summary",
+                    LocKind::Function => "function",
+                };
+                let label = match (loc.kind, loc.var) {
+                    (LocKind::Function, _) => format!("fn:{}", loc.desc),
+                    (_, Some(v)) => match program.symbols.variable_by_id(v) {
+                        Some(var) => format!("{} of {}", loc.desc, var.name),
+                        None => loc.desc.clone(),
+                    },
+                    _ => loc.desc.clone(),
+                };
+                ("loc", label, kind_str.to_string(), loc.var, loc.fn_id)
+            }
+            PagNodeKind::CallTarget(cs) => match program.symbols.call_site_by_id(cs) {
+                Some(site) => (
+                    "call_target",
+                    site.callee_name.clone(),
+                    format!("call @{}", site.span.line),
+                    None,
+                    None,
+                ),
+                None => ("call_target", format!("cs{}", cs.0), String::new(), None, None),
+            },
+        };
+        nodes.execute(params![
+            node.id.0,
+            kind,
+            label,
+            detail,
+            var_id.map(|v| v.0),
+            fn_id.map(|f| f.0)
+        ])?;
+    }
+
+    let mut edge_rows: Vec<(u32, u32, &'static str)> = Vec::new();
+    for c in &pag.constraints {
+        let kind = match c.kind {
+            ConstraintKind::Copy => "copy",
+            ConstraintKind::AddrOf => "addr_of",
+            ConstraintKind::Load => "load",
+            ConstraintKind::Store => "store",
+            ConstraintKind::Gep => "gep",
+        };
+        edge_rows.push((c.src.0, c.dst.0, kind));
+    }
+    // Implicit var → storage-location edges mirror the solver's direct
+    // points-to seeding (no constraint exists for it in the PAG).
+    for (&var, &loc) in &pag.var_location {
+        if let Some(&node) = pag.loc_node.get(&loc) {
+            if let Some(&var_node) = pag.var_node.get(&var) {
+                edge_rows.push((var_node.0, node.0, "points_to"));
+            }
+        }
+    }
+    // Interprocedural argument flow: actual var/function node → formal var
+    // node. Only added where the constraint graph does not already connect
+    // the pair (the solver wires persistent copies for pointee-carrying
+    // params), so traversal sees each hop once.
+    let mut wired_pairs: FxHashSet<(u32, u32)> = FxHashSet::default();
+    for c in &pag.constraints {
+        if matches!(c.kind, ConstraintKind::Copy | ConstraintKind::Load | ConstraintKind::Gep) {
+            wired_pairs.insert((c.src.0, c.dst.0));
+        }
+    }
+    for e in &analysis.arg_flow_edges {
+        let Some(formal_node) = pag.var_node.get(&e.formal) else {
+            continue;
+        };
+        match (e.actual_var, e.actual_fn) {
+            (Some(actual), _) => {
+                let Some(actual_node) = pag.var_node.get(&actual) else {
+                    continue;
+                };
+                if wired_pairs.contains(&(actual_node.0, formal_node.0)) {
+                    continue;
+                }
+                edge_rows.push((actual_node.0, formal_node.0, "call_arg"));
+            }
+            (None, Some(actual_fn)) => {
+                if let Some(&fn_loc) = pag.fn_locations.get(&actual_fn) {
+                    if let Some(&fn_node) = pag.loc_node.get(&fn_loc) {
+                        edge_rows.push((fn_node.0, formal_node.0, "call_arg"));
+                    }
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    edge_rows.sort_unstable();
+    edge_rows.dedup();
+    for (i, (src, dst, kind)) in edge_rows.iter().enumerate() {
+        edges.execute(params![i as i64 + 1, src, dst, kind])?;
     }
     Ok(())
 }
@@ -207,7 +361,8 @@ fn export_one_variable(stmt: &mut rusqlite::Statement<'_>, var: &trace_ir::Varia
         var.fn_id.map(|f| f.0),
         var.type_id.0,
         var.span.file.0,
-        var.span.line
+        var.span.line,
+        var.span.col
     ])?;
     Ok(())
 }
@@ -227,7 +382,7 @@ fn export_functions(conn: &Connection, program: &Program) -> Result<()> {
             func.name,
             func.file.0,
             func.span.line,
-            func.span.line,
+            func.end_line.max(func.span.line),
             linkage,
             format!("fn_{}", func.name),
             func.is_defined as i32

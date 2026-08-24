@@ -133,6 +133,63 @@ trace inspect /tmp/hdf.db calls --to LiteNetSetIpAddr
 
 For unresolved indirect calls, query SQL directly (see below).
 
+### `trace inspect callgraph`
+
+Print the transitive callees or callers of the function containing a line.
+
+```text
+trace inspect <DB> callgraph --file SUBSTR --line N [--depth N] [--direction down|up]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--file <SUBSTR>` | File path substring to disambiguate same-name functions. |
+| `--line <N>` | A line inside the function of interest. |
+| `--depth <N>` | Maximum BFS depth (default 3). |
+| `--direction` | `down` = callees (default), `up` = callers. |
+
+The start function is chosen among definitions whose `[line_start, line_end]`
+contains `--line`. Edges are labeled with their resolution (`direct`,
+`indirect`, `external`, `ambiguous`) and call-site locations; repeated
+callees print `(see above; also file:line)`.
+
+**Examples**
+
+```bash
+trace inspect /tmp/hdf.db callgraph --file devsvc_manager.c --line 120 --depth 2
+trace inspect /tmp/hdf.db callgraph --file hdf_service_record.c --line 20 --direction up
+```
+
+### `trace inspect dataflow`
+
+Walk the PAG value-flow graph from a variable declaration.
+
+```text
+trace inspect <DB> dataflow --file SUBSTR --line N --col C [--depth N] [--direction down|up]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--file <SUBSTR>` | File path substring. |
+| `--line <N>`, `--col <C>` | Position near a variable **declaration** (use sites are not recorded). |
+| `--depth <N>` | Maximum BFS depth (default 3). |
+| `--direction` | `down` = where the value flows (default), `up` = where it came from. |
+
+Edges show how values move: `copy`, `addr_of`, `load`, `store`, `gep`,
+`points_to` (variable → storage), and `call_arg` (argument passing into a
+callee formal). Function-pointer values appear as `fn:<name>` nodes.
+
+The same C parameter may exist as several IR variables (one per TU that sees
+its declaration). If nothing flows through the queried copy, the traversal
+automatically widens to same-name parameters of same-name functions.
+
+**Examples**
+
+```bash
+trace inspect /tmp/hdf.db dataflow --file can_test.c --line 33 --col 31
+trace inspect /tmp/hdf.db dataflow --file usb_raw_io.c --line 331 --col 23 --depth 4
+```
+
 ## Analysis pipeline
 
 ```
@@ -151,9 +208,12 @@ Analysis is **may-analysis** (sound over-approximation): if a call target is pos
 
 | Mode | Flags | Database contents |
 |------|-------|-------------------|
-| **Minimal** (default) | *(none)* | `analysis_run`, `files`, `functions`, filtered `call_sites`, `call_edges`, `arg_flow_edges`, variables referenced by arg-flow only, `diagnostics`. |
+| **Minimal** (default) | *(none)* | `analysis_run`, `files`, `functions`, filtered `call_sites`, `call_edges`, `arg_flow_edges`, PAG-referenced variables, flow graph (`flow_nodes` / `flow_edges`), `diagnostics`. |
 | **Full IR** | `--full-export` | Minimal plus all `types`, all `variables`, PAG `locations`. |
 | **Points-to debug** | `--debug-points-to` | Adds `points_to` table (and retains PAG during analysis). Use with `--full-export` for complete debug dumps. |
+
+The flow-graph tables are always exported because `trace inspect dataflow`
+queries them directly.
 
 ### Call site export filter
 
@@ -175,7 +235,8 @@ Schema version: **v1**. Foreign keys are declared in DDL; exports temporarily di
 analysis_run
 files ─┬─ functions ─┬─ call_sites ─┬─ call_edges → functions (callee)
        │             │              └─ arg_flow_edges → variables
-       └─ variables (fn_id → functions, type_id → types)
+       └─ variables ─ flow_nodes ─ flow_edges → flow_nodes
+                    (fn_id → functions, type_id → types)
 types
 locations (full export / debug)
 points_to (debug only)
@@ -210,7 +271,7 @@ Metadata for one `trace analyze` invocation.
 | `name` | TEXT | Linkage-visible name (may duplicate across TUs before merge; ids differ). |
 | `file_id` | INTEGER FK → `files` | Defining or primary declaration file. |
 | `line_start` | INTEGER | Start line (original file). |
-| `line_end` | INTEGER | End line (currently same as start in export). |
+| `line_end` | INTEGER | End line of the definition body; equals `line_start` for prototypes/synthesized externals. |
 | `linkage` | TEXT | `external`, `internal`, or `none`. |
 | `signature` | TEXT | Placeholder signature string (`fn_<name>`). |
 | `is_defined` | INTEGER | 1 if a body exists under the analyzed root; 0 covers prototypes and synthesized externals (libc, macro-referenced logging backends). |
@@ -261,7 +322,8 @@ Maps actual arguments at a call site to callee formal parameters (when wired by 
 
 ### `variables`
 
-Present in full export, or minimal export for variables referenced by `arg_flow_edges` only.
+Present in full export; in minimal export, only variables referenced by the
+flow graph / arg-flow edges.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -272,6 +334,35 @@ Present in full export, or minimal export for variables referenced by `arg_flow_
 | `type_id` | INTEGER FK → `types` | Type id. |
 | `file_id` | INTEGER FK → `files` | Declaration file. |
 | `line` | INTEGER | Declaration line. |
+| `col` | INTEGER | Declaration column (start of the declarator). |
+
+### `flow_nodes`
+
+PAG value-flow nodes used by `trace inspect dataflow`. Always exported.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | PAG node id (same id space as `points_to.var_node_id`). |
+| `kind` | TEXT | `var`, `loc`, or `call_target` (indirect-call site node). |
+| `label` | TEXT | Variable name, `loc:…`, or `fn:…`. |
+| `detail` | TEXT | Extra context (variable kind, enclosing function, …). |
+| `var_id` | INTEGER FK → `variables` | Owning variable (`NULL` for function locations). |
+| `fn_id` | INTEGER FK → `functions` | Enclosing function, when known. |
+
+**Index:** `flow_nodes(var_id)`.
+
+### `flow_edges`
+
+Directed value-flow edges (value flows src → dst). Always exported.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | Edge id. |
+| `src_node` | INTEGER FK → `flow_nodes` | Source node. |
+| `dst_node` | INTEGER FK → `flow_nodes` | Destination node. |
+| `kind` | TEXT | `copy`, `addr_of`, `load`, `store`, `gep`, `points_to`, or `call_arg`. |
+
+**Indexes:** `flow_edges(src_node)`, `flow_edges(dst_node)`.
 
 ### `types`
 

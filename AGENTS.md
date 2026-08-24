@@ -50,7 +50,7 @@ Current kinds: `Copy`, `AddrOfVar`, `AddrOfFn`, `Store`, `Load`, `GepField`, `Ar
 
 ## Export / CLI
 
-- Default export is **minimal** (call graph + arg-flow; see `trace-db/src/export.rs`).
+- Default export is **minimal** (call graph + arg-flow + PAG flow graph; see `trace-db/src/export.rs`).
 - `--full-export`: types, all variables, `locations`
 - `--debug-points-to`: retain/export points-to
 - Document schema changes in `docs/SQLITE_SCHEMA.md` and `README.md`
@@ -99,6 +99,7 @@ Use `cargo run -p trace-cli --release -- …` (or rebuild `target/release/trace`
 | Return-value / call assignment flow | `trace-parse/src/lower.rs`, `pag.expand_return_flows` |
 | Static / internal call resolution | `symbol.rs` (`resolve_function_in_scope`), `solver.rs`, `pag.rs` |
 | Fn-ptr arg-flow export | `solver.rs` (`extract_arg_flow`), `export.rs`, `arg_flow_edges.actual_fn_id` |
+| Flow-graph export / inspect queries | `export.rs` (`export_flow_graph`), `inspect.rs` |
 | Field summary / GEP fallback | `trace-analysis/src/pag.rs`, `solver.rs` |
 | New SQLite column | `trace-db/src/schema.rs`, `export.rs`, `docs/SQLITE_SCHEMA.md` |
 | Parse new C construct | `trace-parse/src/lower.rs` |

@@ -39,7 +39,12 @@ pub struct Function {
     pub return_type: TypeId,
     pub params: Vec<VarId>,
     pub locals: Vec<VarId>,
+    /// Start position (original-file coordinates via LineMap).
     pub span: Span,
+    /// Last line of the definition body in original-file coordinates.
+    /// Equal to `span.line` for prototypes, synthesized externals, and
+    /// bodies whose end could not be mapped back (e.g. cross-header ends).
+    pub end_line: u32,
     pub file: FileId,
     pub is_defined: bool,
 }
@@ -135,6 +140,7 @@ impl SymbolTable {
                         existing.is_defined = true;
                         existing.file = func.file;
                         existing.span = func.span;
+                        existing.end_line = existing.end_line.max(func.end_line);
                         if !func.params.is_empty() {
                             existing.params = func.params.clone();
                         }

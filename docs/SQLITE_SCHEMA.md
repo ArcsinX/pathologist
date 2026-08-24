@@ -14,11 +14,17 @@ See also the [README](../README.md) for CLI flags that control what is exported.
 | `call_sites` | filtered | filtered | filtered |
 | `call_edges` | ✓ | ✓ | ✓ |
 | `arg_flow_edges` | ✓ | ✓ | ✓ |
-| `variables` | arg-flow only | all | all (+ arg-flow) |
+| `variables` | PAG-referenced | all | all (+ arg-flow) |
+| `flow_nodes` | ✓ | ✓ | ✓ |
+| `flow_edges` | ✓ | ✓ | ✓ |
 | `types` | | ✓ | ✓ |
 | `locations` | | ✓ | ✓ |
 | `points_to` | | | ✓ |
 | `diagnostics` | ✓ | ✓ | ✓ |
+
+The flow-graph tables (`flow_nodes`, `flow_edges`) and the variables they
+reference are always exported because `trace inspect dataflow` works purely
+off the database.
 
 ### Call site export filter
 
@@ -36,6 +42,7 @@ Unresolved indirect calls therefore appear in `call_sites` with zero `call_edges
 analysis_run
 files ─┬─ functions ─┬─ call_sites ─┬─ call_edges → functions (callee)
        │             │              └─ arg_flow_edges → variables
+       ├─ variables ─ flow_nodes ─ flow_edges → flow_nodes
        └─ variables (type_id → types when exported)
 types
 locations (full export)
@@ -71,7 +78,7 @@ diagnostics
 | `name` | TEXT | Linkage-visible name |
 | `file_id` | INTEGER FK → `files` | Defining file (original header if include-originated) |
 | `line_start` | INTEGER | Start line (always original-file coordinates via LineMap) |
-| `line_end` | INTEGER | End line (currently ≈ start) |
+| `line_end` | INTEGER | End line of the definition body; equals `line_start` for prototypes and synthesized externals |
 | `linkage` | TEXT | `external`, `internal`, `none` |
 | `signature` | TEXT | Placeholder `fn_<name>` |
 | `is_defined` | INTEGER | 1 if a body exists under the analyzed root. 0 rows include prototype-only declarations and synthesized externals (libc/logging backends never declared in-tree) |
@@ -135,6 +142,48 @@ Exactly one of `actual_var_id` or `actual_fn_id` is set per row.
 | `type_id` | INTEGER FK → `types` | Type id |
 | `file_id` | INTEGER FK → `files` | Declaration file |
 | `line` | INTEGER | Declaration line |
+| `col` | INTEGER | Declaration column (start of the declarator) |
+
+In minimal export, variables are limited to those referenced by the flow
+graph / arg-flow edges; use `--full-export` for every variable.
+
+### flow_nodes
+
+PAG value-flow nodes (`trace inspect dataflow`). Always exported.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | PAG node id (same id space as `points_to.var_node_id`) |
+| `kind` | TEXT | `var`, `loc`, or `call_target` (indirect-call site node) |
+| `label` | TEXT | Human-readable label (variable name, `loc:…`, `fn:…`) |
+| `detail` | TEXT | Extra context (variable kind, enclosing function, …) |
+| `var_id` | INTEGER FK → `variables` | Variable this node belongs to (`NULL` for function locations) |
+| `fn_id` | INTEGER FK → `functions` | Enclosing function, when known |
+
+**Index:** `flow_nodes(var_id)`
+
+### flow_edges
+
+Directed value-flow edges between PAG nodes. Always exported.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | Edge id |
+| `src_node` | INTEGER FK → `flow_nodes` | Source node |
+| `dst_node` | INTEGER FK → `flow_nodes` | Destination node (value flows src → dst) |
+| `kind` | TEXT | see below |
+
+Edge kinds:
+
+- `copy`, `addr_of`, `load`, `store`, `gep` — direct translations of the IR
+  flow constraints that survived solving (including param copies wired by
+  the solver).
+- `points_to` — implicit var → storage-location edge derived from the final
+  var→location map.
+- `call_arg` — actual-to-formal argument passing from `arg_flow_edges`,
+  exported when no stronger constraint already connects the pair.
+
+**Indexes:** `flow_edges(src_node)`, `flow_edges(dst_node)`
 
 ### types
 
@@ -253,6 +302,22 @@ WHERE af.actual_fn_id IS NOT NULL;
 
 ```bash
 trace inspect graph.db calls [--from FN] [--to FN]
+trace inspect graph.db callgraph --file SUBSTR --line N [--depth N] [--direction down|up]
+trace inspect graph.db dataflow --file SUBSTR --line N --col C [--depth N] [--direction down|up]
 ```
 
-Lists rows from `call_edges` joined with `call_sites` / `functions`. Unresolved indirect sites require SQL (query above).
+- `calls` lists rows from `call_edges` joined with `call_sites` / `functions`.
+  Unresolved indirect sites require SQL (query above).
+- `callgraph` finds the function whose `[line_start, line_end]` contains the
+  given line and prints its transitive callees (`down`) or callers (`up`),
+  bounded by `--depth`. Edge labels distinguish `direct`, `indirect`,
+  `external`, and `ambiguous` resolution.
+- `dataflow` resolves the variable declared nearest the given position (exact
+  identifier hit preferred; declarations only — use sites are not recorded)
+  and walks the PAG value-flow graph forward (`down`: where the value flows)
+  or backward (`up`: where it came from). Edge kinds match `flow_edges.kind`.
+  Parameters duplicated across TUs (header prototype vs definition copies)
+  are reconciled automatically when the queried copy carries no edges.
+
+Both graph commands print a forest with `(truncated at --depth …)` markers
+when the frontier was cut off.

@@ -63,16 +63,25 @@ pub fn callees_of(
         .collect()
 }
 
-pub fn export_program(program: &Program, analysis: &AnalysisResult) -> PathBuf {
-    export_program_with_options(program, analysis, false)
+pub fn export_program(
+    program: &Program,
+    pag: &trace_analysis::Pag,
+    analysis: &AnalysisResult,
+) -> PathBuf {
+    export_program_with_options(program, pag, analysis, false)
 }
 
-pub fn export_program_full(program: &Program, analysis: &AnalysisResult) -> PathBuf {
-    export_program_with_options(program, analysis, true)
+pub fn export_program_full(
+    program: &Program,
+    pag: &trace_analysis::Pag,
+    analysis: &AnalysisResult,
+) -> PathBuf {
+    export_program_with_options(program, pag, analysis, true)
 }
 
 fn export_program_with_options(
     program: &Program,
+    pag: &trace_analysis::Pag,
     analysis: &AnalysisResult,
     full_detail: bool,
 ) -> PathBuf {
@@ -80,7 +89,7 @@ fn export_program_with_options(
     let _ = std::fs::remove_file(&out);
     trace_db::export_to_sqlite(
         program,
-        None,
+        pag,
         analysis,
         &trace_db::ExportOptions {
             output: out.clone(),

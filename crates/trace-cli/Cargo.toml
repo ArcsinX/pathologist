@@ -17,4 +17,5 @@ anyhow.workspace = true
 clap.workspace = true
 indexmap.workspace = true
 rusqlite.workspace = true
+rustc-hash.workspace = true
 walkdir.workspace = true

@@ -39,13 +39,13 @@ fn export_sqlite_roundtrip() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/include");
     let opts = opts.with_include(include_dir);
     let program = build_program(&root, &opts).unwrap();
-    let (_pag, analysis) = analyze(&program);
+    let (pag, analysis) = analyze(&program);
 
     let out = std::env::temp_dir().join(format!("trace_test_{}.db", std::process::id()));
     let _ = std::fs::remove_file(&out);
     export_to_sqlite(
         &program,
-        None,
+        &pag,
         &analysis,
         &ExportOptions {
             output: out.clone(),

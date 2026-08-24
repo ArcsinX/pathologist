@@ -251,6 +251,19 @@ Exactly one of `actual_var` or `actual_fn` is set per row. Only arguments that r
 
 Return-value flow affects **points-to** (what a call expression assigns), not arg-flow formals.
 
+### Flow-graph export
+
+`export_flow_graph` (`trace-db/src/export.rs`) serializes the post-solve PAG
+as `flow_nodes` / `flow_edges` for the `inspect dataflow` command:
+
+- Constraint kinds map 1:1 to edge kinds `copy` / `addr_of` / `load` /
+  `store` / `gep`.
+- `points_to` edges are derived from the final var→location map.
+- `call_arg` edges come from `extract_arg_flow` and are exported only when
+  no stronger constraint already connects the actual/formal pair — this
+  covers scalar (non-pointer) arguments that the solver does not persist as
+  PAG constraints.
+
 ## Libc / external summaries
 
 Registered in `trace-analysis/src/summaries.rs` (`apply_call_summary`). Current stubs:

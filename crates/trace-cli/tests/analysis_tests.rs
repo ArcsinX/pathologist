@@ -214,8 +214,7 @@ fn multi_tu_unique_ids_and_export() {
         "function ids must be unique across translation units"
     );
     let (pag, analysis) = analyze(&program);
-    let _ = pag;
-    let db = export_program(&program, &analysis);
+    let db = export_program(&program, &pag, &analysis);
     let conn = open_db(&db).unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM functions", [], |r| r.get(0))
@@ -297,8 +296,7 @@ fn export_sqlite_has_call_and_arg_tables() {
     let root = fixture("arg_flow");
     let program = build_program(&root, &default_opts(&root)).expect("build");
     let (pag, analysis) = analyze(&program);
-    let _ = pag;
-    let db = export_program(&program, &analysis);
+    let db = export_program(&program, &pag, &analysis);
     let conn = open_db(&db).unwrap();
     let calls: i64 = conn
         .query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))
@@ -338,7 +336,8 @@ fn fn_arg_flow_exported() {
         "expected fn pointer actual handler wired to register_cb formal"
     );
 
-    let db = export_program(&program, &analysis);
+    let (pag, analysis) = analyze(&program);
+    let db = export_program(&program, &pag, &analysis);
     let conn = open_db(&db).unwrap();
     let fn_flow: i64 = conn
         .query_row(
@@ -391,7 +390,7 @@ fn fn_static_local_variable() {
         "function-local static must be FnStatic, not Local"
     );
 
-    let (_pag, analysis) = analyze(&program);
+    let (pag, analysis) = analyze(&program);
     assert!(has_edge(
         &program,
         &analysis,
@@ -400,7 +399,7 @@ fn fn_static_local_variable() {
         ResolutionKind::Indirect
     ));
 
-    let db = export_program_full(&program, &analysis);
+    let db = export_program_full(&program, &pag, &analysis);
     let conn = open_db(&db).unwrap();
     let kind: String = conn
         .query_row(
