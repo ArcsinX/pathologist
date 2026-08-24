@@ -217,7 +217,7 @@ impl PreprocessorState {
     }
 
     fn process_file(&mut self, path: &Path) -> Result<(), PreprocessError> {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical = trace_ir::canonicalize(path);
         if self.included_guard.contains(&canonical) {
             // Already expanded earlier in this run — normally a silent skip.
             // But cached expansions are flat text: an entry built while this

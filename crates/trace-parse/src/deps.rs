@@ -36,7 +36,7 @@ struct IncludeRef {
 
 impl IncludeGraph {
     pub fn build(root: &Path, c_files: &[PathBuf], h_files: &[PathBuf]) -> Self {
-        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let root = trace_ir::canonicalize(root);
         let mut project_files: HashSet<PathBuf> = HashSet::new();
         for p in c_files.iter().chain(h_files.iter()) {
             project_files.insert(canonicalize(p));
@@ -212,7 +212,7 @@ impl IncludeGraph {
 }
 
 fn canonicalize(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    trace_ir::canonicalize(path)
 }
 
 fn discover_include_dirs(root: &Path, headers: &[PathBuf]) -> Vec<PathBuf> {

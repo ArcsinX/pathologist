@@ -33,7 +33,7 @@ impl IndexSourceCache {
         graph: &IncludeGraph,
         eff_opts: &PreprocessOptions,
     ) -> Result<Arc<PreprocessedSource>, String> {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical = trace_ir::canonicalize(path);
         if let Ok(guard) = self.inner.read() {
             if let Some(src) = guard.get(&canonical) {
                 return Ok(Arc::clone(src));
@@ -57,7 +57,7 @@ fn read_index_source(
     graph: &IncludeGraph,
     eff_opts: &PreprocessOptions,
 ) -> Result<(String, LineMap), String> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical = trace_ir::canonicalize(path);
     if !should_preprocess(path, eff_opts, graph) {
         if let Some(s) = graph.source_cache.get(&canonical) {
             return Ok((s.clone(), LineMap::new()));

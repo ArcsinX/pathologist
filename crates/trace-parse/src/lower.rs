@@ -298,7 +298,7 @@ fn is_plain_ident(name: &str) -> bool {
 fn normalize_discovered_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths
         .into_iter()
-        .map(|p| p.canonicalize().unwrap_or(p))
+        .map(|p| trace_ir::canonicalize(&p))
         .collect()
 }
 
@@ -402,7 +402,7 @@ fn process_indexed_file(
         current_file: file_id,
         locals: HashMap::new(),
         line_map: Some(std::sync::Arc::clone(&pre.line_map)),
-        primary_path: path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+        primary_path: trace_ir::canonicalize(path),
         pending: RefCell::new(Vec::new()),
     };
     lower_tree(program, &mut ctx, &parsed.source, parsed.tree.root_node());

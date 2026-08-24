@@ -122,11 +122,11 @@ fn run_analyze(
     // (same basename, different tree) resolve to the wrong copy, which
     // silently starves translation units. Warn loudly — this misconfiguration
     // previously produced silent false negatives.
-    let root_canon = target.canonicalize().unwrap_or_else(|_| target.clone());
+    let root_canon = trace_ir::canonicalize(&target);
     let outside: Vec<PathBuf> = opts
         .include_paths
         .iter()
-        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .map(|p| trace_ir::canonicalize(p))
         .filter(|c| !(c.starts_with(&root_canon) || root_canon.starts_with(c)))
         .collect();
     if !outside.is_empty() {
