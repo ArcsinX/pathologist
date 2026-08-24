@@ -714,7 +714,7 @@ fn lower_declaration(
                     child.child_by_field_name("value"),
                 );
             }
-            "declarator" | "pointer_declarator" | "function_declarator" => {
+            "declarator" | "pointer_declarator" | "function_declarator" | "array_declarator" => {
                 // A pointer-returning function declaration (`T *f(void);`) is a
                 // `pointer_declarator` wrapping a `function_declarator`; it must
                 // register a function, not a variable that shadows the name.
@@ -883,7 +883,18 @@ fn lower_fn_ptr_array_init(
         }
         if child.kind() == "initializer_pair" || child.kind() == "designated_initializer" {
             if let Some(value) = init_pair_value_node(child) {
-                push_array_fn_member(program, ctx, source, array, value);
+                // `[i] = { ... }` with a nested *positional* element list has
+                // no field info — park members via ArrayFnMember (sound blob).
+                // Lists carrying field designators are handled precisely by
+                // `lower_designated_initializer` (via `extract_flow_from_expr`)
+                // so members stay bound to their own field.
+                if value.kind() == "initializer_list" {
+                    if !list_has_field_designators(value) {
+                        lower_fn_ptr_array_init(program, ctx, source, array, value);
+                    }
+                } else {
+                    push_array_fn_member(program, ctx, source, array, value);
+                }
             }
             continue;
         }
@@ -896,6 +907,25 @@ fn init_pair_value_node(node: Node) -> Option<Node> {
     node.children(&mut cursor)
         .filter(|c| c.is_named() && c.kind() != "field_designator")
         .last()
+}
+
+/// True when any direct `initializer_pair`/`designated_initializer` child of
+/// this list carries a `.field =` designator (as opposed to purely positional
+/// contents).
+fn list_has_field_designators(list: Node) -> bool {
+    let mut cursor = list.walk();
+    for c in list.children(&mut cursor) {
+        if c.kind() != "initializer_pair" && c.kind() != "designated_initializer" {
+            continue;
+        }
+        let mut inner = c.walk();
+        for g in c.children(&mut inner) {
+            if g.kind() == "field_designator" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn push_array_fn_member(
@@ -1184,7 +1214,10 @@ fn lower_designated_initializer(
                     }
                 }
             }
-            "=" => {}
+            // `[i]` selects an array element; element access is
+            // index-insensitive in this IR, so the subscript itself carries no
+            // information — just don't mistake it for the value.
+            "subscript_designator" | "=" => {}
             _ if value.is_none() && child.is_named() && child.kind() != "field_designator" => {
                 value = Some(child)
             }
@@ -1198,26 +1231,36 @@ fn lower_designated_initializer(
         Some(t) => t,
         None => return,
     };
-    let mut current = base;
-    for (i, fname) in field_names.iter().enumerate() {
+    if value_node.kind() == "initializer_list" {
+        // `[i] = { .f = v }` or `.s = { .g = v }`: descend into the nested
+        // list against the same base (array elements are index-insensitive),
+        // chaining GEPs for any field designators seen so far.
+        let mut current = base;
+        for fname in &field_names {
+            let Some(fid) = program.types.field_id_by_name(type_id, fname) else {
+                return;
+            };
+            current = alloc_gep_temp(program, ctx, node, current, fid);
+            type_id = program.types.get(type_id).layout.fields[&fid].type_id;
+            type_id = peel_ptr_to_struct(program, type_id);
+        }
+        lower_initializer_list(program, ctx, source, value_node, current);
+        return;
+    }
+    if field_names.is_empty() {
+        // Designated form without a field designator (`[i] = v` on a plain
+        // fn-ptr array): handled by `lower_fn_ptr_array_init`.
+        return;
+    }
+    let mut field_ids = Vec::with_capacity(field_names.len());
+    for fname in &field_names {
         let Some(fid) = program.types.field_id_by_name(type_id, fname) else {
             return;
         };
-        if i + 1 == field_names.len() {
-            emit_field_value_store(
-                program,
-                ctx,
-                source,
-                node,
-                current,
-                std::slice::from_ref(&fid),
-                value_node,
-            );
-        } else {
-            current = alloc_gep_temp(program, ctx, node, current, fid);
-            type_id = program.types.get(type_id).layout.fields[&fid].type_id;
-        }
+        field_ids.push(fid);
+        type_id = program.types.get(type_id).layout.fields[&fid].type_id;
     }
+    emit_field_value_store(program, ctx, source, node, base, &field_ids, value_node);
 }
 
 fn peel_expression(mut node: Node) -> Node {

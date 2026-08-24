@@ -219,3 +219,162 @@ Not addressed (unchanged verdicts): full solver convergence (P0-1 design work), 
 Post-fix review round found and fixed two residual defects: pending-reference retry now falls back to variables (tentative globals defined after use), and `typedef ret (*Name)(...)` aliases resolve to pointer-to-function instead of function-returning-pointer. Corpus metrics unchanged by these fixes; determinism verified (two independent parallel runs produce identical call-edge and arg-flow sets); dispatch-table TPs reconfirmed (sensor cmd table exactly its 6 initializers, light table its 3, HDMI 15).
 12. **Review-round fixes** — (a) HIGH: `finalize_extern_callees` originally synthesized externs over names that DO exist tree-wide, orphaning cross-TU definitions lacking local prototypes (solver name-recovery bypassed). Fixed with a `resolve_function` guard + regression fixture (`extern_call/util.c`: `caller→helper` must stay Direct to the defined body). (b) Solver hot-loop env lookup hoisted; redundant store-target clone removed; CLI ambiguous-edge grouping documented; warning quoting fixed.
 13. **HDMI TP reconciliation after reclassification** — whole-tree runs unchanged: `HdmiIoDispatch` resolves 16 distinct fn-ptr/direct targets including a now-verified **direct edge to the real `DealFormat` body** in `adapter/khdf/hongmeng/osal/src/osal_deal_log_format.c`. Framework-subroot runs show 15 because `DealFormat`'s defining TU lies outside that root — the edge correctly becomes `external` instead of pretending the prototype is a definition. Final whole-tree metrics @300k default: 72983 edges (28978 direct / 25186 indirect / 18819 external), 51351 arg-flow, deterministic across runs; framework corpus 84/84 tests green.
+
+## 7. Round 3 — 2026-08-24: array-table FN/FP fixes (designated inits, tentative arrays)
+
+Scope: fresh whole-tree evaluation + minimal-fixture bisection of indirect-call resolution.
+Builds compared on identical inputs (`-D __LITEOS__ --jobs 8`, default 200k-pop budget):
+`old` = committed HEAD c699933, `new` = this round's fixes. DBs `/tmp/opencode/hdf_old.db`,
+`/tmp/opencode/hdf_det1.db`. Note the default budget constant is now 200_000 (docs above
+mention 300k); site coverage is budget-insensitive here (500 vs 495 unresolved @200k/@300k),
+the budget only affects how many *extra may-targets* late pops add.
+
+### 7.0 TL;DR
+
+| Metric (whole tree) | old | new | Δ |
+|---|---|---|---|
+| Direct edges / sites | 28976 / unchanged | 28976 | — |
+| Indirect resolved edges | 6485 | 6494 | −101 FP · +93 FN-fixed TP · +17 mixed |
+| Unresolved indirect sites | 500 | 495 | −5 (all five now resolve correctly) |
+| Arg-flow fn-ptr actuals | 12 | 12 | unchanged |
+| Tests | 84 | **85** pass | new regression fixture |
+
+All three defect classes were found by minimal fixtures first, then confirmed corpus-wide.
+
+### 7.1 D1 (FN, blocking) — initializer-less array declarations dropped entirely
+
+`lower_declaration` matched `"declarator" | "pointer_declarator" | "function_declarator"`
+but not `array_declarator` (tree-sitter emits it as a *direct* child for `T arr[N];`
+without initializer; with an initializer the child is `init_declarator`, which is why
+initialized tables worked). Any tentative array definition therefore produced **no
+variable at all** — globals and locals alike:
+
+```c
+static int g_noinit[4];          // missing from IR
+int use(int i) { int l[4]; l[i]=1; return g_noinit[i]; }   // l missing too
+static int g_init[4] = {1};      // present (init_declarator path)
+```
+
+Proof chain: fixture `tests/fixtures/array_table_designated` pre-fix DB had no row for
+`g_tbl`; post-fix it exists and element stores resolve. This one-line arm addition also
+closes the previously-open §6.11 item (field callees inside doubly-substituted test
+macros degrading to bare names): `LONGS_EQUAL_RETURN(0, g_driverEntry.Init(7))` with a
+tentative `g_driverEntry` now lowers the full field path and resolves `impl_init`
+(fixture fx21).
+
+Corpus impact: every runtime-populated dispatch table declared without an initializer
+(e.g. `static struct Handler g_tbl[2];` + `g_tbl[i].fn = f`) was invisible to the solver.
+
+### 7.2 D2 (FN) — designated-initializer array members lost
+
+For `[i] = { .fn = Fn }` tables, `lower_designated_initializer` saw the
+`subscript_designator` child first and mistook it for the pair's *value* (it only
+excluded `field_designator`), so nothing was emitted and nested lists were never
+recursed into. Positional tables (`{ { Fn }, ... }`) worked, which is why earlier
+TP proofs (HDMI/sensor) never caught this.
+
+Fix: subscript designators are skipped (index-insensitive per IR contract), and list
+values recurse through `lower_initializer_list` chaining GEPs for any field designators,
+landing in the existing precise `emit_field_value_store` path (AddrOfFn, pending refs
+for later-defined callees, CallReturn all preserved).
+
+Newly-resolved corpus sites (all verified against source):
+
+| Site (source anchor) | Targets now | Proof |
+|---|---|---|
+| `framework/core/shared/src/hdf_object_manager.c:16` `targetCreator->Create()` | exactly the 18 `*Create` fns | table `framework/core/common/src/devlite_object_config.c:23–59`: designated `[OBJ_ID] = {.Create=…, .Release=…}` |
+| `hdf_object_manager.c:34` `targetCreator->Release(object)` | exactly the 13 non-NULL `*Release` fns | same table (two entries have `.Release = NULL` and are absent from targets — correct) |
+| `framework/utils/src/hdf_sbuf.c:405` `constructor->obtain(capacity)` | exactly `{SbufObtainRaw, SbufObtainIpc, SbufObtainIpcHw}` | `g_sbufConstructorMap` designated table at `hdf_sbuf.c:55` |
+| `hdf_sbuf.c:467` `constructor->bind(base, size)` | exactly the 3 `Sbuf*Bind*` fns | same table |
+| wifi sta cmd dispatch (`HandleRequestMessage`, `nodes/local_node.c:32`) → `targetService->ExecRequestMsg` chain | 56 `WifiCmd*` handlers | macro-built cmd table, e.g. `sta.c:631 DUEMessage(CMD_STA_SCAN, WifiCmdScan, 0)` |
+| `power_state_token.c:53` `listener->Suspend(...)`, `:31 Resume`, Doze variants | exactly `{HdfPmHdfTestSuspend, HdfPmSampleSuspend}` etc. | runtime stores `hdf_pm_driver_test.c:223–228 …listener.powerListener.Suspend = HdfPmSampleSuspend` |
+
+The HDMI flagship proof is unchanged: `HdmiIoDispatch` still resolves its 15 positional
+`dispatchFunc[]` entries exactly (positional path untouched).
+
+### 7.3 D3 (FP) — ArrayFnMember merged fields across designated tables
+
+Because D2's fallback pushed designated members as field-less `ArrayFnMember` facts,
+any load of *any* member of such a table observed *every* listed function:
+`constructor->obtain()` targeted the three `.bind` functions too, and
+`targetCreator->Create()`/`->Release()` each saw both families (31 bogus edges on those
+two sites alone). Fix: members written via a field designator lower as precise
+`GepField`+`Store` chains (identical shape to runtime element stores), so they feed only
+loads of that field. Purely positional lists keep the documented merged-blob semantics
+(`docs/ANALYSIS.md` updated).
+
+Corpus-wide effect (old → new, per-site target-set diff): **101 polluted edges removed
+across 10 sites**, spot-proofs that removals are correct:
+
+- `GpioCntlrRead` (`gpio_core.c:67` `cntlr->ops->read`) lost 13 targets incl.
+  `EmmcTestEntry` — which is only ever stored to `tester->TestEntry`
+  (`emmc_test.c:150`), never to any `.read`.
+- `DispatchAddDevice` lost `GpioDevSetDir`/`LinuxGpioSetDir` (only ever stored to
+  `.setDir`: `gpio_wm.c:107`, `gpio_bes.c:130`, …) and `DevSvcManager{Stub,Ext}Start`
+  (only to `.StartService`: `devsvc_manager_stub.c:708`).
+- sbuf/object-manager Create↔Release and obtain↔bind cross-field splits (§7.2 table).
+- `DevSvcManagerStubAddService`, `SetPpgOption`, `DevHostServiceFullOpsDevice` lost
+  unrelated test/dispatch entries likewise.
+
+Net new-edge audit: +93 TP (§7.2) − 101 FP + 17 at seven sites; of those 17, twelve are
+verified-true pm-hook flows (above) and five are the known instance-insensitivity class
+described in §7.5.
+
+### 7.4 Regression safety
+
+- New integration fixture `tests/fixtures/array_table_designated` + test
+  `array_table_designated_init_resolves_targets` covers: global designated tables (helper-ptr
+  and direct access), tentative arrays with runtime stores, local designated tables.
+  Minimal probes also re-verified: plain fn-ptr arrays, cast-wrapped initializers,
+  mixed `.fn/.arg` designated elements, later-defined callees.
+- Workspace: 85/85 tests pass; two consecutive full-tree runs byte-identical edge sets
+  (determinism holds for both binaries; an apparent nondeterminism mid-session was a
+  stale-binary artifact of the A/B procedure, see §7.6).
+
+### 7.5 Remaining known imprecision (unchanged verdicts, new evidence)
+
+1. `servstat_listener.c:57` `stub->listener.callback(...)` gains {`DevSvcManagerExtStart`,
+   `DevSvcManagerStubStart`, `GpioDevSetDir`, `GpioManagerAdd`, `LinuxGpioSetDir`} — none
+   stored to any `.callback`. Mechanism: wrong-type pointer casts make pts(stub) contain
+   foreign objects; field ids are then applied by offset onto alien layouts, plus
+   instance-insensitive summaries. Pre-existing class, surfaced within budget by reshuffled
+   propagation; would need type-aware field locations to fix.
+2. Same-struct-type file-static tables merge across TUs through `(type, field)` summary
+   locs: sensor `DispatchCmdHandle` sees the light driver's 3 table entries (9 targets;
+   identical in old binary — not a regression). Tightening statics to per-var field locs
+   is a candidate precision win.
+3. Remaining 463 unresolved field-path sites are dominated by genuinely out-of-corpus
+   implementations — verified samples: HDMI `audioPathEnable` (never assigned),
+   `macChipDriver->ethMacOps` (only NULL-checked), sensor `AccelRegisterChipOps` (interface
+   never called in-tree), `g_modules[i].deinit` (all entries `.deinit = NULL`). These are
+   faithful results, not FNs; tagging them "out-of-tree" remains the right UX fix.
+4. C++ phantom noise (`mPtr->AddRef`, `autoptr.h operator->`) and the `(vaddr_t)(uintptr_t)`
+   cast-artifact callee text persist (N1/N2 classes from §3.3).
+
+### 7.6 Methodology notes
+
+- A/B builds via `git stash` must copy binaries to explicit paths *and* rebuild after
+  `stash pop`; running `target/release/trace` afterwards silently exercises the wrong
+  build (this produced one false determinism alarm and phantom fixture failures during
+  the session).
+- `call_sites.line` for TU-local sites is the *preprocessed* coordinate (schema-correct
+  but easy to misread: `wifi_base.c:23984` in a 1813-line file). Feedback anchors above
+  give source lines instead; consider exporting both (e.g. `pp_line`) next schema rev.
+
+### 7.7 Repro commands
+
+```bash
+# evaluation DBs
+target/release/trace analyze ~/drivers_hdf_core -o /tmp/opencode/hdf_new.db --jobs 8 -D __LITEOS__
+# newly-resolved dispatch proofs (compare old/new)
+sqlite3 /tmp/opencode/hdf_new.db "SELECT cs.line, group_concat(c.name) FROM call_edges e
+ JOIN call_sites cs ON cs.id=e.call_site_id JOIN functions c ON c.id=e.callee_fn_id
+ JOIN functions caller ON caller.id=cs.caller_fn_id WHERE caller.name='HdfObjectManagerGetObject'
+ AND e.resolution='indirect' GROUP BY cs.id;"
+# FP-removal proof: obtain/bind no longer cross-contaminated
+sqlite3 /tmp/opencode/hdf_new.db "SELECT cs.line, group_concat(c.name) FROM call_edges e
+ JOIN call_sites cs ON cs.id=e.call_site_id JOIN functions c ON c.id=e.callee_fn_id
+ JOIN files f ON f.id=cs.file_id WHERE cs.line IN (893,944) AND f.path LIKE '%utils/src/hdf_sbuf.c'
+ GROUP BY cs.line;"
+cargo test --workspace   # 85 passed
+```

@@ -527,3 +527,86 @@ fn macro_warm_preprocess_failure_is_nonfatal() {
         "main.c should still be indexed after macro warm failure"
     );
 }
+
+#[test]
+fn array_table_designated_init_resolves_targets() {
+    let root = fixture("array_table_designated");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    // Designated-init global table via helper-returned element pointer.
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "caller_helper_ptr",
+            "raw_obtain",
+            ResolutionKind::Indirect
+        ),
+        "helper-ptr designated init: raw_obtain missing"
+    );
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "caller_helper_ptr",
+            "ipc_obtain",
+            ResolutionKind::Indirect
+        ),
+        "helper-ptr designated init: ipc_obtain missing"
+    );
+
+    // Direct subscript access on the same table.
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "caller_direct",
+            "raw_obtain",
+            ResolutionKind::Indirect
+        ) && has_edge(
+            &program,
+            &analysis,
+            "caller_direct",
+            "ipc_obtain",
+            ResolutionKind::Indirect
+        ),
+        "direct subscript designated init targets missing"
+    );
+
+    // Tentative (initializer-less) array + runtime stores into elements.
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "run",
+            "impl_a",
+            ResolutionKind::Indirect
+        ) && has_edge(
+            &program,
+            &analysis,
+            "run",
+            "impl_b",
+            ResolutionKind::Indirect
+        ),
+        "runtime store into tentative array element: impl_a/impl_b missing"
+    );
+
+    // Local array with designated initializers.
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "caller_local",
+            "loc_a",
+            ResolutionKind::Indirect
+        ) && has_edge(
+            &program,
+            &analysis,
+            "caller_local",
+            "loc_b",
+            ResolutionKind::Indirect
+        ),
+        "local designated-init array targets missing"
+    );
+}

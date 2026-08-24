@@ -175,7 +175,17 @@ When `retain_points_to` is false (default), points-to sets are discarded after s
 - **Constant index**: treated conservatively (element refinement is future work).
 - **Unknown subscript**: `ArraySummary` — all elements merged.
 - **`ArrayFnMember`**: each initializer function is merged into the array var's points-to; any subscript call may target **any** listed function.
-- **Nested initializer lists** (`{ {TYPE, Fn}, ... }`, `{ {.init = Fn}, ... }`): element expressions are visited recursively, so arrays of structs with fn-ptr members feed `ArrayFnMember` facts into the table var. Element fn values flow through field loads on the array itself *and* through pointers to elements (`m = &arr[i]; m->fn()`), regardless of worklist order.
+- **Nested initializer lists** (`{ {TYPE, Fn}, ... }`): element expressions are visited recursively, so arrays of structs with fn-ptr members feed `ArrayFnMember` facts into the table var. Element fn values flow through field loads on the array itself *and* through pointers to elements (`m = &arr[i]; m->fn()`), regardless of worklist order.
+- **Field-designated members** (`[i] = { .fn = Fn }`): lowered as precise
+  `GepField`+`Store` chains against the array var (index-insensitive, like
+  runtime element stores), so a member only feeds loads of the field it was
+  written to. Purely positional nested lists still use the merged
+  `ArrayFnMember` blob. Mixed forms where positional and designated members
+  coexist in one element list keep the designated precision; bare positional
+  members of such lists are not separately parked (rare; sound direction).
+- **Initializer-less array declarations** (tentative definitions such as
+  `static struct Ops g_tbl[4];`) register the variable like any other global;
+  runtime stores into elements then resolve normally.
 
 ## Member subobject addressing
 
