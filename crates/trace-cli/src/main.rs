@@ -60,6 +60,10 @@ enum InspectCommands {
         from: Option<String>,
         #[arg(long)]
         to: Option<String>,
+        /// Only edges whose caller or callee file path contains this substring
+        /// (disambiguates same-name functions defined in different files).
+        #[arg(long)]
+        file: Option<String>,
     },
 }
 
@@ -225,82 +229,54 @@ fn run_analyze(
 fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
     let conn = open_db(&db)?;
     match command {
-        InspectCommands::Calls { from, to } => {
+        InspectCommands::Calls { from, to, file } => {
             let mut sql = String::from(
-                "SELECT caller.name, callee.name, ce.resolution, cs.line \
+                "SELECT caller.name, csf.path, cs.line, callee.name, callee_f.path, ce.resolution \
                  FROM call_edges ce \
                  JOIN call_sites cs ON cs.id = ce.call_site_id \
                  JOIN functions caller ON caller.id = cs.caller_fn_id \
-                 JOIN functions callee ON callee.id = ce.callee_fn_id WHERE 1=1",
+                 JOIN files csf ON csf.id = cs.file_id \
+                 JOIN functions callee ON callee.id = ce.callee_fn_id \
+                 JOIN files callee_f ON callee_f.id = callee.file_id WHERE 1=1",
             );
-            if from.is_some() {
-                sql.push_str(" AND caller.name = ?1");
+            let mut params: Vec<String> = Vec::new();
+            if let Some(f) = from.as_deref() {
+                params.push(f.to_string());
+                sql.push_str(&format!(" AND caller.name = ?{}", params.len()));
             }
-            if to.is_some() {
-                sql.push_str(if from.is_some() {
-                    " AND callee.name = ?2"
-                } else {
-                    " AND callee.name = ?1"
-                });
+            if let Some(t) = to.as_deref() {
+                params.push(t.to_string());
+                sql.push_str(&format!(" AND callee.name = ?{}", params.len()));
+            }
+            if let Some(p) = file.as_deref() {
+                params.push(format!("%{p}%"));
+                let n = params.len();
+                sql.push_str(&format!(
+                    " AND (csf.path LIKE ?{n} OR callee_f.path LIKE ?{n})"
+                ));
+            }
+            sql.push_str(" ORDER BY csf.path, cs.line");
+            fn basename(p: &str) -> &str {
+                p.rsplit('/').next().unwrap_or(p)
             }
             let mut stmt = conn.prepare(&sql)?;
-            match (from.as_deref(), to.as_deref()) {
-                (Some(f), Some(t)) => {
-                    let rows = stmt.query_map(rusqlite::params![f, t], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    })?;
-                    for row in rows {
-                        let (caller, callee, res, line) = row?;
-                        println!("{caller} -> {callee} ({res}) at line {line}");
-                    }
-                }
-                (Some(f), None) => {
-                    let rows = stmt.query_map(rusqlite::params![f], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    })?;
-                    for row in rows {
-                        let (caller, callee, res, line) = row?;
-                        println!("{caller} -> {callee} ({res}) at line {line}");
-                    }
-                }
-                (None, Some(t)) => {
-                    let rows = stmt.query_map(rusqlite::params![t], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    })?;
-                    for row in rows {
-                        let (caller, callee, res, line) = row?;
-                        println!("{caller} -> {callee} ({res}) at line {line}");
-                    }
-                }
-                (None, None) => {
-                    let rows = stmt.query_map([], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    })?;
-                    for row in rows {
-                        let (caller, callee, res, line) = row?;
-                        println!("{caller} -> {callee} ({res}) at line {line}");
-                    }
-                }
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (caller, cfile, line, callee, efile, res) = row?;
+                println!(
+                    "{caller} ({}:{line}) -> {callee} [{}] ({res})",
+                    basename(&cfile),
+                    basename(&efile)
+                );
             }
         }
     }

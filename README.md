@@ -101,7 +101,12 @@ Same identifier in different `.c` files (each `static`) gets distinct IR ids; re
 Query an existing analysis database.
 
 ```text
-trace inspect <DB> calls [--from FN] [--to FN]
+trace inspect <DB> calls [--from FN] [--to FN] [--file SUBSTR]
+
+Edges print as `caller (file:line) -> callee [deffile] (resolution)` — the
+`[deffile]` bracket distinguishes same-name (e.g. `static`) functions defined
+in different files; `--file` filters edges whose caller or callee file path
+contains the substring.
 ```
 
 | Option | Description |
