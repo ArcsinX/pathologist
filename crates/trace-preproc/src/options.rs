@@ -10,6 +10,15 @@ pub struct IncludeExpansion {
     /// Origin map for `text`: offsets are relative to the start of the
     /// expansion. Empty when line-map tracking is disabled.
     pub line_map: Arc<crate::LineMap>,
+    /// Macro definitions this header's processing added relative to its
+    /// starting table (new names only). Cached expansions are replayed
+    /// WITHOUT executing their `#define` directives, so a consumer that
+    /// splices an entry must re-apply these — otherwise a later header
+    /// whose body invokes one of those macros starves during its own
+    /// warm pass and freezes invocation residue into its cached text.
+    /// `#undef` side effects and redefinitions of pre-existing macros
+    /// are not captured (rare in practice).
+    pub macros: Arc<Vec<(String, crate::MacroDef)>>,
 }
 
 #[derive(Debug, Clone, Default)]

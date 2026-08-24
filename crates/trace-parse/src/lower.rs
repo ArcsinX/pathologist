@@ -500,8 +500,8 @@ fn lower_typedef(program: &mut Program, source: &str, node: Node) {
         let (alias, _) = parse_declarator_name(source, decl);
         if let Some(type_node) = node.child_by_field_name("type") {
             if type_node.kind() == "struct_specifier" || type_node.kind() == "union_specifier" {
-                let tag = lower_struct_specifier(program, source, type_node);
-                if !alias.is_empty() && !tag.is_empty() && alias != tag {
+                let tag = lower_struct_specifier(program, source, type_node, Some(&alias));
+                if !alias.is_empty() && !tag.is_empty() {
                     let kind = if type_node.kind() == "union_specifier" {
                         TypeDesc::Union {
                             name: tag.clone(),
@@ -513,7 +513,12 @@ fn lower_typedef(program: &mut Program, source: &str, node: Node) {
                             fields: Vec::new(),
                         }
                     };
-                    program.types.intern(kind);
+                    program.types.intern(kind.clone());
+                    // Register even when alias == tag: later `Tag *x`
+                    // declarations resolve through the alias table
+                    // (`type_desc_from_node`), and without an entry the
+                    // pointer degrades to Int, killing field decomposition.
+                    program.types.register_alias(&alias, kind);
                 }
             } else if let Some(desc) = typedef_underlying_desc(program, source, node) {
                 program.types.register_alias(&alias, desc);
@@ -527,7 +532,7 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
         "function_definition" => lower_function(program, ctx, source, node),
         "declaration" => lower_declaration(program, ctx, source, node, None),
         "struct_specifier" | "union_specifier" => {
-            lower_struct_specifier(program, source, node);
+            lower_struct_specifier(program, source, node, None);
         }
         "type_definition" => lower_typedef(program, source, node),
         _ => {
@@ -539,13 +544,32 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
     }
 }
 
-fn lower_struct_specifier(program: &mut Program, source: &str, node: Node) -> String {
+fn lower_struct_specifier(
+    program: &mut Program,
+    source: &str,
+    node: Node,
+    alias_hint: Option<&str>,
+) -> String {
     let is_union = node.kind() == "union_specifier";
     let mut name = node
         .child_by_field_name("name")
         .map(|n| node_text(source, &n).to_string())
         .unwrap_or_default();
 
+    if name.is_empty() {
+        // A typedef'd anonymous struct (`typedef struct { .. } Alias;`)
+        // gets the alias as its tag so every translation unit that lowers
+        // the shared header produces an identical TypeDesc. Per-unit
+        // `anon_N` counters made the descs differ across TUs, which kept
+        // `merge_types` from unifying them and split one logical type into
+        // several TypeIds (field summaries, layouts, and points-to cells
+        // all diverged per copy).
+        if let Some(alias) = alias_hint {
+            if !alias.is_empty() {
+                name = alias.to_string();
+            }
+        }
+    }
     if name.is_empty() {
         program.anon_type_counter += 1;
         name = format!("anon_{}", program.anon_type_counter);
@@ -1799,12 +1823,42 @@ fn type_desc_from_field_declaration(
             ret: Box::new(base),
             params: Vec::new(),
         }
+    } else if declarator_is_pointer_to_fn(decl) {
+        // `struct T *(*Ref)(args)`: a pointer-wrapped function declarator.
+        // Classifying it as a plain `Ptr(base)` loses the function-ness,
+        // and downstream typed-slot guards then reject every function
+        // value stored into such fields — killing indirect-call
+        // resolution for ops tables assigned outside initializers.
+        TypeDesc::FnPtr {
+            ret: Box::new(base),
+            params: Vec::new(),
+        }
     } else if declarator_is_pointer(decl) {
         TypeDesc::Ptr(Box::new(base))
     } else {
         base
     };
     Some((fname, desc))
+}
+
+/// True when the declarator chain (through any number of pointer /
+/// parenthesized levels) bottoms out in a function declarator — e.g.
+/// `T * (*Ref)(args)` or `T (*tab[4])(args)`.
+fn declarator_is_pointer_to_fn(decl: Node) -> bool {
+    let mut cur = decl;
+    while matches!(
+        cur.kind(),
+        "pointer_declarator" | "parenthesized_declarator"
+    ) {
+        cur = match cur
+            .child_by_field_name("declarator")
+            .or_else(|| cur.named_child(0))
+        {
+            Some(c) => c,
+            None => return false,
+        };
+    }
+    is_function_pointer_declarator(cur)
 }
 
 fn declarator_is_pointer(decl: Node) -> bool {
@@ -2135,7 +2189,7 @@ fn storage_for(ctx: &LowerContext, is_static: bool) -> StorageClass {
 
 fn type_desc_from_node(program: &mut Program, source: &str, node: Node) -> TypeDesc {
     if node.kind() == "struct_specifier" || node.kind() == "union_specifier" {
-        let name = lower_struct_specifier(program, source, node);
+        let name = lower_struct_specifier(program, source, node, None);
         if node.kind() == "union_specifier" {
             return TypeDesc::Union {
                 name,

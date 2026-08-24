@@ -44,6 +44,7 @@ flowchart LR
 | Literals | String and character literals preserved |
 | `#include "..."` / `<...>` | Include path stack + `--include` |
 | `#define` | Object-like and **function-like** (non-variadic) |
+| Macro rescanning | Function-like macros invoked inside another macro's expansion are expanded too (C11 6.10.3.4); uninvoked function-like names are emitted verbatim |
 | `##` token pasting | In macro bodies after argument substitution |
 | Conditionals | `#ifdef`, `#ifndef`, `#if` / `#elif` (macro-expanded), `#else`, `#endif` |
 | `#line` | Location tracking in `LineMap` |
@@ -98,6 +99,12 @@ Indexing output must be identical across runs of the same tree. Two mechanisms g
 - **Expansion-cache freeze**: during parallel phases the include-expansion cache is read-only (`PreprocessOptions::frozen_expansion_cache`). Hits replay warm-pass entries (produced deterministically); misses expand inline under each TU's own macro/guard state and are *not* inserted — first-writer-wins inserts would make results scheduling-dependent.
 
 Translation units inherit the **union** of all warm-pass macro states: cached expansions replay without executing their `#define` directives, so TU-local code still needs those macros.
+
+### Macro deltas in cached entries
+
+A cached expansion replays its text **without** executing the `#define`s it contains, so a header whose body *invokes* macros defined by an earlier-included header would starve: at warm time the dependency was processed inline (fine), but a consumer warmed later splices the dependency's cached body and never learns its macros. Therefore each `IncludeExpansion` also records a **macro delta**: every macro *name* that is new relative to the snapshot taken when entry construction began (`IncludeExpansion.macros`). `splice_cached` re-applies these into the current table first-wins (`or_insert_with`), so later headers warm with the definitions they were built against.
+
+Limitation: the delta captures new names only. `#undef` of an inherited name, or redefinition of a macro that already existed in the warm table, is not replayed — such patterns across include boundaries are unsupported (v1).
 
 ### Cache self-containment
 

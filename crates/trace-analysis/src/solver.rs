@@ -447,6 +447,11 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
                 let Some(field) = field else {
                     continue;
                 };
+                // Did any pointee yield a usable field cell? Untyped bases
+                // (e.g. `void *` heap allocations) synthesize nothing, but
+                // the access still needs the type-keyed summary to see
+                // stores from other instances of the same struct type.
+                let mut produced_cell = false;
                 for &loc in delta.iter() {
                     // Function values reach a base node's points-to either as
                     // `ArrayFnMember` table initializers (flow through element
@@ -478,6 +483,7 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
                         continue;
                     }
                     if let Some(field_loc) = pag.ensure_field_loc(program, loc, field) {
+                        produced_cell = true;
                         // Field loc plus its instance-insensitive summary:
                         // the GEP result points AT these cells.
                         let targets = [Some(field_loc), pag.summary_for_field_loc(field_loc)];
@@ -504,10 +510,16 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
                         }
                     }
                 }
-                // First-time GEP on a var with no pointees yet: fall back to
-                // the instance-insensitive field summary so loads through the
-                // destination still see something.
-                if st.pts.get(&node).map(|p| p.is_empty()).unwrap_or(true) {
+                // First-time GEP on a var with no pointees yet, or a GEP
+                // whose pointees all failed to synthesize a field cell
+                // (untyped `void *` heap, opaque summaries): fall back to
+                // the instance-insensitive field summary so accesses
+                // through this destination still observe stores made via
+                // other instances of the same struct type. Without this,
+                // ops tables assigned through freshly-allocated objects
+                // starve every load site that reads them.
+                let base_unpointed = st.pts.get(&node).map(|p| p.is_empty()).unwrap_or(true);
+                if base_unpointed || !produced_cell {
                     if let PagNodeKind::Var(base_var) = pag.nodes[src.0 as usize].kind {
                         if let Some(summary) =
                             pag.ensure_field_summary_for_var(program, base_var, field)
@@ -665,6 +677,7 @@ fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: 
         if fn_for_loc(pag, loc).is_some() {
             continue;
         }
+
         // Signature guard: never plant a function value into a cell whose
         // declared type is an incompatible fn pointer (or a concrete
         // non-fn-pointer object). Wrong-type casts put unrelated objects into

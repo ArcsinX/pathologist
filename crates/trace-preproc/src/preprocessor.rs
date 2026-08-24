@@ -202,6 +202,18 @@ impl PreprocessorState {
         };
         let offset = self.output.len();
         self.output.push_str(&entry.text);
+        // Replay the entry's macro side effects. Cached text is spliced
+        // without executing the header's directives, so without this a
+        // consumer sees none of the macros the header defines — later
+        // warm passes then expand dependent headers against a starved
+        // table and freeze unexpanded invocations into their own cache
+        // entries. First-wins: a table that already defines the name
+        // (e.g. TUs seeded from the union table) keeps its definition.
+        for (name, def) in entry.macros.iter() {
+            self.macros
+                .entry(name.clone())
+                .or_insert_with(|| def.clone());
+        }
         if self.opts.track_line_map {
             // Renumber the cached expansion's file indices into this run's
             // intern table, then splice its entries.
@@ -252,6 +264,14 @@ impl PreprocessorState {
             self.included_guard.clone()
         } else {
             HashSet::new()
+        };
+        // Snapshot for the entry's macro delta: everything this header's
+        // processing adds relative to its starting table is replayed by
+        // `splice_cached` (see `IncludeExpansion::macros`).
+        let macros_snapshot = if cache_header && !self.opts.frozen_expansion_cache {
+            Some(self.macros.clone())
+        } else {
+            None
         };
         self.included_guard.insert(canonical.clone());
         let output_start = self.output.len();
@@ -326,11 +346,25 @@ impl PreprocessorState {
                         .cloned()
                         .collect();
                     let line_map = Arc::new(self.line_map.slice_from(output_start));
+                    let macro_defs: Arc<Vec<(String, crate::MacroDef)>> = match &macros_snapshot {
+                        Some(snap) => {
+                            let mut v: Vec<(String, crate::MacroDef)> = self
+                                .macros
+                                .iter()
+                                .filter(|(k, _)| !snap.contains_key(k.as_str()))
+                                .map(|(k, val)| (k.clone(), val.clone()))
+                                .collect();
+                            v.shrink_to_fit();
+                            Arc::new(v)
+                        }
+                        None => Arc::default(),
+                    };
                     if let Ok(mut guard) = cache.write() {
                         guard.entry(canonical).or_insert(crate::IncludeExpansion {
                             text,
                             files: Arc::new(new_files),
                             line_map,
+                            macros: macro_defs,
                         });
                     }
                 }
@@ -443,10 +477,36 @@ impl PreprocessorState {
             }
             if self.is_active() {
                 if let TokenKind::Identifier(name) = &tok.kind {
-                    if let Some(MacroDef::Object { replacement }) = self.macros.get(name).cloned() {
-                        self.expand_tokens_no_directives(&replacement)?;
-                        i += 1;
-                        continue;
+                    match self.macros.get(name).cloned() {
+                        Some(MacroDef::Object { replacement }) => {
+                            self.expand_tokens_no_directives(&replacement)?;
+                            i += 1;
+                            continue;
+                        }
+                        // Function-like macros appearing inside another
+                        // macro's expansion must be invoked and their
+                        // expansion rescanned (C11 6.10.3.4); otherwise
+                        // nested definitions like
+                        // `#define A SHARED_OBJ(T)` leak `SHARED_OBJ(T)`
+                        // verbatim into the output.
+                        Some(MacroDef::Function {
+                            params,
+                            replacement,
+                            variadic,
+                        }) if self.next_non_newline_is(tokens, i + 1, "(") => {
+                            let mut j = i + 1;
+                            let args = self.parse_macro_args(tokens, &mut j)?;
+                            let expanded = apply_concatenation(substitute_macro(
+                                &replacement,
+                                &params,
+                                &args,
+                                variadic,
+                            ));
+                            self.expand_tokens_no_directives(&expanded)?;
+                            i = j;
+                            continue;
+                        }
+                        Some(MacroDef::Function { .. }) | None => {}
                     }
                 }
                 self.emit_token(tok);
@@ -1282,6 +1342,24 @@ mod tests {
         assert!(!result.output.contains("unguarded"), "{}", result.output);
         assert!(result.output.contains("present"), "{}", result.output);
         assert!(!result.output.contains("missing"), "{}", result.output);
+    }
+
+    #[test]
+    fn function_macro_inside_object_expansion_expands() {
+        // C11 6.10.3.4: after an object-like macro is replaced, the result is
+        // rescanned; a function-like macro invoked there must be expanded
+        // too, not emitted verbatim.
+        use std::path::PathBuf;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/preproc/nested_fn_macro.c");
+        let result = preprocess_file(&path, &PreprocessOptions::new()).unwrap();
+        assert!(
+            !result.output.contains("WRAP") && !result.output.contains("SHARED"),
+            "macro invocations leaked verbatim: {}",
+            result.output
+        );
+        assert!(result.output.contains("status_Node"), "{}", result.output);
+        assert!(result.output.contains("done"), "{}", result.output);
     }
 
     #[test]

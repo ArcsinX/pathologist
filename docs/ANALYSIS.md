@@ -133,6 +133,8 @@ Solving is capped at a deterministic **200 000 pops** by default. Normal corpora
 
 When `pts(base)` is empty (typical for pointer parameters with no incoming flow), fall back to **`FieldSummary`** for `(struct_type(base), field)` via `ensure_field_summary_for_var`. This connects field stores through parameters to later field loads on unrelated instances (may-analysis).
 
+The same fallback also fires when the base *has* pointees but none of them yielded a field cell — e.g. `void *` heap allocations or opaque summaries, where per-pointee `ensure_field_loc` synthesizes nothing. Without this, ops fields assigned through freshly-allocated objects starve every load site that reads them (observed as missing indirect-call edges for shared-obj style code).
+
 **Stores to field summaries**
 
 `apply_store` propagates into both concrete field locs and their `FieldSummary`, keeping summary memory in sync with instance stores.
@@ -178,6 +180,7 @@ When `retain_points_to` is false (default), points-to sets are discarded after s
 - `GepField` in IR becomes PAG `Gep` with field id.
 - **`FieldSummary`** locations unify all instances of `struct T.field` for sound may-analysis (e.g. vtable writes through a parameter pointer visible at unrelated call sites).
 - Unknown or non-struct base → GEP may no-op.
+- **Struct identity is per-TypeDesc**: types intern by full `(tag, fields)` equality. Field summaries and layouts of divergent copies diverge too (stores through one copy are invisible to loads through another), so lowering must produce *identical* descs for the same logical struct in every TU. In particular, a typedef'd anonymous struct (`typedef struct { .. } Alias;`) takes `Alias` as its tag — per-unit `anon_N` counters would otherwise split one shared-header type into several TypeIds after merge.
 
 ## Arrays and function-pointer tables
 
