@@ -1,14 +1,28 @@
-use crate::constraints::{ArgFlowEdge, CallGraphEdge, LocKind, ResolutionKind};
+use crate::constraints::{
+    ArgFlowEdge, CallGraphEdge, Constraint, ConstraintKind, LocKind, ResolutionKind,
+};
 use crate::pag::{Pag, PagNodeKind};
-use crate::summaries::apply_call_summary;
+use crate::summaries::{Effect, FnModelSet};
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, VarId};
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 pub struct AnalyzeOptions {
     /// Retain full points-to sets on the result (for `--debug-points-to` export).
     pub retain_points_to: bool,
+    /// Function models matched by callee name (built-ins plus any user
+    /// configuration). See `docs/ANALYSIS.md`, "Function models".
+    pub models: std::sync::Arc<FnModelSet>,
+}
+
+impl Default for AnalyzeOptions {
+    fn default() -> Self {
+        Self {
+            retain_points_to: false,
+            models: std::sync::Arc::new(FnModelSet::builtin()),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -17,6 +31,9 @@ pub struct AnalysisResult {
     pub call_edges: Vec<CallGraphEdge>,
     pub arg_flow_edges: Vec<ArgFlowEdge>,
     pub wired_arg_flow: FxHashSet<(CallSiteId, u32, FnId)>,
+    /// Applied `clears` effects: `(call site, cleared parameter index)`.
+    /// Exported as terminator nodes/edges in the flow graph.
+    pub terminator_events: Vec<(CallSiteId, u32)>,
 }
 
 pub fn analyze(program: &Program) -> (Pag, AnalysisResult) {
@@ -24,8 +41,8 @@ pub fn analyze(program: &Program) -> (Pag, AnalysisResult) {
 }
 
 pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, AnalysisResult) {
-    let mut pag = Pag::build(program);
-    let mut result = solve(&mut pag, program, opts.retain_points_to);
+    let mut pag = Pag::build_with_models(program, &opts.models);
+    let mut result = solve(&mut pag, program, opts.retain_points_to, &opts.models);
     let call_edges = result.call_edges.clone();
     let wired = result.wired_arg_flow.clone();
     extract_arg_flow(program, &call_edges, &wired, &mut result);
@@ -57,6 +74,9 @@ struct SolverState {
     /// (actual → formal) pair recurs across many call sites and re-adding it
     /// per discovered edge explodes constraint volume on large trees.
     wired_copies: FxHashSet<(PagNodeId, PagNodeId)>,
+    /// Same dedup, shared with parameter copies, for model-effect stores
+    /// (`content_store`) and alias/mem-copy edges.
+    wired_model_edges: FxHashSet<(PagNodeId, PagNodeId)>,
     /// Signature-aware propagation guards (see `SlotGuard`).
     slot_guard: FxHashMap<LocId, SlotGuard>,
     /// Parameter count per function location (only when > 0; old-style `()`
@@ -177,7 +197,12 @@ fn st_pts_stats_max(pts: &IndexMap<PagNodeId, FxHashSet<LocId>>) -> usize {
 /// `apply_store_to_targets`).
 const SUMMARY_MEM_CAP: usize = 1024;
 
-fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisResult {
+fn solve(
+    pag: &mut Pag,
+    program: &Program,
+    retain_points_to: bool,
+    models: &FnModelSet,
+) -> AnalysisResult {
     let mut st = SolverState {
         pts: FxHashMap::default(),
         delta: FxHashMap::default(),
@@ -189,6 +214,7 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
         seen_once: FxHashSet::default(),
         saturated_summaries: FxHashSet::default(),
         wired_copies: FxHashSet::default(),
+        wired_model_edges: FxHashSet::default(),
         slot_guard: FxHashMap::default(),
         fn_arity: FxHashMap::default(),
     };
@@ -221,6 +247,7 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
     let mut call_edges: Vec<CallGraphEdge> = Vec::new();
     let mut resolved_indirect: FxHashMap<CallSiteId, Vec<FnId>> = FxHashMap::default();
     let mut wired_arg_flow: FxHashSet<(CallSiteId, u32, FnId)> = FxHashSet::default();
+    let mut terminator_events: Vec<(CallSiteId, u32)> = Vec::new();
 
     for var in &program.symbols.variables {
         if !matches!(
@@ -283,6 +310,7 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
             if has_formals {
                 wire_params(pag, program, cs, callee, &mut st, &mut wired_arg_flow);
             }
+            apply_fn_model(pag, &mut st, cs, &f.name, models, &mut terminator_events);
         }
     }
 
@@ -558,7 +586,14 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
                             resolution: ResolutionKind::Indirect,
                         });
                         wire_params(pag, program, cs, callee, &mut st, &mut wired_arg_flow);
-                        apply_call_summary(cs, callee, program);
+                        apply_fn_model(
+                            pag,
+                            &mut st,
+                            cs,
+                            &program.symbols.function(callee).name,
+                            models,
+                            &mut terminator_events,
+                        );
                     }
                 }
             }
@@ -588,6 +623,122 @@ fn solve(pag: &mut Pag, program: &Program, retain_points_to: bool) -> AnalysisRe
         call_edges,
         arg_flow_edges: Vec::new(),
         wired_arg_flow,
+        terminator_events,
+    }
+}
+
+/// Copy side for model `alias` / `mem_copy` effects. An address-of actual
+/// (`memcpy_s(&dst, .., &src, ..)`) is rewritten to the underlying **object
+/// variable**, so later field accesses on the destination object observe the
+/// source-side field cells (the address temp itself is never used for
+/// loads). Pointer-typed actuals (`memcpy(d, s, n)`) stay at their own node.
+fn model_copy_side(pag: &Pag, node: PagNodeId) -> PagNodeId {
+    if let Some(idxs) = pag.indices.addr_of_dst.get(&node) {
+        for &idx in idxs {
+            let c = &pag.constraints[idx];
+            if let PagNodeKind::Loc(loc) = pag.nodes[c.src.0 as usize].kind {
+                if let Some(v) = pag.locations[loc.0 as usize].var {
+                    if let Some(&var_node) = pag.var_node.get(&v) {
+                        return var_node;
+                    }
+                }
+            }
+        }
+    }
+    node
+}
+
+/// Apply a callee's function model at one resolved call site: attach
+/// persistent PAG constraints between the actual-argument nodes so data
+/// flows through bodyless callees, and record terminator events.
+/// `ReturnAlias` / `ReturnHeap` are handled at PAG build time (they target
+/// the `CallReturn` destination, not call arguments).
+fn apply_fn_model(
+    pag: &mut Pag,
+    st: &mut SolverState,
+    cs: &trace_ir::CallSite,
+    callee_name: &str,
+    models: &FnModelSet,
+    terminator_events: &mut Vec<(CallSiteId, u32)>,
+) {
+    let Some(model) = models.get(callee_name) else {
+        return;
+    };
+    // `&base.member` arguments resolve to the base variable; copying the
+    // whole container would pollute unrelated fields with the source's
+    // pointees, so alias-style effects refuse to fire on them.
+    let member_addr = |idx: u32| cs.addr_of_member_args.binary_search(&idx).is_ok();
+    // Actual argument node for parameter slot `idx`, when the call passed an
+    // IR variable there (literals like `0` or `sizeof(..)` do not
+    // participate).
+    let mut arg_node_cache: FxHashMap<u32, Option<PagNodeId>> = FxHashMap::default();
+    let mut arg_node = |pag: &Pag, idx: u32| -> Option<PagNodeId> {
+        *arg_node_cache.entry(idx).or_insert_with(|| {
+            let v = cs.var_args.iter().find(|(j, _)| *j == idx)?.1;
+            pag.var_node.get(&v).copied()
+        })
+    };
+    for effect in &model.effects {
+        match effect {
+            // Alias: `pts(param[dst]) ⊇ pts(param[src])` — whole-pointer
+            // alias.  Skip member-address arguments to avoid polluting
+            // unrelated fields of the base container.
+            Effect::Alias { dst, src } => {
+                if member_addr(*dst) || member_addr(*src) {
+                    continue;
+                }
+                let d_side = arg_node(pag, *dst).map(|n| model_copy_side(pag, n));
+                let s_side = arg_node(pag, *src).map(|n| model_copy_side(pag, n));
+                if let (Some(d), Some(s)) = (d_side, s_side) {
+                    if st.wired_model_edges.insert((s, d)) {
+                        ensure_param_copy(pag, st, s, d);
+                    }
+                }
+            }
+            // MemCopy: bulk content copy `*dst <- *src` (memcpy family).
+            // Unlike pointer Alias, the copy targets a specific sub-object
+            // (e.g. `memcpy_s(&dst->chipData, ..., src, ...)`), so the
+            // whole-object Copy to the base variable is sound for may-
+            // analysis: the GEP chain already models the field access, and
+            // extra pointees on unrelated fields are over-approximated.
+            Effect::MemCopy { dst, src } => {
+                let d_side = arg_node(pag, *dst).map(|n| model_copy_side(pag, n));
+                let s_side = arg_node(pag, *src).map(|n| model_copy_side(pag, n));
+                if let (Some(d), Some(s)) = (d_side, s_side) {
+                    if st.wired_model_edges.insert((s, d)) {
+                        ensure_param_copy(pag, st, s, d);
+                    }
+                }
+            }
+            Effect::ContentStore { ptr, value } => {
+                if let (Some(p), Some(v)) = (arg_node(pag, *ptr), arg_node(pag, *value)) {
+                    if st.wired_model_edges.insert((v, p)) {
+                        let idx = pag.constraints.len();
+                        pag.constraints.push(Constraint {
+                            kind: ConstraintKind::Store,
+                            dst: p,
+                            src: v,
+                            field: None,
+                        });
+                        pag.indices.store_dst.entry(p).or_default().push(idx);
+                        pag.indices.store_src.entry(v).or_default().push(idx);
+                        // Either side gaining pointees must re-fire the store;
+                        // evaluate both immediately with current knowledge.
+                        st.push(p);
+                        st.push(v);
+                    }
+                }
+            }
+            Effect::Clears { param } => {
+                if arg_node(pag, *param).is_some() {
+                    let event = (cs.id, *param);
+                    if !terminator_events.contains(&event) {
+                        terminator_events.push(event);
+                    }
+                }
+            }
+            Effect::ReturnAlias { .. } | Effect::ReturnHeap => {}
+        }
     }
 }
 
@@ -952,6 +1103,7 @@ mod tests {
             callee_fn_id: None,
             var_args: Vec::new(),
             fn_args: Vec::new(),
+            addr_of_member_args: Vec::new(),
             span: trace_ir::Span {
                 file: trace_ir::FileId(0),
                 line: 1,

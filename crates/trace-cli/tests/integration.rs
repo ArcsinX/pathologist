@@ -51,6 +51,7 @@ fn export_sqlite_roundtrip() {
             output: out.clone(),
             include_points_to: false,
             full_detail: false,
+            model_files: Vec::new(),
         },
     )
     .unwrap();

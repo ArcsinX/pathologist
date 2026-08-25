@@ -56,6 +56,7 @@ trace analyze [OPTIONS] <TARGET>
 | `--jobs <N>` | Parallel jobs for indexing (parse + lower). Default: logical CPU count. |
 | `--full-export` | Export full IR detail: all types, all variables, PAG `locations`. Slower and produces a larger database. |
 | `--debug-points-to` | Retain points-to sets during analysis and export the `points_to` debug table (requires PAG in memory). Implies keeping location data needed for export. |
+| `--models <FILE>` | Load a TOML function-model file (interprocedural summaries for bodyless callees, e.g. `memcpy_s`). Repeatable; later files override earlier entries and built-ins. See `docs/ANALYSIS.md`. |
 
 **Progress output** (stderr):
 
@@ -344,7 +345,7 @@ PAG value-flow nodes used by `trace inspect dataflow`. Always exported.
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | PAG node id (same id space as `points_to.var_node_id`). |
-| `kind` | TEXT | `var`, `loc`, or `call_target` (indirect-call site node). |
+| `kind` | TEXT | `var`, `loc`, `call_target` (indirect-call site node), or `terminator` (function-model clears event). |
 | `label` | TEXT | Variable name, `loc:…`, or `fn:…`. |
 | `detail` | TEXT | Extra context (variable kind, enclosing function, …). |
 | `var_id` | INTEGER FK → `variables` | Owning variable (`NULL` for function locations). |
@@ -361,7 +362,7 @@ Directed value-flow edges (value flows src → dst). Always exported.
 | `id` | INTEGER PK | Edge id. |
 | `src_node` | INTEGER FK → `flow_nodes` | Source node. |
 | `dst_node` | INTEGER FK → `flow_nodes` | Destination node. |
-| `kind` | TEXT | `copy`, `addr_of`, `load`, `store`, `gep`, `points_to`, or `call_arg`. |
+| `kind` | TEXT | `copy`, `addr_of`, `load`, `store`, `gep`, `points_to`, `call_arg`, or `terminates` (function-model clears event). |
 
 **Indexes:** `flow_edges(src_node)`, `flow_edges(dst_node)`.
 

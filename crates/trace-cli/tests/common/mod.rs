@@ -95,6 +95,7 @@ fn export_program_with_options(
             output: out.clone(),
             include_points_to: false,
             full_detail,
+            model_files: Vec::new(),
         },
     )
     .expect("export");

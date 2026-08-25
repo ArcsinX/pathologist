@@ -488,6 +488,7 @@ pub fn dataflow_graph(
                 "gep" => "gep",
                 "points_to" => "points_to",
                 "call_arg" => "call_arg",
+                "terminates" => "terminates",
                 _ => "flow",
             };
             fwd.entry(src)
@@ -511,6 +512,7 @@ pub fn dataflow_graph(
             let tag = match kind.as_str() {
                 "loc" => "loc",
                 "call_target" => "target",
+                "terminator" => "terminator",
                 _ => "",
             };
             let shown = if tag.is_empty() {

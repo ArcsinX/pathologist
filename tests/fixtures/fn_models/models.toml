@@ -1,0 +1,8 @@
+version = 1
+
+# Project-specific wrapper: content of *src is copied into *dst.
+[[model]]
+name = "copy_via_wrapper"
+effects = [
+    { kind = "mem_copy", dst = 0, src = 1 },
+]

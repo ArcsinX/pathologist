@@ -50,6 +50,7 @@ fn build_and_export(name: &str) -> PathBuf {
             output: out.clone(),
             include_points_to: false,
             full_detail: false,
+            model_files: Vec::new(),
         },
     )
     .expect("export");

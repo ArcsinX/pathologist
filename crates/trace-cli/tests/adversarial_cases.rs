@@ -4,7 +4,10 @@
 mod common;
 
 use common::*;
-use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
+use std::sync::Arc;
+use trace_analysis::{
+    analyze, analyze_with_options, AnalysisResult, AnalyzeOptions, ResolutionKind,
+};
 use trace_ir::{FlowConstraint, Program};
 use trace_parse::build_program;
 use trace_preproc::preprocess_file;
@@ -201,37 +204,51 @@ fn comma_without_assignment_keeps_first_fn_ptr() {
     );
 }
 
-// --- Known limitations (document imprecision / missing libc models) ---
+// --- libc memcpy/memmove modeling (function models, see docs/ANALYSIS.md) ---
 
-/// memcpy of fn-ptr bytes is not modeled; indirect call through post-memcpy fp is missed.
+/// `memcpy(&fp, &src, n)` copies fn-ptr bits: the builtin model resolves the
+/// indirect call through the copy. Without models the gap remains.
 #[test]
-fn limitation_memcpy_fnptr_indirect_unresolved() {
+fn memcpy_fnptr_indirect_resolved_via_model() {
     let root = fixture("memcpy_fnptr");
     let program = build_program(&root, &default_opts(&root)).expect("build");
-    let (_pag, analysis) = analyze(&program);
+    let with_models = analyze(&program);
     assert!(
-        !has_any_edge(&program, &analysis, "memcpy_indirect", "real_target"),
-        "memcpy-modeled fn-ptr would make this pass — update test if intentional"
+        has_any_edge(&program, &with_models.1, "memcpy_indirect", "real_target"),
+        "builtin mem_copy model must carry the fn-ptr through memcpy"
     );
     assert!(
-        has_any_edge(&program, &analysis, "memcpy_no_fn_edge", "real_target"),
+        has_any_edge(&program, &with_models.1, "memcpy_no_fn_edge", "real_target"),
         "plain fp() path still works"
     );
     assert!(
-        must_not_have_edge(&program, &analysis, "memcpy_no_fn_edge", "ghost"),
+        must_not_have_edge(&program, &with_models.1, "memcpy_no_fn_edge", "ghost"),
         "memset/memcpy on blob must not invent ghost edge"
+    );
+
+    // Baseline without models keeps the documented limitation.
+    let no_models = analyze_with_options(
+        &program,
+        AnalyzeOptions {
+            models: Arc::new(trace_analysis::FnModelSet::default()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        !has_any_edge(&program, &no_models.1, "memcpy_indirect", "real_target"),
+        "without models the copied fn-ptr stays unresolved"
     );
 }
 
-/// memmove staging of fn-ptr — same gap as memcpy unless summarized.
+/// memmove staging of fn-ptr — same model coverage as memcpy.
 #[test]
-fn limitation_memmove_staged_fnptr_unresolved() {
+fn memmove_staged_fnptr_resolved_via_model() {
     let root = fixture("memmove_fnptr");
     let program = build_program(&root, &default_opts(&root)).expect("build");
-    let (_pag, analysis) = analyze(&program);
+    let with_models = analyze(&program);
     assert!(
-        !has_any_edge(&program, &analysis, "memmove_indirect", "mover_target"),
-        "memmove-modeled fn-ptr would make this pass — update test if intentional"
+        has_any_edge(&program, &with_models.1, "memmove_indirect", "mover_target"),
+        "builtin mem_copy model carries the fn-ptr through staged memmove"
     );
 }
 
@@ -258,14 +275,38 @@ fn fn_ptr_table_over_approximates_all_entries() {
     );
 }
 
-/// memcpy of a struct that embeds a fn-ptr — field initializer now wires setConfig.
+/// memcpy of a struct that embeds a fn-ptr — the MemCopy model wires the
+/// fn-ptr field through the whole-object copy, and GEP processing resolves
+/// the indirect call.
 #[test]
-fn limitation_memcpy_struct_with_fnptr_unresolved() {
+fn memcpy_struct_fnptr_resolves_indirect() {
     let root = fixture("memcpy_struct_fn");
     let program = build_program(&root, &default_opts(&root)).expect("build");
     let (_pag, analysis) = analyze(&program);
     assert!(
         has_any_edge(&program, &analysis, "struct_holder_memcpy", "embedded"),
-        "struct fn-ptr field should resolve after designated-init store fix"
+        "struct fn-ptr field should resolve through memcpy MemCopy model"
+    );
+}
+
+/// memcpy_s into a sub-field (`memcpy_s(&drv->chipData, ..., chip, ...)`)
+/// must flow the source op-table function pointers through the MemCopy model
+/// so that indirect calls through the destination resolve.
+#[test]
+fn memcpy_s_member_field_resolves_fnptrs() {
+    let root = fixture("memcpy_s_member_field");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(
+        has_any_edge(&program, &analysis, "test_indirect_through_memcpy_s", "SetPpgEnable"),
+        "Enable op should resolve through memcpy_s into sub-field"
+    );
+    assert!(
+        has_any_edge(&program, &analysis, "test_indirect_through_memcpy_s", "SetPpgDisable"),
+        "Disable op should resolve through memcpy_s into sub-field"
+    );
+    assert!(
+        has_any_edge(&program, &analysis, "test_indirect_through_memcpy_s", "SetPpgReadData"),
+        "ReadData op should resolve through memcpy_s into sub-field"
     );
 }

@@ -1,4 +1,5 @@
 use crate::constraints::{AbstractLocation, Constraint, ConstraintKind, LocKind};
+use crate::summaries::{Effect, FnModelSet};
 use indexmap::IndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use trace_ir::{
@@ -61,10 +62,14 @@ pub struct Pag {
 
 impl Pag {
     pub fn build(program: &Program) -> Self {
+        Self::build_with_models(program, &FnModelSet::builtin())
+    }
+
+    pub fn build_with_models(program: &Program, models: &FnModelSet) -> Self {
         let mut pag = Self::default();
         pag.build_variables(program);
         pag.build_function_locations(program);
-        pag.build_flow_constraints(program);
+        pag.build_flow_constraints(program, models);
         pag.build_call_constraints(program);
         pag.build_indices(program);
         pag
@@ -341,7 +346,7 @@ impl Pag {
         }
     }
 
-    fn build_flow_constraints(&mut self, program: &Program) {
+    fn build_flow_constraints(&mut self, program: &Program, models: &FnModelSet) {
         for flow in &program.flow {
             match flow {
                 FlowConstraint::Copy { dst, src } => {
@@ -405,11 +410,28 @@ impl Pag {
                     // May-approximation: a merged name may bind to the
                     // query file's `static` def, the external def, or both.
                     let mut visited = FxHashSet::default();
-                    for callee in program
+                    let candidates: Vec<_> = program
                         .symbols
-                        .resolve_function_candidates(callee_name, file)
-                    {
-                        self.expand_return_flows(program, dst_n, callee, &mut visited);
+                        .resolve_function_candidates(callee_name, file);
+                    let mut any_real = false;
+                    for callee in &candidates {
+                        if self.expand_return_flows(program, dst_n, *callee, models, &mut visited) {
+                            any_real = true;
+                        }
+                    }
+                    // Modeled return effects fire only when no real return
+                    // flow exists (bodyless callees: libc realloc, vendor
+                    // allocators). Synthesized externals never enter the
+                    // name-resolution maps, so the model is consulted by
+                    // call name directly.
+                    if !any_real {
+                        if let Some(model) = models.get(callee_name) {
+                            let params = candidates
+                                .iter()
+                                .find(|c| !program.symbols.function(**c).params.is_empty())
+                                .map(|c| program.symbols.function(*c).params.clone());
+                            self.apply_return_model(dst_n, model, params.as_deref());
+                        }
                     }
                 }
             }
@@ -421,44 +443,116 @@ impl Pag {
         program: &Program,
         dst: PagNodeId,
         callee: FnId,
+        models: &FnModelSet,
         visited: &mut FxHashSet<FnId>,
-    ) {
+    ) -> bool {
         if !visited.insert(callee) {
-            return;
+            return false;
         }
-        let Some(flows) = program.fn_returns.get(&callee) else {
-            return;
-        };
-        for flow in flows.clone() {
-            match flow {
-                ReturnFlow::AddrOfVar { src } => {
-                    if let Some(loc) = self.ensure_var_loc(program, src) {
-                        let loc_n = self.loc_node[&loc];
-                        self.add_addr_of(dst, loc_n);
+        match program.fn_returns.get(&callee) {
+            Some(flows) => {
+                let mut applied = false;
+                for flow in flows.clone() {
+                    match flow {
+                        ReturnFlow::AddrOfVar { src } => {
+                            if let Some(loc) = self.ensure_var_loc(program, src) {
+                                let loc_n = self.loc_node[&loc];
+                                self.add_addr_of(dst, loc_n);
+                                applied = true;
+                            }
+                        }
+                        ReturnFlow::AddrOfFn { callee: fn_id } => {
+                            // Trust the merge-remapped FnId (see AddrOfFn above).
+                            if let Some(&fn_loc) = self.fn_locations.get(&fn_id) {
+                                let loc_n = self.loc_node[&fn_loc];
+                                self.add_addr_of(dst, loc_n);
+                                applied = true;
+                            }
+                        }
+                        ReturnFlow::Copy { src } => {
+                            let src_n = self.var_node_id(src);
+                            self.add_copy(dst, src_n);
+                            applied = true;
+                        }
+                        ReturnFlow::Call { callee_name } => {
+                            let file = program.symbols.function(callee).file;
+                            let inner_candidates = program
+                                .symbols
+                                .resolve_function_candidates(&callee_name, Some(file));
+                            let mut inner_applied = false;
+                            for inner in inner_candidates.iter().copied() {
+                                if self.expand_return_flows(program, dst, inner, models, visited) {
+                                    inner_applied = true;
+                                }
+                            }
+                            // Bodyless leaf (`return realloc(p, n)` where
+                            // realloc has no tree body): fall back to the
+                            // modeled return effects.
+                            if !inner_applied {
+                                if let Some(model) = models.get(&callee_name) {
+                                    let params = inner_candidates
+                                        .iter()
+                                        .find(|c| !program.symbols.function(**c).params.is_empty())
+                                        .map(|c| program.symbols.function(*c).params.clone());
+                                    self.apply_return_model(dst, model, params.as_deref());
+                                    // Modeled heap/alias facts count as applied
+                                    // so outer frames do not re-apply them.
+                                    inner_applied = true;
+                                }
+                            }
+                            if inner_applied {
+                                applied = true;
+                            }
+                        }
                     }
                 }
-                ReturnFlow::AddrOfFn { callee: fn_id } => {
-                    // Trust the merge-remapped FnId (see AddrOfFn above).
-                    if let Some(&fn_loc) = self.fn_locations.get(&fn_id) {
-                        let loc_n = self.loc_node[&fn_loc];
-                        self.add_addr_of(dst, loc_n);
+                applied
+            }
+            // No body under the analyzed root: no real return facts here.
+            None => false,
+        }
+    }
+
+    /// Apply `return_alias` / `return_heap` model effects to a `CallReturn`
+    /// destination whose callee has no body under the analyzed root.
+    fn apply_return_model(
+        &mut self,
+        dst: PagNodeId,
+        model: &crate::summaries::FnModel,
+        params: Option<&[VarId]>,
+    ) {
+        for effect in &model.effects {
+            match effect {
+                Effect::ReturnAlias { param } => {
+                    if let Some(formal) = params.and_then(|ps| ps.get(*param as usize)) {
+                        let formal_n = self.var_node_id(*formal);
+                        self.add_copy(dst, formal_n);
                     }
                 }
-                ReturnFlow::Copy { src } => {
-                    let src_n = self.var_node_id(src);
-                    self.add_copy(dst, src_n);
+                Effect::ReturnHeap => {
+                    let name = &model.name;
+                    let loc = self.alloc_heap_loc(format!("{name}() storage"));
+                    let loc_n = self.loc_node[&loc];
+                    self.add_addr_of(dst, loc_n);
                 }
-                ReturnFlow::Call { callee_name } => {
-                    let file = program.symbols.function(callee).file;
-                    for inner in program
-                        .symbols
-                        .resolve_function_candidates(&callee_name, Some(file))
-                    {
-                        self.expand_return_flows(program, dst, inner, visited);
-                    }
-                }
+                _ => {}
             }
         }
+    }
+
+    /// Fresh anonymous storage location (malloc-family return summaries).
+    fn alloc_heap_loc(&mut self, desc: String) -> LocId {
+        let id = LocId(self.locations.len() as u32);
+        self.alloc_loc(AbstractLocation {
+            id,
+            kind: LocKind::Heap,
+            var: None,
+            fn_id: None,
+            field: None,
+            type_id: trace_ir::TypeId(0),
+            desc,
+        });
+        id
     }
 
     fn build_call_constraints(&mut self, program: &Program) {

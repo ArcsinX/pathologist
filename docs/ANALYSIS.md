@@ -264,16 +264,103 @@ as `flow_nodes` / `flow_edges` for the `inspect dataflow` command:
   covers scalar (non-pointer) arguments that the solver does not persist as
   PAG constraints.
 
-## Libc / external summaries
+## Function models (configurable summaries)
 
-Registered in `trace-analysis/src/summaries.rs` (`apply_call_summary`). Current stubs:
+Bodyless functions (libc, `_s`-family secure variants, vendor externs) contribute no
+IR: calls to them produce call edges but no data flow. **Function models** close this
+gap with declarative per-function summaries that relate parameters to each other.
 
-| Function | Model |
-|----------|-------|
-| `malloc`, `calloc`, `realloc` | No heap loc allocated yet (stub) |
-| `free` | No effect |
-| `memcpy`, `memmove` | **No pointer flow** |
-| Others | No effect |
+Models are matched by function name at every resolved call site — direct, recovered
+cross-TU, indirect, and external. A model applies regardless of whether the callee is
+defined in-tree, so project-specific wrappers can be described too.
+
+### Effect kinds
+
+| Effect | Semantics (may) | PAG realization |
+|--------|-----------------|-----------------|
+| `alias { dst, src }` | `pts(param[dst]) ⊇ pts(param[src])` after the call | persistent `Copy(actual[dst] ← actual[src])` |
+| `mem_copy { dst, src }` | contents of `*src` copied into `*dst` (memcpy family) | modeled as `alias` (see imprecision note) |
+| `content_store { ptr, value }` | `*param[ptr] = param[value]` | persistent `Store(actual[ptr] ← actual[value])` |
+| `return_alias { param }` | returned pointer may be `param[param]` | addr/copy edges into the `CallReturn` destination |
+| `return_heap` | returns a fresh storage location | fresh `Heap` loc per call site into the destination |
+| `clears { param }` | **terminator**: memory reachable via `param[param]` is zeroed by this call | no value introduction; terminator event exported |
+
+Effects attach to parameter positions (0-based) of the *actual arguments* recorded at
+the call site. Arguments that are not IR variables or functions (literals like
+`sizeof(...)` or `0`) simply do not participate.
+
+### Terminators (`clears`)
+
+A terminator states that the call **writes zeros** through a pointer parameter
+(`memset(p, 0, n)` family). Semantics under may-analysis:
+
+- The call introduces **no pointer values** through any modeled argument; data never
+  flows *out of* the terminator's parameters into memory or return values.
+- Kills are **not** modeled: the solver is flow-insensitive and inclusion-based
+  (monotone); values stored before a memset still reach later loads. This mirrors the
+  documented no-path-sensitivity stance — adding kills would be flow-sensitive
+  refinement requiring explicit design approval.
+- Every applied `clears` event is exported as a `terminator` flow node with a
+  `terminates` edge from the cleared argument, so `trace inspect dataflow` shows where
+  value chains are zeroed instead of silently stopping.
+
+### Built-in models
+
+Shipped in `trace-analysis/src/summaries.rs`; user configuration overrides same-name
+entries:
+
+| Function(s) | Effects |
+|-------------|---------|
+| `memcpy`, `memmove`, `strcpy`, `strncpy` | `mem_copy dst=0 src=1` |
+| `memcpy_s`, `memmove_s`, `strcpy_s`, `strncpy_s` | `mem_copy dst=0 src=2` |
+| `memset`, `memset_s` | `clears param=0` |
+| `malloc`, `calloc`, `zalloc`, `kmalloc` | `return_heap` |
+| `realloc` | `return_alias param=0`, `return_heap` |
+
+### Configuration format
+
+TOML, one `[model]` table per function; loaded via `--models <FILE>` (repeatable;
+later files override earlier entries and built-ins):
+
+```toml
+version = 1
+
+[[model]]
+name = "SbufImplAssign"
+effects = [
+    { kind = "mem_copy", dst = 0, src = 1 },
+]
+
+[[model]]
+name = "MyInit"
+effects = [
+    { kind = "content_store", ptr = 0, value = 1 },
+]
+
+[[model]]
+name = "MyPoolAlloc"
+effects = [ { kind = "return_heap" } ]
+
+# An explicitly empty effect list overrides (disables) a same-name built-in.
+[[model]]
+name = "memcpy"
+effects = []
+```
+
+### Documented imprecision
+
+- **`mem_copy` as aliasing**: true memcpy makes contents equal; modeling it as
+  `pts(dst) ⊇ pts(src)` reproduces every field/value read through the destination
+  (field cells and summaries of the source objects become visible), but stores through
+  the destination may also land in source-side field cells (over-approximation, sound
+  for may-analysis).
+- **Member-address arguments are skipped**: lowering resolves `&base.member` to the
+  base variable, so alias effects (`mem_copy`, `alias`) refuse to fire when either
+  side is a member/array-element address — copying the whole container would pollute
+  unrelated fields with the source's pointees. Such copies contribute no flow.
+- `return_alias`/`return_heap` fire only when the callee has **no body** under the
+  analyzed root; defined functions keep their exact return flow.
+- Terminators kill nothing (see above).
 
 ## Known imprecision
 
@@ -296,7 +383,8 @@ Registered in `trace-analysis/src/summaries.rs` (`apply_call_summary`). Current 
 - **IPC / process boundaries are unmodeled**: `HdfRemoteServiceObtain`-style
   registrations that hand a dispatcher to an external broker do not connect
   client proxies to server-side handler objects.
-- **`memcpy` / `memmove`**: invisible to analysis.
+- **`memcpy` / `memmove` family**: modeled through function models (see above);
+  unmodeled copier names remain invisible.
 - **C++ TUs** (`.cpp`) not indexed — impls only in C++ may be missing.
 - Macro-generated identifiers may be skipped when classified as macro-like callees.
 - Function pointer resolution is name/linkage based; dynamic `dlsym` not modeled.

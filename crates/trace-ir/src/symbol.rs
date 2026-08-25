@@ -64,6 +64,11 @@ pub struct CallSite {
     pub callee_fn_id: Option<FnId>,
     pub var_args: Vec<(u32, VarId)>,
     pub fn_args: Vec<(u32, FnId)>,
+    /// Argument positions recorded as `&base.member` / `&arr[i]` addresses.
+    /// Lowering resolves these to the *base* variable, so function-model
+    /// alias effects must not treat them as whole-object copies (copying
+    /// the containing object would pollute unrelated fields).
+    pub addr_of_member_args: Vec<u32>,
     pub span: Span,
     pub is_direct: bool,
 }

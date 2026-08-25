@@ -1099,10 +1099,18 @@ fn collect_call_at_node(
     }
     let mut var_args = Vec::new();
     let mut fn_args = Vec::new();
+    let mut addr_of_member_args = Vec::new();
     let mut arg_index = 0u32;
     if let Some(args_node) = node.child_by_field_name("arguments") {
         for arg in args_node.children(&mut args_node.walk()) {
             if arg.kind() != "(" && arg.kind() != ")" && arg.kind() != "," {
+                // Parameter positions are syntactic: every argument slot
+                // advances the index even when the expression yields no IR
+                // variable (literals, sizeof, casts). Compressing indices
+                // would mis-attribute later arguments to earlier formals
+                // (e.g. `memcpy_s(d, sizeof(*d), s, n)` recording `s` at
+                // position 1) and corrupt both interprocedural wiring and
+                // function-model effects.
                 if let Some(v) = resolve_expr_var(program, ctx, source, arg) {
                     // A field/subscript argument passes the *value* stored in
                     // that memory (e.g. `take(g_h.h, 0)` passes the fn-ptr in
@@ -1118,11 +1126,16 @@ fn collect_call_at_node(
                         }
                     }
                     var_args.push((arg_index, v));
-                    arg_index += 1;
+                    // `&base.member` / `&arr[i]` resolve to the base
+                    // variable; flag the position so function-model alias
+                    // effects can refuse to copy the whole container.
+                    if is_addr_of_member(source, arg) {
+                        addr_of_member_args.push(arg_index);
+                    }
                 } else if let Some(fn_id) = resolve_call_fn_arg(program, ctx, source, arg) {
                     fn_args.push((arg_index, fn_id));
-                    arg_index += 1;
                 }
+                arg_index += 1;
             }
         }
     }
@@ -1136,6 +1149,7 @@ fn collect_call_at_node(
         callee_fn_id: None,
         var_args,
         fn_args,
+        addr_of_member_args,
         span,
         is_direct,
     });
@@ -1795,6 +1809,26 @@ fn resolve_lvalue_var(
             .and_then(|n| resolve_lvalue_var(program, ctx, source, n)),
         _ => None,
     }
+}
+
+/// True when `node` is a `&base.member` or `&arr[i]` address expression.
+/// Such arguments resolve to the base variable, so alias-style function
+/// models must not treat them as whole-object copies.
+fn is_addr_of_member(source: &str, node: Node) -> bool {
+    if node.kind() != "pointer_expression" || pointer_op(source, node).as_deref() != Some("&") {
+        return false;
+    }
+    let mut inner = match pointer_arg(node) {
+        Some(arg) => arg,
+        None => return false,
+    };
+    while matches!(inner.kind(), "parenthesized_expression" | "cast_expression") {
+        inner = match inner.named_child(0) {
+            Some(child) => child,
+            None => return false,
+        };
+    }
+    matches!(inner.kind(), "field_expression" | "subscript_expression")
 }
 
 fn find_function_declarator(node: Node) -> Option<Node> {

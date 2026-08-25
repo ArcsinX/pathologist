@@ -154,8 +154,8 @@ PAG value-flow nodes (`trace inspect dataflow`). Always exported.
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | PAG node id (same id space as `points_to.var_node_id`) |
-| `kind` | TEXT | `var`, `loc`, or `call_target` (indirect-call site node) |
-| `label` | TEXT | Human-readable label (variable name, `loc:…`, `fn:…`) |
+| `kind` | TEXT | `var`, `loc`, `call_target` (indirect-call site node), or `terminator` (function-model clears event) |
+| `label` | TEXT | Human-readable label (variable name, `loc:…`, `fn:…`, `"memset_s clears arg0"`) |
 | `detail` | TEXT | Extra context (variable kind, enclosing function, …) |
 | `var_id` | INTEGER FK → `variables` | Variable this node belongs to (`NULL` for function locations) |
 | `fn_id` | INTEGER FK → `functions` | Enclosing function, when known |
@@ -182,6 +182,10 @@ Edge kinds:
   var→location map.
 - `call_arg` — actual-to-formal argument passing from `arg_flow_edges`,
   exported when no stronger constraint already connects the pair.
+- `terminates` — terminator visibility edge from a function-model `clears`
+  effect (e.g. `memset_s(dst, …)`): the actual-argument node flows into a
+  synthetic `terminator` node recording the call site. No points-to value
+  is produced; the edge documents where a buffer's prior contents stop.
 
 **Indexes:** `flow_edges(src_node)`, `flow_edges(dst_node)`
 

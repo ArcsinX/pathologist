@@ -13,6 +13,8 @@ pub struct ExportOptions {
     pub include_points_to: bool,
     /// Export types, all variables, and PAG locations (slower, larger DB).
     pub full_detail: bool,
+    /// Function-model config files used by the analysis run (metadata only).
+    pub model_files: Vec<String>,
 }
 
 impl ExportOptions {
@@ -21,6 +23,7 @@ impl ExportOptions {
             output,
             include_points_to: false,
             full_detail: false,
+            model_files: Vec::new(),
         }
     }
 }
@@ -51,6 +54,7 @@ pub fn export_to_sqlite(
             "defines": program.defines,
             "include_points_to": opts.include_points_to,
             "full_detail": opts.full_detail,
+            "model_files": opts.model_files,
         })
         .to_string();
 
@@ -347,6 +351,45 @@ fn export_flow_graph(
             }
             (None, None) => {}
         }
+    }
+    // Terminator events (`clears` model effects): a synthetic terminal node
+    // per (call site, parameter) with an edge from the cleared actual, so
+    // dataflow walks show where value chains are zeroed.
+    let mut next_node_id = pag.nodes.len() as u64;
+    let mut seen_terms: FxHashSet<(trace_ir::CallSiteId, u32)> = FxHashSet::default();
+    for &(cs_id, param) in &analysis.terminator_events {
+        if !seen_terms.insert((cs_id, param)) {
+            continue;
+        }
+        let Some(site) = program.symbols.call_site_by_id(cs_id) else {
+            continue;
+        };
+        let Some(&actual) = site
+            .var_args
+            .iter()
+            .find(|(j, _)| *j == param)
+            .map(|(_, v)| v)
+        else {
+            continue;
+        };
+        let Some(&actual_node) = pag.var_node.get(&actual) else {
+            continue;
+        };
+        let term_node = next_node_id;
+        next_node_id += 1;
+        nodes.execute(params![
+            term_node,
+            "terminator",
+            format!("{} clears arg{param}", site.callee_name),
+            format!(
+                "call @{} in {}",
+                site.span.line,
+                program.symbols.function(site.caller).name
+            ),
+            Option::<i64>::None,
+            Some(site.caller.0 as i64),
+        ])?;
+        edge_rows.push((actual_node.0, term_node as u32, "terminates"));
     }
     edge_rows.sort_unstable();
     edge_rows.dedup();

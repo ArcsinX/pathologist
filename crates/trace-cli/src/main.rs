@@ -42,6 +42,9 @@ enum Commands {
         /// Export full IR detail (types, all variables, PAG locations). Default: call graph + arg-flow only.
         #[arg(long)]
         full_export: bool,
+        /// Function-model TOML file (repeatable; overrides built-ins by name).
+        #[arg(long = "models")]
+        models: Vec<PathBuf>,
     },
     /// Inspect an existing analysis database.
     Inspect {
@@ -117,6 +120,7 @@ fn main() -> Result<()> {
             jobs,
             debug_points_to,
             full_export,
+            models,
         } => run_analyze(
             target,
             output,
@@ -125,11 +129,13 @@ fn main() -> Result<()> {
             jobs,
             debug_points_to,
             full_export,
+            models,
         ),
         Commands::Inspect { db, command } => run_inspect(db, command),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_analyze(
     target: PathBuf,
     output: PathBuf,
@@ -138,6 +144,7 @@ fn run_analyze(
     jobs: Option<usize>,
     debug_points_to: bool,
     full_export: bool,
+    model_files: Vec<PathBuf>,
 ) -> Result<()> {
     let jobs = jobs.unwrap_or_else(|| {
         std::thread::available_parallelism()
@@ -145,6 +152,27 @@ fn run_analyze(
             .unwrap_or(1)
             .max(1)
     });
+    let mut models = trace_analysis::FnModelSet::builtin();
+    for path in &model_files {
+        let src = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read models file {}", path.display()))?;
+        models
+            .merge_toml_str(&src)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    }
+    let models = std::sync::Arc::new(models);
+    if model_files.is_empty() {
+        eprintln!(
+            "models: built-in ({} functions); add --models <file.toml> for project-specific summaries",
+            models.len()
+        );
+    } else {
+        eprintln!(
+            "models: {} functions (built-ins + {} config file(s))",
+            models.len(),
+            model_files.len()
+        );
+    }
     let mut opts = PreprocessOptions::new();
     for inc in includes {
         opts.include_paths.push(inc);
@@ -198,6 +226,7 @@ fn run_analyze(
         &program,
         AnalyzeOptions {
             retain_points_to: debug_points_to,
+            models,
         },
     );
     let indirect = analysis
@@ -221,6 +250,10 @@ fn run_analyze(
             output: output.clone(),
             include_points_to: debug_points_to,
             full_detail: full_export,
+            model_files: model_files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
         },
     )
     .with_context(|| format!("failed to export to {}", output.display()))?;
