@@ -50,6 +50,8 @@ Lowered from C during parse. Mapped to PAG in `Pag::build_flow_constraints`.
 | `GepField { dst, base, field }` | field address | `&obj.field`, `p->field` |
 | `ArrayFnMember { array, callee }` | fn-ptr array init member | `{ fn0, fn1 }` |
 | `CallReturn { dst, callee_name }` | `dst = callee()` | `p = GetOps()` |
+| `CallReturnIndirect { dst, callee_var }` | `dst = *callee_var()` | `sbuf->impl->readBuffer(...)` (indirect return) |
+| `NewHeap { dst }` | heap allocation | `new T(...)` (C++ ctor result) |
 
 ### Return-value flow
 
@@ -72,6 +74,10 @@ This models patterns like:
 subDev->subDevOps = GetSensorDeviceOps();  // return &g_sensorDeviceOps
 subDev.subDevOps->setConfig(subDev);
 ```
+
+**`CallReturnIndirect`** is the indirect-call analogue of `CallReturn`. The callee is resolved by the solver when indirect call targets are known (via function-pointer analysis). The `callee_var` is a synthetic load variable that holds the resolved function pointer; the solver wires return flows from each resolved target into `dst`.
+
+**`NewHeap`** represents C++ `new T(...)` allocations. The PAG allocates a heap location typed to the allocated struct and adds an `AddrOf` edge from `dst` to the heap location. The solver then propagates into the struct's fields, enabling resolution of function pointers stored by constructors (e.g., `MParcelImplInterfaceAssign` writing into `HdfSBufImpl.readBuffer`).
 
 ## Program Assignment Graph (PAG)
 

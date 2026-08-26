@@ -57,6 +57,9 @@ pub struct Pag {
     /// Fn locations parked into an array var by `ArrayFnMember` inits
     /// (`{ {.., Fn}, .. }`); reachable through any element field load.
     pub array_fn_members: FxHashMap<VarId, Vec<LocId>>,
+    /// Maps callee_var load-var to the PAG node that should receive the
+    /// return value of indirect calls whose function pointer is that var.
+    pub indirect_return_dst: FxHashMap<VarId, PagNodeId>,
     pub indices: SolverIndices,
 }
 
@@ -185,6 +188,40 @@ impl Pag {
                     .push(cs.id);
             }
         }
+    }
+
+    /// Index constraints added after `build_indices` ran (e.g. from
+    /// `expand_return_flows` during the solver worklist loop).
+    pub(crate) fn index_new_constraints(&mut self, from: usize) -> Vec<PagNodeId> {
+        let mut srcs = Vec::new();
+        for i in from..self.constraints.len() {
+            let c = &self.constraints[i];
+            match c.kind {
+                ConstraintKind::Copy => {
+                    self.indices.copy_src.entry(c.src).or_default().push(i);
+                    srcs.push(c.src);
+                }
+                ConstraintKind::AddrOf => {
+                    self.indices.addr_of_dst.entry(c.dst).or_default().push(i);
+                    srcs.push(c.src);
+                }
+                ConstraintKind::Load => {
+                    self.indices.load_src.entry(c.src).or_default().push(i);
+                    srcs.push(c.src);
+                }
+                ConstraintKind::Store => {
+                    self.indices.store_dst.entry(c.dst).or_default().push(i);
+                    self.indices.store_src.entry(c.src).or_default().push(i);
+                    srcs.push(c.src);
+                    srcs.push(c.dst);
+                }
+                ConstraintKind::Gep => {
+                    self.indices.gep_src.entry(c.src).or_default().push(i);
+                    srcs.push(c.src);
+                }
+            }
+        }
+        srcs
     }
 
     fn alloc_field_loc(
@@ -434,11 +471,28 @@ impl Pag {
                         }
                     }
                 }
+                FlowConstraint::CallReturnIndirect { dst, callee_var } => {
+                    // Record the return destination so the solver can expand
+                    // return flows when it resolves indirect call targets.
+                    // INVARIANT: each callee_var maps to exactly one dst —
+                    // lowering must not reuse callee load vars across sites.
+                    let dst_n = self.var_node_id(*dst);
+                    self.indirect_return_dst.insert(*callee_var, dst_n);
+                }
+                FlowConstraint::NewHeap { dst } => {
+                    let dst_n = self.var_node_id(*dst);
+                    let var = program.symbols.variable(*dst);
+                    let type_id = var.type_id;
+                    let loc = self.alloc_heap_loc("new heap".to_string());
+                    let loc_n = self.loc_node[&loc];
+                    self.locations[loc.0 as usize].type_id = type_id;
+                    self.add_addr_of(dst_n, loc_n);
+                }
             }
         }
     }
 
-    fn expand_return_flows(
+    pub(crate) fn expand_return_flows(
         &mut self,
         program: &Program,
         dst: PagNodeId,

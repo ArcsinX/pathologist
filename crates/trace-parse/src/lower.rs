@@ -57,6 +57,17 @@ struct LowerContext {
     class_ctx: Option<ClassCtx>,
     /// True for .cpp/.cc/.cxx TUs — gates the C++-specific lowering paths.
     is_cpp: bool,
+    /// `new_expression` node IDs already handled by `expr_to_rhs_flow` so
+    /// `walk_function_body` skips them (avoids duplicate call sites with
+    /// incorrect `this`-parameter wiring).
+    handled_new_exprs: RefCell<std::collections::HashSet<usize>>,
+    /// Cache for `resolve_callee_with_loads`: maps the `func` node id of a
+    /// field-expression callee to the load variable created for the fn-ptr
+    /// load.  Without this, `emit_field_value_store` (via `resolve_callee_var`)
+    /// and the later `collect_call_at_node` (via `resolve_callee_with_loads`)
+    /// would create *two different* load variables for the same expression,
+    /// breaking the `CallReturnIndirect` → `indirect_return_dst` mapping.
+    callee_load_cache: RefCell<HashMap<usize, Option<VarId>>>,
 }
 
 /// C++ class scope during member lowering.
@@ -442,6 +453,8 @@ fn process_indexed_file(
         using_nss: Vec::new(),
         class_ctx: None,
         is_cpp: crate::parse::SourceLang::from_path(path) == crate::parse::SourceLang::Cpp,
+        handled_new_exprs: RefCell::new(std::collections::HashSet::new()),
+        callee_load_cache: RefCell::new(HashMap::new()),
     };
     lower_tree(program, &mut ctx, &parsed.source, parsed.tree.root_node());
     resolve_pending_fn_refs(program, &ctx);
@@ -572,7 +585,12 @@ fn lower_tree(program: &mut Program, ctx: &mut LowerContext, source: &str, node:
         "declaration" => lower_declaration(program, ctx, source, node, None),
         "struct_specifier" | "union_specifier" | "class_specifier" => {
             let tag = lower_struct_specifier(program, ctx, source, node);
-            if node.kind() == "class_specifier" {
+            // In C++, `struct` is identical to `class` except for default
+            // visibility — structs may have constructors, destructors, and
+            // member functions that must be lowered just like classes.
+            if node.kind() == "class_specifier"
+                || (ctx.is_cpp && node.kind() == "struct_specifier")
+            {
                 lower_class_members(program, ctx, source, node, &tag);
             }
         }
@@ -1293,15 +1311,22 @@ fn lower_one_declarator(
                 Some(name)
             }
             _ => None,
-        } {
+        }         {
             let span = node_span(program, ctx, span_node);
-            let call_args = collect_call_args(program, ctx, source, ctor_args);
+            let (mut var_args, fn_args, addr_of_member_args) =
+                collect_call_args(program, ctx, source, ctor_args);
+            // The implicit `this` (param 0) points to the object being
+            // constructed; shift explicit args to start at index 1.
+            for v in &mut var_args {
+                v.0 += 1;
+            }
+            var_args.insert(0, (0, var_id));
             emit_member_sites(
                 program,
                 ctx.current_fn.unwrap(),
                 &cls,
                 &trace_ir::MethodKind::Ctor,
-                call_args,
+                (var_args, fn_args, addr_of_member_args),
                 span,
             );
         }
@@ -1518,21 +1543,33 @@ fn walk_function_body(
         "call_expression" => collect_call_at_node(program, ctx, source, node, caller),
         "return_statement" => collect_return_statement(program, ctx, source, node, caller),
         // C++ object lifecycle: constructor invocations and destructor runs.
+        #[allow(clippy::collapsible_match)]
         "new_expression" if ctx.is_cpp => {
-            if let Some(cls) = new_expression_class(program, ctx, source, node) {
-                let args = node
-                    .children(&mut node.walk())
-                    .find(|c| c.kind() == "argument_list");
-                let span = node_span(program, ctx, node);
-                let call_args = collect_call_args(program, ctx, source, args);
-                emit_member_sites(
-                    program,
-                    caller,
-                    &cls,
-                    &trace_ir::MethodKind::Ctor,
-                    call_args,
-                    span,
-                );
+            // Skip if already handled by expr_to_rhs_flow (declaration init).
+            if !ctx.handled_new_exprs.borrow().contains(&node.id()) {
+                if let Some(cls) = new_expression_class(program, ctx, source, node) {
+                    let args = node
+                        .children(&mut node.walk())
+                        .find(|c| c.kind() == "argument_list");
+                    let span = node_span(program, ctx, node);
+                    let (mut var_args, fn_args, addr_of_member_args) =
+                        collect_call_args(program, ctx, source, args);
+                    // Shift explicit args by 1 so param 0 (`this`) does not
+                    // collide with the first explicit argument.  We leave
+                    // `this` unwired; the solver creates an imprecise summary
+                    // node for it (sound over-approximation).
+                    for v in &mut var_args {
+                        v.0 += 1;
+                    }
+                    emit_member_sites(
+                        program,
+                        caller,
+                        &cls,
+                        &trace_ir::MethodKind::Ctor,
+                        (var_args, fn_args, addr_of_member_args),
+                        span,
+                    );
+                }
             }
         }
         "delete_expression" if ctx.is_cpp => {
@@ -1778,6 +1815,8 @@ fn collect_call_args(
                     if is_addr_of_member(source, arg) {
                         addr_of_member_args.push(arg_index);
                     }
+                } else if let Some(gep) = addr_of_field_path(program, ctx, source, arg) {
+                    var_args.push((arg_index, gep));
                 } else if let Some(fn_id) = resolve_call_fn_arg(program, ctx, source, arg) {
                     fn_args.push((arg_index, fn_id));
                 }
@@ -2331,6 +2370,14 @@ fn emit_field_value_store(
                             callee_name,
                         });
                         true
+                    } else if let Some(callee_var) =
+                        resolve_callee_var(program, ctx, source, value_node)
+                    {
+                        program.flow.push(FlowConstraint::CallReturnIndirect {
+                            dst: ret_temp,
+                            callee_var,
+                        });
+                        true
                     } else {
                         false
                     }
@@ -2470,6 +2517,29 @@ fn deref_operand(node: Node) -> Option<Node> {
     pointer_arg(node)
 }
 
+/// Inside a C++ class method, a bare identifier like `infImpl` that is a
+/// member of the enclosing class should be implicitly treated as
+/// `this->infImpl`.  Returns the GEP temp VarId representing the member
+/// address when the identifier matches a class field, `None` otherwise.
+fn resolve_implicit_this_member(
+    program: &mut Program,
+    ctx: &LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<VarId> {
+    if !ctx.is_cpp {
+        return None;
+    }
+    let cls = ctx.class_ctx.as_ref()?;
+    let cls_name = &cls.qual_name;
+    let struct_tid = program.types.type_id_by_tag(cls_name, trace_ir::TypeKind::Struct)?;
+    let field_name = node_text(source, &node);
+    let field_id = program.types.field_id_by_name(struct_tid, field_name)?;
+    let fn_id = ctx.current_fn?;
+    let this_var = *program.symbols.function(fn_id).params.first()?;
+    Some(alloc_gep_temp(program, ctx, node, this_var, field_id))
+}
+
 /// Lower `&base.f1.f2` into a gep-temp chain so the resulting pointer
 /// targets the field's own abstract location (with the field's type),
 /// not the flattened outer instance. Returns the final temp var.
@@ -2480,15 +2550,30 @@ fn addr_of_field_path(
     arg: Node,
 ) -> Option<VarId> {
     let peeled = peel_expression(arg);
-    if peeled.kind() != "field_expression" {
-        return None;
+    // &field_expression → direct field path
+    if peeled.kind() == "field_expression" {
+        let (base, field_ids) = decompose_field_path(program, ctx, source, peeled)?;
+        let mut current = base;
+        for fid in field_ids {
+            current = alloc_gep_temp(program, ctx, peeled, current, fid);
+        }
+        return Some(current);
     }
-    let (base, field_ids) = decompose_field_path(program, ctx, source, peeled)?;
-    let mut current = base;
-    for fid in field_ids {
-        current = alloc_gep_temp(program, ctx, peeled, current, fid);
+    // &identifier → check for C++ implicit this->member
+    if peeled.kind() == "identifier" {
+        if let Some(gep) = resolve_implicit_this_member(program, ctx, source, peeled) {
+            return Some(gep);
+        }
     }
-    Some(current)
+    // &ptr_expr → peel through pointer_expression with &
+    if peeled.kind() == "pointer_expression"
+        && pointer_op(source, peeled).as_deref() == Some("&")
+    {
+        if let Some(inner) = pointer_arg(peeled) {
+            return addr_of_field_path(program, ctx, source, inner);
+        }
+    }
+    None
 }
 
 fn expr_to_store_src(
@@ -2514,7 +2599,7 @@ fn expr_to_store_src(
 
 fn expr_to_rhs_flow(
     program: &mut Program,
-    ctx: &LowerContext,
+    ctx: &mut LowerContext,
     source: &str,
     node: Node,
     dst: VarId,
@@ -2529,6 +2614,8 @@ fn expr_to_rhs_flow(
                 Some(FlowConstraint::AddrOfFn { dst, callee })
             } else if let Some(src) = lookup_var(ctx, program, name) {
                 Some(FlowConstraint::Copy { dst, src })
+            } else if let Some(gep) = resolve_implicit_this_member(program, ctx, source, node) {
+                Some(FlowConstraint::Load { dst, src: gep })
             } else {
                 // Might be a function defined later in the unit.
                 ctx.pending.borrow_mut().push(PendingFnRef::RhsIdent {
@@ -2590,6 +2677,52 @@ fn expr_to_rhs_flow(
                     return Some(FlowConstraint::Load { dst, src: tmp });
                 }
                 current = alloc_gep_temp(program, ctx, node, current, *fid);
+            }
+            None
+        }
+        "new_expression" if ctx.is_cpp => {
+            if let Some(cls) = new_expression_class(program, ctx, source, node) {
+                // Allocate a temp representing the heap allocation result.
+                // The constructor's implicit `this` parameter (param 0) is
+                // wired to this temp; explicit args start at index 1.
+                let alloc_tmp = alloc_ret_temp(program, ctx, node);
+                // Give alloc_tmp the class pointer type so the heap location
+                // created by NewHeap carries the correct struct type.
+                if let Some(struct_tid) =
+                    program.types.type_id_by_tag(&cls, trace_ir::TypeKind::Struct)
+                {
+                    program.symbols.variable_mut(alloc_tmp).type_id = struct_tid;
+                }
+                let args = node
+                    .children(&mut node.walk())
+                    .find(|c| c.kind() == "argument_list");
+                let span = node_span(program, ctx, node);
+                let (mut var_args, fn_args, addr_of_member_args) =
+                    collect_call_args(program, ctx, source, args);
+                for v in &mut var_args {
+                    v.0 += 1;
+                }
+                var_args.insert(0, (0, alloc_tmp));
+                if let Some(caller) = ctx.current_fn {
+                    emit_member_sites(
+                        program,
+                        caller,
+                        &cls,
+                        &trace_ir::MethodKind::Ctor,
+                        (var_args, fn_args, addr_of_member_args),
+                        span,
+                    );
+                }
+                ctx.handled_new_exprs.borrow_mut().insert(node.id());
+                // Create a heap location for the allocated object so the
+                // constructor's `this` parameter has concrete pointees.
+                program
+                    .flow
+                    .push(FlowConstraint::NewHeap { dst: alloc_tmp });
+                return Some(FlowConstraint::Copy {
+                    dst,
+                    src: alloc_tmp,
+                });
             }
             None
         }
@@ -2896,6 +3029,17 @@ fn resolve_fn_ref(program: &Program, ctx: &LowerContext, source: &str, node: Nod
     None
 }
 
+fn resolve_callee_var(
+    program: &mut Program,
+    ctx: &mut LowerContext,
+    source: &str,
+    node: Node,
+) -> Option<VarId> {
+    let func = node.child_by_field_name("function")?;
+    let (_, _, var) = resolve_callee_with_loads(program, ctx, source, func);
+    var
+}
+
 fn resolve_callee_with_loads(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -2906,11 +3050,20 @@ fn resolve_callee_with_loads(
     if node.kind() == "field_expression" {
         if let Some((base, field_ids)) = decompose_field_path(program, ctx, source, node) {
             let text = field_callee_text(source, node);
+            // Return a cached load var if we already created one for this
+            // node (avoids duplicate loads that break CallReturnIndirect
+            // mapping).
+            let cached = ctx.callee_load_cache.borrow().get(&node.id()).cloned();
+            if let Some(cached_var) = cached {
+                return (text, false, cached_var);
+            }
             if let Some(load_var) =
                 emit_field_fn_ptr_load(program, ctx, source, node, base, &field_ids)
             {
+                ctx.callee_load_cache.borrow_mut().insert(node.id(), Some(load_var));
                 return (text, false, Some(load_var));
             }
+            ctx.callee_load_cache.borrow_mut().insert(node.id(), None);
         }
     }
     resolve_callee(program, ctx, source, node)

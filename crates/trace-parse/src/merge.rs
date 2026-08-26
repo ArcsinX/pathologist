@@ -230,6 +230,8 @@ fn flow_vars(flow: &FlowConstraint) -> impl Iterator<Item = VarId> + '_ {
         FlowConstraint::GepField { dst, base, .. } => vec![*dst, *base],
         FlowConstraint::ArrayFnMember { array, .. } => vec![*array],
         FlowConstraint::CallReturn { dst, .. } => vec![*dst],
+        FlowConstraint::CallReturnIndirect { dst, callee_var } => vec![*dst, *callee_var],
+        FlowConstraint::NewHeap { dst, .. } => vec![*dst],
     }
     .into_iter()
 }
@@ -315,6 +317,11 @@ fn remap_flow(
             dst: rv(dst),
             callee_name,
         },
+        FlowConstraint::CallReturnIndirect { dst, callee_var } => FlowConstraint::CallReturnIndirect {
+            dst: rv(dst),
+            callee_var: rv(callee_var),
+        },
+        FlowConstraint::NewHeap { dst } => FlowConstraint::NewHeap { dst: rv(dst) },
     }
 }
 

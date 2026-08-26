@@ -72,7 +72,7 @@ impl FnModelSet {
         for n in ["memset", "memset_s"] {
             reg(n, vec![Effect::Clears { param: 0 }]);
         }
-        for n in ["malloc", "calloc", "zalloc", "kmalloc"] {
+        for n in ["malloc", "calloc", "zalloc", "kmalloc", "OsalMemAlloc", "OsalMemCalloc"] {
             reg(n, vec![Effect::ReturnHeap]);
         }
         reg(

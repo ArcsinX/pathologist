@@ -3,7 +3,7 @@ use crate::constraints::{
 };
 use crate::pag::{Pag, PagNodeKind};
 use crate::summaries::{Effect, FnModelSet};
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use rustc_hash::{FxHashMap, FxHashSet};
 use trace_ir::{CallSiteId, FnId, LocId, PagNodeId, Program, StorageClass, VarId};
 
@@ -14,6 +14,9 @@ pub struct AnalyzeOptions {
     /// Function models matched by callee name (built-ins plus any user
     /// configuration). See `docs/ANALYSIS.md`, "Function models".
     pub models: std::sync::Arc<FnModelSet>,
+    /// Solver pop budget (None = unlimited). Override via
+    /// `TRACE_SOLVE_BUDGET_POPS=<n>` env var; =0 restores unlimited.
+    pub solve_budget: Option<u64>,
 }
 
 impl Default for AnalyzeOptions {
@@ -21,6 +24,7 @@ impl Default for AnalyzeOptions {
         Self {
             retain_points_to: false,
             models: std::sync::Arc::new(FnModelSet::builtin()),
+            solve_budget: Some(800_000),
         }
     }
 }
@@ -42,7 +46,7 @@ pub fn analyze(program: &Program) -> (Pag, AnalysisResult) {
 
 pub fn analyze_with_options(program: &Program, opts: AnalyzeOptions) -> (Pag, AnalysisResult) {
     let mut pag = Pag::build_with_models(program, &opts.models);
-    let mut result = solve(&mut pag, program, opts.retain_points_to, &opts.models);
+    let mut result = solve(&mut pag, program, opts.retain_points_to, &opts.models, opts.solve_budget);
     let call_edges = result.call_edges.clone();
     let wired = result.wired_arg_flow.clone();
     extract_arg_flow(program, &call_edges, &wired, &mut result);
@@ -61,7 +65,7 @@ struct SolverState {
     /// many nodes hold) append a given (node, loc) pair once per pending
     /// cycle instead of unboundedly inflating delta vectors.
     delta_pending: FxHashSet<(PagNodeId, LocId)>,
-    memory_pts: FxHashMap<LocId, FxHashSet<LocId>>,
+    memory_pts: FxHashMap<LocId, IndexSet<LocId>>,
     loc_nodes: FxHashMap<LocId, FxHashSet<PagNodeId>>,
     worklist: Vec<PagNodeId>,
     queued: FxHashSet<PagNodeId>,
@@ -82,6 +86,9 @@ struct SolverState {
     /// Parameter count per function location (only when > 0; old-style `()`
     /// declarations stay unfiltered).
     fn_arity: FxHashMap<LocId, usize>,
+    /// Last-seen `memory_pts[loc]` size per `(dst, loc)` pair, used to skip
+    /// redundant `merge_memory_into` iterations when memory hasn't grown.
+    merge_sizes: FxHashMap<(PagNodeId, LocId), usize>,
 }
 
 /// Declared content type of a memory cell / points-to slot, as far as it is
@@ -120,13 +127,22 @@ impl SolverState {
         }
     }
 
-    /// A memory write changed `memory_pts[loc]`: every node whose points-to
-    /// contains `loc` must reprocess it (loads re-merge the fresh content).
-    /// Under difference propagation an empty delta would make them skip, so
-    /// the location is appended to their delta explicitly (deduped).
-    fn touch_loc_holders(&mut self, loc: LocId) {
+    /// A memory write changed `memory_pts[loc]`: only nodes that LOAD from
+    /// `loc` (i.e. are the pointer source of a Load constraint) benefit from
+    /// re-merging.  Under difference propagation an empty delta would make
+    /// them skip, so the location is appended to their delta explicitly
+    /// (deduped).  Pushing ALL holders was the dominant budget burn on large
+    /// trees — copy-only holders re-popped with no effect.
+    fn touch_loc_holders(
+        &mut self,
+        loc: LocId,
+        load_src: &FxHashMap<PagNodeId, Vec<usize>>,
+    ) {
         if let Some(nodes) = self.loc_nodes.get(&loc).cloned() {
             for n in nodes {
+                if !load_src.contains_key(&n) {
+                    continue;
+                }
                 self.record_delta(n, &[loc]);
                 self.push(n);
             }
@@ -142,41 +158,72 @@ impl SolverState {
         }
     }
 
-    /// Merge `memory_pts[mem_loc]` into `pts[dst]` without cloning. Field-
-    /// disjoint borrows keep this allocation-free apart from a tiny staging
-    /// vector of newly added locations.
+    /// Skip `merge_memory_into` when `memory_pts[mem_loc]` hasn't grown
+    /// since the last merge for this `(dst, mem_loc)` pair.  Breaks the
+    /// touch_loc_holders → re-merge cycle that dominated budget on large
+    /// trees.
+    fn merge_memory_into_if_grown(&mut self, dst: PagNodeId, mem_loc: LocId) {
+        let cur = self.memory_pts.get(&mem_loc).map(|m| m.len()).unwrap_or(0);
+        let key = (dst, mem_loc);
+        let prev = self.merge_sizes.get(&key).copied().unwrap_or(0);
+        if cur > prev {
+            self.merge_memory_into(dst, mem_loc);
+            self.merge_sizes.insert(key, cur);
+        }
+    }
+
+    /// Merge `memory_pts[mem_loc]` into `pts[dst]` without cloning.
+    /// Iterates only entries added since the last merge for this pair
+    /// (index-based since `memory_pts` uses `IndexSet`).
     fn merge_memory_into(&mut self, dst: PagNodeId, mem_loc: LocId) {
         let Some(mem) = self.memory_pts.get(&mem_loc) else {
             return;
         };
-        let mut new_locs: Vec<LocId> = Vec::new();
+        let key = (dst, mem_loc);
+        let prev_len = self.merge_sizes.get(&key).copied().unwrap_or(0);
+        let cur_len = mem.len();
+        if cur_len <= prev_len {
+            return;
+        }
+        let new_locs: Vec<LocId> = (prev_len..cur_len)
+            .filter_map(|i| {
+                let loc = mem[i];
+                if self.arity_allows(mem_loc, loc) {
+                    Some(loc)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if new_locs.is_empty() {
+            self.merge_sizes.insert(key, cur_len);
+            return;
+        }
+        let mut truly_new: Vec<LocId> = Vec::new();
         {
-            let mem: Vec<LocId> = mem
-                .iter()
-                .copied()
-                .filter(|&loc| self.arity_allows(mem_loc, loc))
-                .collect();
             let entry = self.pts.entry(dst).or_default();
-            for loc in mem.iter() {
-                if !entry.contains(loc) {
-                    new_locs.push(*loc);
+            for &loc in &new_locs {
+                if !entry.contains(&loc) {
+                    truly_new.push(loc);
                 }
             }
         }
-        if new_locs.is_empty() {
+        if truly_new.is_empty() {
+            self.merge_sizes.insert(key, cur_len);
             return;
         }
         {
             let entry = self.pts.get_mut(&dst).expect("pts entry exists");
-            for loc in &new_locs {
+            for loc in &truly_new {
                 entry.insert(*loc);
             }
         }
-        for loc in &new_locs {
+        for loc in &truly_new {
             self.loc_nodes.entry(*loc).or_default().insert(dst);
         }
-        self.record_delta(dst, &new_locs);
+        self.record_delta(dst, &truly_new);
         self.push(dst);
+        self.merge_sizes.insert(key, cur_len);
     }
 }
 
@@ -202,6 +249,7 @@ fn solve(
     program: &Program,
     retain_points_to: bool,
     models: &FnModelSet,
+    budget_override: Option<u64>,
 ) -> AnalysisResult {
     let mut st = SolverState {
         pts: FxHashMap::default(),
@@ -217,6 +265,7 @@ fn solve(
         wired_model_edges: FxHashSet::default(),
         slot_guard: FxHashMap::default(),
         fn_arity: FxHashMap::default(),
+        merge_sizes: FxHashMap::default(),
     };
     // Per-location slot guards and per-function parameter counts for
     // signature-aware propagation.
@@ -242,6 +291,36 @@ fn solve(
     for c in &pag.constraints {
         st.push(c.dst);
         st.push(c.src);
+    }
+
+    // Pre-seed addr-of constraints: these are purely structural and don't
+    // depend on points-to content. Seeding them upfront avoids a wasteful
+    // two-pop cycle per variable (first pop for seen_once, second for
+    // actual propagation) and dramatically improves worklist drain on
+    // large PAGs where LIFO ordering buries early-pushed nodes.
+    for c in pag.constraints.iter() {
+        if matches!(c.kind, ConstraintKind::AddrOf) {
+            if let PagNodeKind::Loc(loc) = pag.nodes[c.src.0 as usize].kind {
+                let inserted = {
+                    let entry = st.pts.entry(c.dst).or_default();
+                    entry.insert(loc)
+                };
+                if inserted {
+                    st.loc_nodes.entry(loc).or_default().insert(c.dst);
+                    st.record_delta(c.dst, &[loc]);
+                    st.push(c.dst);
+                }
+            }
+        }
+    }
+
+    // Mark all nodes that received pre-seeded addr-of points as
+    // already processed for addr-of so the solver's seen_once path
+    // doesn't duplicate the seeding.
+    for c in &pag.constraints {
+        if matches!(c.kind, ConstraintKind::AddrOf) {
+            st.seen_once.insert(c.dst);
+        }
     }
 
     let mut call_edges: Vec<CallGraphEdge> = Vec::new();
@@ -325,11 +404,10 @@ fn solve(
     // A deterministic pop cap converts a hang into a partial result plus a
     // visible warning; normal corpora converge far below it. Override with
     // TRACE_SOLVE_BUDGET_POPS=<n>; =0 restores unlimited solving.
-    const DEFAULT_SOLVE_BUDGET_POPS: u64 = 200_000;
     let solve_budget: Option<u64> = match std::env::var("TRACE_SOLVE_BUDGET_POPS") {
         Ok(v) if v.trim() == "0" => None,
-        Ok(v) => v.parse::<u64>().ok().or(Some(DEFAULT_SOLVE_BUDGET_POPS)),
-        Err(_) => Some(DEFAULT_SOLVE_BUDGET_POPS),
+        Ok(v) => v.parse::<u64>().ok().or(budget_override),
+        Err(_) => budget_override,
     };
 
     if std::env::var("TRACE_SOLVER_STATS").is_ok() {
@@ -408,7 +486,7 @@ fn solve(
                                 pag.ensure_field_summary_for_var(program, base_var, field)
                             {
                                 propagate_locs(&mut st, dst, [summary]);
-                                st.merge_memory_into(dst, summary);
+                                st.merge_memory_into_if_grown(dst, summary);
                             }
                         }
                     }
@@ -442,7 +520,7 @@ fn solve(
                         add_pts(&mut st, dst, loc);
                     } else {
                         w_load += 1;
-                        st.merge_memory_into(dst, loc);
+                        st.merge_memory_into_if_grown(dst, loc);
                     }
                 }
             }
@@ -525,7 +603,7 @@ fn solve(
                         // loaded) still observe stores that lowering recorded
                         // against the cell without an intervening load temp.
                         for fl in targets.into_iter().flatten() {
-                            st.merge_memory_into(dst, fl);
+                            st.merge_memory_into_if_grown(dst, fl);
                         }
                         // ArrayFnMember element fns: reachable through
                         // the array itself or any pointer to an element.
@@ -553,7 +631,7 @@ fn solve(
                             pag.ensure_field_summary_for_var(program, base_var, field)
                         {
                             propagate_locs(&mut st, dst, [summary]);
-                            st.merge_memory_into(dst, summary);
+                            st.merge_memory_into_if_grown(dst, summary);
                         }
                     }
                     continue 'gep;
@@ -572,6 +650,23 @@ fn solve(
                 let mut new_callees = Vec::new();
                 for &loc in delta.iter() {
                     if let Some(fn_id) = fn_for_loc(pag, loc) {
+                        // If the resolved callee is undefined (e.g. a weak
+                        // forward declaration), also pull in defined
+                        // candidates with the same name so return flows
+                        // and param wiring reach the real body.
+                        if !program.symbols.function(fn_id).is_defined {
+                            let name = program.symbols.function(fn_id).name.clone();
+                            let file = Some(program.symbols.function(fn_id).file);
+                            let extra: Vec<FnId> = program
+                                .symbols
+                                .resolve_function_candidates(&name, file)
+                                .into_iter()
+                                .filter(|c| program.symbols.function(*c).is_defined)
+                                .collect();
+                            if !extra.is_empty() {
+                                new_callees.extend(extra);
+                            }
+                        }
                         new_callees.push(fn_id);
                     }
                 }
@@ -586,6 +681,28 @@ fn solve(
                             resolution: ResolutionKind::Indirect,
                         });
                         wire_params(pag, program, cs, callee, &mut st, &mut wired_arg_flow);
+                        // Expand return flows from the callee into the
+                        // `CallReturnIndirect` destination so the return
+                        // value reaches the assignment LHS (e.g.
+                        // `sbuf->impl = constructor->obtain(capacity)`).
+                        if let Some(callee_var) = cs.callee_var {
+                            if let Some(&dst_n) = pag.indirect_return_dst.get(&callee_var) {
+                                let constraint_before = pag.constraints.len();
+                                let mut visited = FxHashSet::default();
+                                pag.expand_return_flows(
+                                    program, dst_n, callee, models, &mut visited,
+                                );
+                                // Index any new constraints added by expand_return_flows
+                                // and push their sources onto the worklist so the solver
+                                // processes them.
+                                if pag.constraints.len() > constraint_before {
+                                    let new_srcs = pag.index_new_constraints(constraint_before);
+                                    for src in new_srcs {
+                                        st.push(src);
+                                    }
+                                }
+                            }
+                        }
                         apply_fn_model(
                             pag,
                             &mut st,
@@ -866,12 +983,12 @@ fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: 
             let summary_entry = st.memory_pts.entry(summary).or_default();
             let before_summary = summary_entry.len();
             if summary_entry.len() < SUMMARY_MEM_CAP {
-                // Same signature guard for the instance-insensitive summary
-                // cell (its declared type mirrors the field's).
                 let accepts_fns = matches!(
                     st.slot_guard.get(&summary),
                     None | Some(SlotGuard::FnParams(_))
                 );
+                // Same signature guard for the instance-insensitive summary
+                // cell (its declared type mirrors the field's).
                 if let Some(s) = src_set {
                     for &l in s.iter() {
                         if !accepts_fns && fn_for_loc(pag, l).is_some() {
@@ -884,12 +1001,6 @@ fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: 
                     summary_entry.insert(sl);
                 }
             } else if !st.saturated_summaries.contains(&summary) {
-                // Instance-insensitive summaries are the unbounded resource of
-                // this solver: with interprocedural param flow their content
-                // grows toward "everything stored through any instance".
-                // Saturation stops the growth (documented imprecision: reads
-                // past saturation may miss targets); ordinary per-object
-                // field locations stay exact.
                 st.saturated_summaries.insert(summary);
             }
             changed |= summary_entry.len() > before_summary;
@@ -902,7 +1013,7 @@ fn apply_store_to_targets(pag: &Pag, idx: usize, st: &mut SolverState, targets: 
         }
     }
     for loc in requeues {
-        st.touch_loc_holders(loc);
+        st.touch_loc_holders(loc, &pag.indices.load_src);
     }
 }
 

@@ -41,4 +41,10 @@ pub enum FlowConstraint {
     ArrayFnMember { array: VarId, callee: FnId },
     /// `dst = callee()` — callee resolved by name after all TUs are merged.
     CallReturn { dst: VarId, callee_name: String },
+    /// `dst = callee_var()` — callee resolved at analysis time from the
+    /// function-pointer variable's points-to set (indirect / virtual calls).
+    CallReturnIndirect { dst: VarId, callee_var: VarId },
+    /// `dst = new T(...)` — allocate a fresh heap location and point `dst` to
+    /// it, so the constructor's implicit `this` has concrete pointees.
+    NewHeap { dst: VarId },
 }

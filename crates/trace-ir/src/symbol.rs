@@ -211,6 +211,29 @@ impl SymbolTable {
                 .push(func.id);
         }
         if func.linkage == Linkage::Internal {
+            // Merge forward declarations with definitions for internal
+            // (static) functions. Without this, a forward declaration
+            // lower bounds before its definition creates a separate entry;
+            // call-sites resolved between the two point at the declaration
+            // (is_defined=false) and the solver never expands its body.
+            if let Some(scope_map) = self.fn_by_scope.get(&func.file) {
+                if let Some(&existing_id) = scope_map.get(&func.name) {
+                    if let Some(existing) = self.functions.iter_mut().find(|f| f.id == existing_id) {
+                        if func.is_defined && !existing.is_defined {
+                            existing.is_defined = true;
+                            existing.file = func.file;
+                            existing.span = func.span;
+                            existing.end_line = func.end_line;
+                            if !func.params.is_empty() {
+                                existing.params = func.params.clone();
+                            }
+                        } else if !func.is_defined && existing.params.is_empty() && !func.params.is_empty() {
+                            existing.params = func.params.clone();
+                        }
+                        return existing_id;
+                    }
+                }
+            }
             // Index every internal-linkage entry, declarations included:
             // lowering resolves identifiers against this table *while the
             // file streams in*, so a designated initializer like
@@ -239,11 +262,6 @@ impl SymbolTable {
         self.fn_slots.insert(id, self.functions.len() as u32);
         self.functions.push(func);
         id
-    }
-
-    fn function_mut(&mut self, id: FnId) -> Option<&mut Function> {
-        let slot = *self.fn_slots.get(&id)?;
-        self.functions.get_mut(slot as usize)
     }
 
     /// Slot of `id` in [`SymbolTable::functions`], O(1).
@@ -401,6 +419,13 @@ impl SymbolTable {
 
     pub fn variable(&self, id: VarId) -> &Variable {
         self.variable_by_id(id)
+            .unwrap_or_else(|| panic!("unknown variable id {}", id.0))
+    }
+
+    pub fn variable_mut(&mut self, id: VarId) -> &mut Variable {
+        self.variables
+            .get_mut(id.0 as usize)
+            .filter(|v| v.id == id)
             .unwrap_or_else(|| panic!("unknown variable id {}", id.0))
     }
 
