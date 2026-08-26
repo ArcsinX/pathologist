@@ -418,10 +418,10 @@ impl Pag {
                     let src_n = self.var_node_id(*src);
                     self.add_store(dst_n, src_n);
                 }
-                FlowConstraint::GepField { dst, base, field } => {
+                FlowConstraint::GepField { dst, base, field, field_name } => {
                     let dst_n = self.var_node_id(*dst);
                     let base_n = self.var_node_id(*base);
-                    self.add_gep(dst_n, base_n, *field);
+                    self.add_gep(dst_n, base_n, *field, field_name.clone());
                 }
                 FlowConstraint::ArrayFnMember { array, callee } => {
                     let array_n = self.var_node_id(*array);
@@ -656,6 +656,7 @@ impl Pag {
             dst,
             src,
             field: None,
+            field_name: None,
         });
     }
 
@@ -665,6 +666,7 @@ impl Pag {
             dst,
             src: loc_node,
             field: None,
+            field_name: None,
         });
     }
 
@@ -674,6 +676,7 @@ impl Pag {
             dst,
             src,
             field: None,
+            field_name: None,
         });
     }
 
@@ -683,20 +686,22 @@ impl Pag {
             dst,
             src,
             field: None,
+            field_name: None,
         });
     }
 
-    pub fn add_gep(&mut self, dst: PagNodeId, base: PagNodeId, field: FieldId) {
+    pub fn add_gep(&mut self, dst: PagNodeId, base: PagNodeId, field: FieldId, field_name: String) {
         self.constraints.push(Constraint {
             kind: crate::constraints::ConstraintKind::Gep,
             dst,
             src: base,
             field: Some(field),
+            field_name: Some(field_name),
         });
     }
 }
 
-fn struct_type_for_loc(pag: &Pag, program: &Program, loc: LocId) -> Option<trace_ir::TypeId> {
+pub(crate) fn struct_type_for_loc(pag: &Pag, program: &Program, loc: LocId) -> Option<trace_ir::TypeId> {
     if let Some(var) = pag.locations[loc.0 as usize].var {
         let mut type_id = program.symbols.variable_by_id(var)?.type_id;
         for _ in 0..4 {

@@ -45,9 +45,6 @@ enum Commands {
         /// Function-model TOML file (repeatable; overrides built-ins by name).
         #[arg(long = "models")]
         models: Vec<PathBuf>,
-        /// Fast mode: lower solver budget (200K pops) for quick results.
-        #[arg(long)]
-        fast: bool,
     },
     /// Inspect an existing analysis database.
     Inspect {
@@ -124,7 +121,6 @@ fn main() -> Result<()> {
             debug_points_to,
             full_export,
             models,
-            fast,
         } => run_analyze(
             target,
             output,
@@ -134,7 +130,6 @@ fn main() -> Result<()> {
             debug_points_to,
             full_export,
             models,
-            fast,
         ),
         Commands::Inspect { db, command } => run_inspect(db, command),
     }
@@ -150,7 +145,6 @@ fn run_analyze(
     debug_points_to: bool,
     full_export: bool,
     model_files: Vec<PathBuf>,
-    fast: bool,
 ) -> Result<()> {
     let jobs = jobs.unwrap_or_else(|| {
         std::thread::available_parallelism()
@@ -233,7 +227,7 @@ fn run_analyze(
         AnalyzeOptions {
             retain_points_to: debug_points_to,
             models,
-            solve_budget: if fast { Some(200_000) } else { Some(800_000) },
+            solve_budget: Some(800_000),
         },
     );
     let indirect = analysis

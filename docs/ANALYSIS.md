@@ -123,7 +123,7 @@ Worklist algorithm with **constraint adjacency index** (`SolverIndices`) for O(1
 
 ### Work budget
 
-Solving is capped at a deterministic **200 000 pops** by default. Normal corpora converge far below the cap (the HDF framework corpus needs ~42k). The cap trades late-stage target recall for bounded runtime: on the HDF whole tree, fn-pointer-deref site coverage completes around ~300k pops, and past that returns collapse sharply (+110s for +21% indirect edges from 300k→500k; +176s for +4% more from 500k→700k). Raise `TRACE_SOLVE_BUDGET_POPS` when maximal target recall on very large trees matters more than runtime; `=0` restores unlimited solving. The budget is deterministic, so repeated runs produce identical databases.
+Solving is capped at a deterministic **800 000 pops** by default. Normal corpora converge far below the cap (the HDF framework corpus needs ~42k). The cap trades late-stage target recall for bounded runtime. Override via `TRACE_SOLVE_BUDGET_POPS=<n>`; `=0` restores unlimited solving. The budget is deterministic, so repeated runs produce identical databases.
 
 ### State
 

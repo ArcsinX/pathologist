@@ -9,7 +9,6 @@ use trace_analysis::{analyze_with_options, AnalyzeOptions, ResolutionKind};
 use trace_db::open_db;
 use trace_ir::Program;
 use trace_parse::build_program;
-use trace_preproc::PreprocessOptions;
 
 fn build() -> Program {
     let root = fixture("fn_models");

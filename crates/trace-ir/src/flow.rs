@@ -31,11 +31,15 @@ pub enum FlowConstraint {
     Load { dst: VarId, src: VarId },
     /// `*dst = src` (store through pointer)
     Store { dst: VarId, src: VarId },
-    /// `dst = src->field` or struct field address
+    /// `dst = src->field` or struct field address.
+    /// `field_name` carries the human-readable name resolved during lowering;
+    /// the solver uses it to reject pointees whose struct type has a different
+    /// field at the same positional index.
     GepField {
         dst: VarId,
         base: VarId,
         field: FieldId,
+        field_name: String,
     },
     /// Function-pointer array initializer: any subscript may target any listed callee.
     ArrayFnMember { array: VarId, callee: FnId },

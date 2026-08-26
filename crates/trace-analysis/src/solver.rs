@@ -546,9 +546,9 @@ fn solve(
             let idxs = idxs.clone();
             w_gep += delta.len() as u64 * idxs.len() as u64;
             'gep: for idx in idxs {
-                let (dst, src, field) = {
+                let (dst, src, field, ref expected_name) = {
                     let c = &pag.constraints[idx];
-                    (c.dst, c.src, c.field)
+                    (c.dst, c.src, c.field, c.field_name.clone())
                 };
                 let Some(field) = field else {
                     continue;
@@ -559,6 +559,21 @@ fn solve(
                 // stores from other instances of the same struct type.
                 let mut produced_cell = false;
                 for &loc in delta.iter() {
+                    // Cross-struct FieldId guard: if the GEP carries a
+                    // field name from lowering, reject pointees whose
+                    // struct type has a different field at the same
+                    // positional index — this prevents functions from
+                    // unrelated structs leaking as indirect-call targets.
+                    if let Some(ref expected) = expected_name {
+                        if let Some(parent_type) =
+                            crate::pag::struct_type_for_loc(pag, program, loc)
+                        {
+                            match program.types.get(parent_type).layout.fields.get(&field) {
+                                Some(fl) if fl.name == *expected => {}
+                                _ => continue,
+                            }
+                        }
+                    }
                     // Function values reach a base node's points-to either as
                     // `ArrayFnMember` table initializers (flow through element
                     // accesses unchanged) or via opaque/wrong-type parameter
@@ -836,6 +851,7 @@ fn apply_fn_model(
                             dst: p,
                             src: v,
                             field: None,
+                            field_name: None,
                         });
                         pag.indices.store_dst.entry(p).or_default().push(idx);
                         pag.indices.store_src.entry(v).or_default().push(idx);
@@ -1032,6 +1048,7 @@ fn ensure_param_copy(
         dst: formal_node,
         src: actual_node,
         field: None,
+        field_name: None,
     });
     pag.indices
         .copy_src

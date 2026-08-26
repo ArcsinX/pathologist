@@ -407,3 +407,94 @@ fn cross_tu_no_proto_call_recovers_definition() {
     assert_eq!(helpers.len(), 1, "no phantom duplicate rows for helper");
     assert!(helpers[0].is_defined);
 }
+
+/// Different struct types with function pointers at the same positional index
+/// (FieldId) but different field names must NOT leak across structs. Before
+/// the field_name guard in the solver, GEP accesses into struct A would
+/// pick up function pointers stored in struct B's same-index field, causing
+/// massive false-positive indirect call edges (observed as 140 false
+/// targets for HdfSbufReadBuffer in the real HDF corpus).
+#[test]
+fn cross_struct_field_id_no_pollution() {
+    let root = fixture("fn_ptr_cross_struct");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    // CallWithOpsA loads "callback" — must resolve to CallbackImplA only.
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "CallWithOpsA",
+            "CallbackImplA",
+            ResolutionKind::Indirect
+        ),
+        "CallWithOpsA must resolve to CallbackImplA"
+    );
+    assert!(
+        !has_edge(
+            &program,
+            &analysis,
+            "CallWithOpsA",
+            "HandlerImplB",
+            ResolutionKind::Indirect
+        ),
+        "CallWithOpsA must NOT see HandlerImplB from OpsB (cross-struct pollution)"
+    );
+
+    // CallWithOpsB loads "handler" — must resolve to HandlerImplB only.
+    assert!(
+        has_edge(
+            &program,
+            &analysis,
+            "CallWithOpsB",
+            "HandlerImplB",
+            ResolutionKind::Indirect
+        ),
+        "CallWithOpsB must resolve to HandlerImplB"
+    );
+    assert!(
+        !has_edge(
+            &program,
+            &analysis,
+            "CallWithOpsB",
+            "CallbackImplA",
+            ResolutionKind::Indirect
+        ),
+        "CallWithOpsB must NOT see CallbackImplA from OpsA (cross-struct pollution)"
+    );
+
+    // CallBoth exercises both paths — verify it calls both dispatchers
+    // directly, and that the indirect edges are inside them.
+    for callee in ["CallWithOpsA", "CallWithOpsB"] {
+        assert!(
+            has_edge(
+                &program,
+                &analysis,
+                "CallBoth",
+                callee,
+                ResolutionKind::Direct
+            ),
+            "CallBoth must directly call {callee}"
+        );
+    }
+
+    // Total indirect edges must be exactly 2 (one per field load)
+    let all_indirect: Vec<_> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| e.resolution == ResolutionKind::Indirect)
+        .map(|e| {
+            (
+                fn_name(&program, e.caller),
+                fn_name(&program, e.callee),
+            )
+        })
+        .collect();
+    assert_eq!(
+        all_indirect.len(),
+        2,
+        "total indirect edges must be exactly 2, got: {:?}",
+        all_indirect
+    );
+}

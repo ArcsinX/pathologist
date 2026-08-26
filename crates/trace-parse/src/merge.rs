@@ -304,10 +304,11 @@ fn remap_flow(
             dst: rv(dst),
             src: rv(src),
         },
-        FlowConstraint::GepField { dst, base, field } => FlowConstraint::GepField {
+        FlowConstraint::GepField { dst, base, field, field_name } => FlowConstraint::GepField {
             dst: rv(dst),
             base: rv(base),
             field,
+            field_name: field_name.clone(),
         },
         FlowConstraint::ArrayFnMember { array, callee } => FlowConstraint::ArrayFnMember {
             array: rv(array),

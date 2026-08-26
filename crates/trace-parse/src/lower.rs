@@ -2185,6 +2185,7 @@ fn lower_initializer_list(
                                 child,
                                 base,
                                 &[fid],
+                                &[fname],
                                 child,
                             );
                         }
@@ -2278,7 +2279,7 @@ fn lower_designated_initializer(
             let Some(fid) = program.types.field_id_by_name(type_id, fname) else {
                 return;
             };
-            current = alloc_gep_temp(program, ctx, node, current, fid);
+            current = alloc_gep_temp(program, ctx, node, current, fid, fname.clone());
             type_id = program.types.get(type_id).layout.fields[&fid].type_id;
             type_id = peel_ptr_to_struct(program, type_id);
         }
@@ -2298,7 +2299,7 @@ fn lower_designated_initializer(
         field_ids.push(fid);
         type_id = program.types.get(type_id).layout.fields[&fid].type_id;
     }
-    emit_field_value_store(program, ctx, source, node, base, &field_ids, value_node);
+    emit_field_value_store(program, ctx, source, node, base, &field_ids, &field_names, value_node);
 }
 
 fn peel_expression(mut node: Node) -> Node {
@@ -2315,15 +2316,16 @@ fn emit_field_store(
     lhs: Node,
     rhs: Node,
 ) {
-    let Some((base, field_ids)) = decompose_field_path(program, ctx, source, lhs) else {
+    let Some((base, field_ids, field_names)) = decompose_field_path(program, ctx, source, lhs) else {
         return;
     };
     if field_ids.is_empty() {
         return;
     }
-    emit_field_value_store(program, ctx, source, lhs, base, &field_ids, rhs);
+    emit_field_value_store(program, ctx, source, lhs, base, &field_ids, &field_names, rhs);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_field_value_store(
     program: &mut Program,
     ctx: &mut LowerContext,
@@ -2331,12 +2333,13 @@ fn emit_field_value_store(
     span_node: Node,
     base: VarId,
     field_ids: &[FieldId],
+    field_names: &[String],
     value_node: Node,
 ) {
     let mut current = base;
     for (i, fid) in field_ids.iter().enumerate() {
         if i + 1 == field_ids.len() {
-            let gep = alloc_gep_temp(program, ctx, span_node, current, *fid);
+            let gep = alloc_gep_temp(program, ctx, span_node, current, *fid, field_names[i].clone());
             if let Some(src) = expr_to_store_src(program, ctx, source, value_node) {
                 program.flow.push(FlowConstraint::Store { dst: gep, src });
             } else if value_node.kind() == "identifier" {
@@ -2396,7 +2399,7 @@ fn emit_field_value_store(
                 }
             }
         } else {
-            current = alloc_gep_temp(program, ctx, span_node, current, *fid);
+            current = alloc_gep_temp(program, ctx, span_node, current, *fid, field_names[i].clone());
         }
     }
 }
@@ -2407,6 +2410,7 @@ fn alloc_gep_temp(
     span_node: Node,
     base: VarId,
     field: FieldId,
+    field_name: String,
 ) -> VarId {
     let var_id = program.symbols.alloc_var_id();
     let span = node_span(program, ctx, span_node);
@@ -2424,6 +2428,7 @@ fn alloc_gep_temp(
         dst: var_id,
         base,
         field,
+        field_name,
     });
     var_id
 }
@@ -2438,7 +2443,7 @@ fn decompose_field_path(
     ctx: &LowerContext,
     source: &str,
     node: Node,
-) -> Option<(VarId, Vec<FieldId>)> {
+) -> Option<(VarId, Vec<FieldId>, Vec<String>)> {
     let mut field_names = Vec::new();
     let mut cur = peel_expression(node);
     while cur.kind() == "field_expression" {
@@ -2457,7 +2462,7 @@ fn decompose_field_path(
         type_id = layout.layout.fields.get(&fid)?.type_id;
         type_id = peel_ptr_to_struct(program, type_id);
     }
-    Some((base, field_ids))
+    Some((base, field_ids, field_names))
 }
 
 fn peel_ptr_to_struct(program: &mut Program, type_id: trace_ir::TypeId) -> trace_ir::TypeId {
@@ -2537,7 +2542,7 @@ fn resolve_implicit_this_member(
     let field_id = program.types.field_id_by_name(struct_tid, field_name)?;
     let fn_id = ctx.current_fn?;
     let this_var = *program.symbols.function(fn_id).params.first()?;
-    Some(alloc_gep_temp(program, ctx, node, this_var, field_id))
+    Some(alloc_gep_temp(program, ctx, node, this_var, field_id, field_name.to_string()))
 }
 
 /// Lower `&base.f1.f2` into a gep-temp chain so the resulting pointer
@@ -2552,10 +2557,10 @@ fn addr_of_field_path(
     let peeled = peel_expression(arg);
     // &field_expression → direct field path
     if peeled.kind() == "field_expression" {
-        let (base, field_ids) = decompose_field_path(program, ctx, source, peeled)?;
+        let (base, field_ids, field_names) = decompose_field_path(program, ctx, source, peeled)?;
         let mut current = base;
-        for fid in field_ids {
-            current = alloc_gep_temp(program, ctx, peeled, current, fid);
+        for (i, fid) in field_ids.iter().enumerate() {
+            current = alloc_gep_temp(program, ctx, peeled, current, *fid, field_names[i].clone());
         }
         return Some(current);
     }
@@ -2669,14 +2674,14 @@ fn expr_to_rhs_flow(
             None
         }
         "field_expression" => {
-            let (base, field_ids) = decompose_field_path(program, ctx, source, node)?;
+            let (base, field_ids, field_names) = decompose_field_path(program, ctx, source, node)?;
             let mut current = base;
             for (i, fid) in field_ids.iter().enumerate() {
                 if i + 1 == field_ids.len() {
-                    let tmp = alloc_gep_temp(program, ctx, node, current, *fid);
+                    let tmp = alloc_gep_temp(program, ctx, node, current, *fid, field_names[i].clone());
                     return Some(FlowConstraint::Load { dst, src: tmp });
                 }
-                current = alloc_gep_temp(program, ctx, node, current, *fid);
+                current = alloc_gep_temp(program, ctx, node, current, *fid, field_names[i].clone());
             }
             None
         }
@@ -3048,7 +3053,7 @@ fn resolve_callee_with_loads(
 ) -> (String, bool, Option<VarId>) {
     let node = peel_expression(node);
     if node.kind() == "field_expression" {
-        if let Some((base, field_ids)) = decompose_field_path(program, ctx, source, node) {
+        if let Some((base, field_ids, field_names)) = decompose_field_path(program, ctx, source, node) {
             let text = field_callee_text(source, node);
             // Return a cached load var if we already created one for this
             // node (avoids duplicate loads that break CallReturnIndirect
@@ -3058,7 +3063,7 @@ fn resolve_callee_with_loads(
                 return (text, false, cached_var);
             }
             if let Some(load_var) =
-                emit_field_fn_ptr_load(program, ctx, source, node, base, &field_ids)
+                emit_field_fn_ptr_load(program, ctx, source, node, base, &field_ids, &field_names)
             {
                 ctx.callee_load_cache.borrow_mut().insert(node.id(), Some(load_var));
                 return (text, false, Some(load_var));
@@ -3094,6 +3099,7 @@ fn emit_field_fn_ptr_load(
     span_node: Node,
     base: VarId,
     field_ids: &[FieldId],
+    field_names: &[String],
 ) -> Option<VarId> {
     if field_ids.is_empty() {
         return None;
@@ -3101,7 +3107,7 @@ fn emit_field_fn_ptr_load(
     let mut type_id = struct_type_for_var(program, base)?;
     let mut current = base;
     for (i, fid) in field_ids.iter().enumerate() {
-        let gep = alloc_gep_temp(program, ctx, span_node, current, *fid);
+        let gep = alloc_gep_temp(program, ctx, span_node, current, *fid, field_names[i].clone());
         let field_type_id = program.types.get(type_id).layout.fields.get(fid)?.type_id;
         type_id = field_type_id;
         if i + 1 == field_ids.len() {
