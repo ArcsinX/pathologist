@@ -67,3 +67,4 @@ pub fn node_text<'a>(source: &'a str, node: &Node) -> &'a str {
 pub fn has_parse_errors(tree: &Tree) -> bool {
     tree.root_node().has_error()
 }
+

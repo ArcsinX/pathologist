@@ -1,8 +1,16 @@
 # Evaluation Report: `trace` on OpenHarmony corpora
 
-**Date:** 2026-08-25 (updated 2026-08-26 with cross-struct FieldId guard fix; **2026-08-27** preprocessor hide-set + `hiviewdfx_hiview` eval)
+**Date:** 2026-08-25 (updated 2026-08-26 with cross-struct FieldId guard fix; **2026-08-27** preprocessor hide-set, C++ CHA/`final`/callables, hiviewdfx_hiview re-eval, and review-fix revalidation)
 **Binary:** `target/release/trace` (current tree)
 **Solver budget:** 800,000 pops (default; override via `TRACE_SOLVE_BUDGET_POPS`)
+**Machine (timing):** WSL2, 16 logical CPUs, `--jobs 8`, minimal SQLite export
+
+### Wall-clock (release, `--jobs 8`, minimal export)
+
+| Corpus | Index | Analyze | Export | Wall | Notes |
+|--------|------:|--------:|-------:|-----:|-------|
+| HDF `~/drivers_hdf_core` | 7.0s | 1.6s | 0.6s | 9.5s | first timed run on this machine |
+| Hiview `~/hiviewdfx_hiview` | 10.0s | 0.6s | 1.2s | 12.1s | previous index-only figure was 10.5s |
 
 This document covers two trees:
 
@@ -32,6 +40,73 @@ After C11 macro hide-set + expansion-depth cap, the same tree was re-analyzed (m
 
 No stack overflow. Counts match within a few edges (noise / cache order). The hide-set change does not regress HDF pointer analysis.
 
+### C++ CHA / callable revalidation (2026-08-27)
+
+After virtual-inheritance recording, `final` class/method devirtualization, implicit `this->method()`, smart-pointer unwrap, and callable modeling (`std::function`, lambdas, `operator()`), the same tree was re-analyzed (minimal export, `--jobs 8`):
+
+| Metric | Hide-set revalidation | This run |
+|--------|------------------------|----------|
+| Files | 1,356 | 1,356 |
+| Functions | 11,903 | 11,955 |
+| Call edges | 36,956 | 40,428 |
+| Direct / indirect / external | 16,031 / 4,430 / 16,495 | 20,825 / 4,484 / 15,119 |
+| Arg-flow edges | 26,056 | 28,307 |
+| Parse warnings | 442 (original full-export) | 478 |
+
+Direct edges rose and external edges fell because C++ member/static calls that previously became unqualified stubs now bind in-tree. Indirect totals moved by ~50 edges.
+
+**Dispatch hubs (no pollution regression):**
+
+| Function | Original eval | This run |
+|----------|---------------|----------|
+| `DeviceNodeExtDispatch` | 73 indirect targets | **73** unique indirect |
+| `HdfDeviceLaunchNode` | 125 driver inits | **125** unique indirect |
+| `HdfSbufReadBuffer` | 2 (C + C++) | **2** (`SbufRawImplReadBuffer`, `SbufMParcelImplReadBuffer`) |
+| `StreamDispatch` | 24 | **24** |
+| `HdfCameraDispatch` | 23 | **23** |
+| `HdfPmDriverDispatch` | 19 | **19** |
+| `HdfObjectManagerGetObject` | 18 | **18** |
+| `PlatformDumperDump` | 13 | **13** |
+| `SetOption` | 13 | **13** |
+| `HdfDeviceUnlaunchNode` | 135 | 135 indirect **edges** / 116 unique names |
+| `DeviceDriverBind` | 122 | 122 indirect **edges** / 106 unique names |
+| `GpioOnDevEventReceive` | 13 | 13 indirect **edges** / 12 unique names |
+
+`HdfSbufReadBuffer` staying at exactly two targets is the cross-struct FieldId guard: it has not regressed to the old 140-FP result. Hub **edge** counts match the original eval; where unique-name counts are lower, several edges share a callee.
+
+### Review-fix revalidation (2026-08-27, later)
+
+After field receivers, predefined `__UNUSED`, inspect `LIKE` escape, member CHA arity, and `std::function`-only wrappers, the same tree was re-analyzed (minimal export, `--jobs 8`):
+
+| Metric | CHA/callable revalidation | This run |
+|--------|---------------------------|----------|
+| Files | 1,356 | 1,356 |
+| Functions | 11,955 | 11,970 |
+| Call edges | 40,428 | 40,473 |
+| Direct / indirect / external | 20,825 / 4,484 / 15,119 | 20,820 / 4,484 / 15,169 |
+| Arg-flow edges | 28,307 | 28,254 |
+| Parse warnings | 478 | 478 |
+| Index / analyze / export / wall | (unrecorded) | **7.0s / 1.6s / 0.6s / 9.5s** |
+
+**No dispatch-hub regression.** Unique indirect counts are unchanged:
+
+| Function | CHA/callable run | This run |
+|----------|------------------|----------|
+| `DeviceNodeExtDispatch` | 73 | **73** |
+| `HdfDeviceLaunchNode` | 125 | **125** |
+| `HdfSbufReadBuffer` | 2 | **2** (`SbufRawImplReadBuffer`, `SbufMParcelImplReadBuffer`) |
+| `StreamDispatch` | 24 | **24** |
+| `HdfCameraDispatch` | 23 | **23** |
+| `HdfPmDriverDispatch` | 19 | **19** |
+| `HdfObjectManagerGetObject` | 18 | **18** |
+| `PlatformDumperDump` | 13 | **13** |
+| `SetOption` | 13 | **13** |
+| `HdfDeviceUnlaunchNode` | 135 edges / 116 unique | 135 / 116 |
+| `DeviceDriverBind` | 122 edges / 106 unique | 122 / 106 |
+| `GpioOnDevEventReceive` | 13 edges / 12 unique | 13 / 12 |
+
+Indirect stays at **exactly 4,484**. The +15 functions / +45 call edges are unnamed-parameter arity slots (overloads no longer collapsed) and a few extra C++ binds — not hub pollution. `LoadIpcImpl` `dlsym` remains external.
+
 ## Executive Summary
 
 Analysis of 1,356 files (11,899 defined + 2,564 external functions) produced:
@@ -43,7 +118,7 @@ Analysis of 1,356 files (11,899 defined + 2,564 external functions) produced:
 
 All 40 evaluated functions below were analyzed successfully at 800K pops. Indirect call resolution via function-pointer analysis resolved every dispatch pattern tested, including vtable dispatch (73 targets), array-of-function-pointers (24 targets), driver entry tables (125 targets), C++ cross-language interop (2 targets), power-state dispatch (4 sites × 4 targets), sensor dispatch (13 targets), and GPIO event callbacks (13 targets).
 
-**C++ support** (new) adds namespaces, overloads (arity-based), classes with virtual dispatch, ctors/dtors, templates (name-stripping), constructor-initializer lists, and cross-C/C++ interop. The C++ implementation files (`.cpp`) are now indexed as translation units alongside `.c` files, enabling analysis of mixed C/C++ driver stacks such as the HDF framework where C++ IPC backends extend C interfaces.
+**C++ support** adds namespaces, overloads (arity-based), classes with virtual dispatch (including virtual bases and `final` class/method devirtualization), ctors/dtors, implicit `this->method()`, smart-pointer unwrap, callables (`std::function`, lambdas, functors), templates (name-stripping), constructor-initializer lists, and cross-C/C++ interop. The C++ implementation files (`.cpp`) are indexed as translation units alongside `.c` files, enabling analysis of mixed C/C++ driver stacks such as the HDF framework where C++ IPC backends extend C interfaces.
 
 ## Overall Metrics
 
@@ -1015,17 +1090,29 @@ After: **3/3** resolved, with **+16 call edges** and **+12 arg-flow edges** (neg
 
 ### C++ Feature Coverage
 
-| Feature | Pattern | Status | Documented Imprecision |
-|---------|---------|--------|----------------------|
-| Namespaces | `ns::f`, anonymous ns → internal linkage | Working | `using` directives not used for qualification |
-| Overloads | Same-name, different arity | Working | Arity-only resolution (no type ranking) |
-| Classes | Layout under qualified tag, inheritance chain | Working | — |
-| Virtual dispatch | `virtual` methods expand to subclass closure | Working | Single-inheritance assumed for upward walk |
-| Ctors / dtors | `new T(...)`, `delete p`, ctor-init lists | Working | Default-construct `Cls o;` emits no site |
-| Templates | Stripped to primary name `<T>` → `<T>` removed | Working | No dependent-type modeling |
-| Multiple inheritance | `AB : A, B` — nearest declarer wins | Working | — |
-| Static members | `S::Make()` | Working | — |
-| Cross-C/C++ | `extern "C"` functions in C++ TU, C caller resolves both | Working | — |
+| Feature | Pattern | Status | Test / documented imprecision |
+|---------|---------|--------|------------------------------|
+| Namespaces | `ns::f`, anonymous ns → internal linkage | Working | `cpp_namespace_qualified_call`, `cpp_anonymous_namespace_is_internal`; `using` not used for qualification |
+| Overloads | Same-name, different arity; ties emit both | Working | `cpp_overload_resolution_by_arity`, `cpp_overload_tie_emits_both_sites`; arity-only |
+| Classes | Layout under qualified tag, inheritance chain | Working | `cpp_non_virtual_member_call_exact`, `cpp_header_inline_method_dedups_with_out_of_class_uses` |
+| Virtual dispatch | CHA from static receiver, subclass closure | Working | `cpp_virtual_dispatch_expands_to_overrides` |
+| Virtual inheritance | `class D : virtual B` recorded as a base edge | Working | `cpp_virtual_inheritance_diamond_resolves_overrides` |
+| `final` class | `class Sealed final` stops further subclasses | Working | `cpp_final_class_devirtualizes_receiver` |
+| `final` method | `int g() final` unique at that receiver | Working | `cpp_final_method_stops_further_overrides` |
+| Implicit `this` | Bare `OnEvent()` inside a method | Working | `cpp_implicit_this_virtual_call_expands` |
+| Smart pointers | `shared_ptr` / `unique_ptr` / `weak_ptr` unwrap to `T` | Working | `cpp_smart_ptr_member_call_unwraps_pointee`, `cpp_smart_ptr_field_receiver_unwraps`; `auto p = wp.lock()` stays `Unknown` |
+| Callables | `std::function` / `::std::function` only; lambdas (`$lambda`), `operator()` | Working | `cpp_std_function_resolves_like_fn_ptr`, `cpp_lambda_is_addr_of_fn_and_indirect_call`, `cpp_functor_operator_call_resolves`; a class named `function` is still a functor |
+| Member arity | Virtual `foo(int)` vs `foo(int,int)` filtered by explicit argc | Working | `cpp_member_virtual_overload_filters_by_arity` |
+| `__UNUSED` on `T&` | Predefined empty object macro so the body is not dropped | Working | `cpp_unused_attr_on_ref_param_keeps_definition` |
+| Fn-ptr fields | C-style field/local function pointers | Working | `cpp_fn_ptr_field_and_local_resolve_indirect` |
+| Qualified extern | `FileUtil::Exists` with no body → external edge | Working | `cpp_qualified_undeclared_becomes_external` |
+| Ctors / dtors | `new T(...)`, `delete p`, ctor-init lists | Working | `cpp_ctor_and_dtor_sites`, `cpp_ctor_initializer_list_targets`; `Cls o;` emits no site |
+| Templates | Stripped to primary name | Working | `cpp_template_class_method_resolves_by_primary_name`; no dependent types |
+| Multiple inheritance | `AB : A, B` — nearest declarer wins | Working | `cpp_virtual_call_through_base_of_multiple_inheritance` |
+| Static members | `S::Make()` | Working | `cpp_static_member_function_resolves` |
+| Inherited non-virtual | `d.base_value()` walks to `Base` | Working | `cpp_inherited_non_virtual_via_derived_receiver` |
+| Cross-C/C++ | `extern "C"` ops table + C caller | Working | `cpp_impl_registered_into_c_ops_table_resolves_indirect`, `cpp_extern_c_driver_resolves_ipc_and_dispatch` |
+| `inspect --from/--to` | Suffix match `%::FN` with `LIKE` `_`/`%` escaped | Working | `inspect_calls_matches_cpp_qualified_suffix`, `inspect_calls_like_wildcards_are_literal` |
 
 ### C++ Interop Pattern: `cpp_flow` Fixture
 
@@ -1097,63 +1184,66 @@ At 800K pops: **both targets resolved** (37s on 1,198-file corpus).
 **Target:** `~/hiviewdfx_hiview` (OpenHarmony HiView DFX plugin platform)
 **Flags:** default (minimal SQLite export; flow graph always written)
 **Command:** `trace analyze ~/hiviewdfx_hiview -o hiview.db --jobs 8`
-**Index time:** 9.3s
+**Timing (this run):** index 10.0s / analyze 0.6s / export 1.2s / wall **12.1s** (previous index-only figure: 10.5s)
 
 Hiview previously **aborted with a stack overflow** in `PreprocessorState::expand_tokens_no_directives`. After C11 hide-set painting (and a 256-deep expansion cap), the tree indexes to completion.
 
+The first post-hide-set eval (same day, before implicit-`this` / CHA-from-receiver / callables) produced 12,652 edges with **0** indirect and almost no in-tree C++ dispatch. The numbers below are the **re-eval on the current binary**.
+
 ## Executive summary
 
-Analysis of **1,322 files** (5,790 defined + 4,110 external functions) produced:
+Analysis of **1,322 files** (6,418 defined + 4,180 external functions) produced:
 
-- **12,652 call edges** (549 direct, **0 indirect**, 12,103 external)
-- **9,006** `call_sites` with `is_direct=0`, **none** of which gained a `call_edge`
-- **673** arg-flow edges
-- **430,156** flow nodes / **200,350** flow edges (dominated by `points_to`)
-- **552** parse warnings, 0 preprocess “expansion depth exceeded” diagnostics, 0 analysis errors
+- **19,898 call edges** (4,010 direct, **10** indirect, 15,878 external)
+- **2,479** `call_sites` with `is_direct=0` (2,333 still have no `call_edge`)
+- **3,920** arg-flow edges
+- **437,428** flow nodes / **208,302** flow edges (still dominated by `points_to`)
+- **551** parse warnings, 0 preprocess “expansion depth exceeded” diagnostics, 0 analysis errors
+- **357** synthetic `$lambda` functions
 
 The preprocessor fix is **confirmed**: the `PRIVATE_MESSAGE_TYPE` X-macro in `base/include/defines.h` (invoked from `Event::MessageType` in `event.h`) expands as gcc does (`PRIVATE_MESSAGE_TYPE, ENGINE_UPLOAD_READY_MSG, …`) instead of recursing.
 
-C++ plugin dispatch is **not** resolved the way HDF C function-pointer tables are. Almost every interesting call is either:
+C++ **CHA from the static receiver** plus implicit `this->method()` now recovers the plugin virtual fan-out (`Plugin::OnEventProxy` → **23 defined** `::OnEvent` overrides, including `Plugin::OnEvent`). Same-class unqualified calls (`GetGlobalPluginInfo`, `IsValidEventParam`, recursive `OnContinue`) bind instead of becoming external stubs.
 
-1. an **unqualified** member/static call lowered as a **direct external** stub (`OnEvent`, `OnContinue`, `GetGlobalPluginInfo`), or
-2. an arrow/qualified call (`pluginPtr->OnEventProxy`, `std::string::c_str`) classified as **indirect** with **zero** solver targets.
+What still fails is **pointer-typed dispatch whose static type is lost**: `auto pluginPtr = wp.lock(); pluginPtr->OnEventProxy(...)` and `info->getPluginObject()` (`std::function` field with no assignment visible to the PAG). The 10 indirect edges are lambdas / JSON accessors, not the pipeline plugin pump. Field-typed `plugin_->OnEvent` (H10) and the `plugin.cpp` `__UNUSED` body (H16) now pass on this corpus.
 
 ## Overall metrics
 
-| Metric | Value |
-|--------|-------|
-| Files indexed | 1,322 |
-| Functions total | 9,900 |
-| Functions defined | 5,790 |
-| External functions | 4,110 |
-| Call sites | 21,435 |
-| Call sites `is_direct=0` | 9,006 |
-| Call edges | 12,652 |
-| Direct call edges | 549 |
-| Indirect call edges | **0** |
-| External call edges | 12,103 |
-| Arg-flow edges | 673 |
-| Flow nodes | 430,156 |
-| Flow edges | 200,350 |
+| Metric | Hide-set-only eval | CHA/callable run | This run |
+|--------|--------------------|------------------|----------|
+| Files indexed | 1,322 | 1,322 | 1,322 |
+| Functions total | 9,900 | 10,507 | 10,598 |
+| Functions defined | 5,790 | 6,412 | 6,418 |
+| External functions | 4,110 | 4,095 | 4,180 |
+| Call sites | 21,435 | 21,706 | 22,033 |
+| Call sites `is_direct=0` | 9,006 | 2,519 | 2,479 |
+| Call edges | 12,652 | 19,350 | 19,898 |
+| Direct call edges | 549 | 3,354 | 4,010 |
+| Indirect call edges | **0** | **10** | **10** |
+| External call edges | 12,103 | 15,986 | 15,878 |
+| Arg-flow edges | 673 | 3,373 | 3,920 |
+| Flow nodes | 430,156 | 436,314 | 437,428 |
+| Flow edges | 200,350 | 207,793 | 208,302 |
+| Index / analyze / export / wall | (unrecorded) | index 10.5s | **10.0s / 0.6s / 1.2s / 12.1s** |
 
-### Flow edge breakdown
+### Flow edge breakdown (this run)
 
 | Kind | Count |
 |------|-------|
-| points_to | 195,897 |
-| copy | 2,369 |
-| gep | 1,232 |
-| call_arg | 538 |
-| store | 125 |
-| load | 113 |
-| addr_of | 70 |
+| points_to | 195,979 |
+| copy | 4,152 |
+| gep | 3,755 |
+| call_arg | 2,524 |
+| load | 1,060 |
+| store | 633 |
+| addr_of | 193 |
 | terminates | 6 |
 
 ### Diagnostics
 
 | Severity | Stage | Count |
 |----------|-------|-------|
-| warning | parse | 552 |
+| warning | parse | 551 |
 
 No `macro expansion depth exceeded` warnings — hide-set, not the depth cap, stopped the X-macro recursion.
 
@@ -1164,12 +1254,19 @@ No `macro expansion depth exceeded` warnings — hide-set, not the depth cap, st
 | H1 | Self-referential object macro / X-macro enum list | **Pass** — `PRIVATE_MESSAGE_TYPE` / `PRIVATE_AUDIT_EVENT_TYPE` in `defines.h`; analysis completes |
 | H2 | Nested function-like macros (`MIN(MIN(a,b),c)`) | **Pass** (unit + fixture `self_ref_macro.c`) |
 | H3 | Mutual object macros (`#define A B+B` / `#define B A`) | **Pass** — terminates as `A+A` (gcc-compatible) |
-| H4 | Virtual `Plugin::OnEvent` via `OnEventProxy` | **Fail** — `OnEvent()` is a direct **external** stub, not the 27 in-tree `::OnEvent` overrides |
-| H5 | Pipeline plugin dispatch `pluginPtr->OnEventProxy` | **Fail** — site is indirect, 0 targets |
-| H6 | Same-class static call `PluginFactory::GetPlugin` → `GetGlobalPluginInfo` | **Fail** — unqualified name → external stub (qualified definition exists) |
-| H7 | `std::function` factory `info->getPluginObject()` | **Fail** — indirect, 0 targets |
-| H8 | Plugin body `EventLogger::OnEvent` | **Partial** — one qualified direct (`StartLogCollect`); other same-class calls external; `shared_ptr` methods unresolved |
-| H9 | `inspect calls --from OnEventProxy` | **Fail** — CLI is exact `functions.name` match; IR stores `OHOS::HiviewDFX::Plugin::OnEventProxy` |
+| H4 | Virtual `Plugin::OnEvent` via `OnEventProxy` | **Pass** — implicit `this->OnEvent()` CHA-expands to **23 defined** plugin `::OnEvent` (including `Plugin::OnEvent` at `plugin.cpp:35`) |
+| H5 | Pipeline plugin dispatch `pluginPtr->OnEventProxy` | **Fail** — `auto` / `lock()` loses the `Plugin` type; site still has 0 targets |
+| H6 | Same-class static call `PluginFactory::GetPlugin` → `GetGlobalPluginInfo` | **Pass** — unqualified call binds to `OHOS::HiviewDFX::PluginFactory::GetGlobalPluginInfo` |
+| H7 | `std::function` factory `info->getPluginObject()` | **Fail** — field call, 0 targets (no constructor-address flow into that field) |
+| H8 | Plugin body `EventLogger::OnEvent` | **Pass** (same-class) — `IsValidEventParam`, `GetEventPid`, `UpdateDB`, … are direct; STL / SDK remain external |
+| H9 | `inspect calls --from OnEventProxy` | **Pass** — suffix lists `Plugin::OnEventProxy` and `EventHandler::OnEventProxy`; `--from Get_lugin` matches nothing (`LIKE` `_` escaped) |
+| H10 | `PluginProxy::OnEvent` → `plugin_->OnEvent` | **Pass** — line 28 CHA to the same 23 defined plugin `::OnEvent` as H4 (field `shared_ptr<Plugin> plugin_`) |
+| H11 | `Plugin::DelayProcessEvent` / `std::bind(&Plugin::OnEventProxy, …)` | **Fail** — `std::bind` still external (no edge to `OnEventProxy`); `AddTimerEvent` is now **direct** |
+| H12 | `EventLoop::ProcessEvent` work-queue | **Partial** — `handler->OnEventProxy` CHA **Pass** (`EventHandler` + `Plugin`); `event->task()` / `packagedTask` **Fail** (0 targets) |
+| H13 | `Event::DownCastTo<SysEvent>` | **Fail** — 13 sites, all **external** `Event::DownCastTo` |
+| H14 | `ffrt::submit` deferred lambdas | **Fail** — 34 sites → external `ffrt::submit`; `$lambda` bodies have 7 in-edges (not from submit) |
+| H15 | `dlopen` / `dlsym` | **Fail** — `GraphicMemoryCollectorImpl::GetGraphicUsage`, `CallDllFunc`, `LoadModule` are external; HDF `LoadIpcImpl` `dlsym("SbufObtainIpc")` same |
+| H16 | Out-of-line `Plugin::OnEvent` body | **Pass** — `plugin.cpp:35` is `is_defined=1`; predefined empty `__UNUSED` |
 
 ## Individual function evaluations
 
@@ -1195,17 +1292,13 @@ No `macro expansion depth exceeded` warnings — hide-set, not the depth cap, st
 |----------|-------|
 | File | `base/plugin.cpp:55-83` |
 | Linkage | external (defined) |
-| Call sites | 10 (1 direct, 9 `is_direct=0`) |
-| Call edges | 1 — `OnEvent` **external** at line 68 |
-| Arg-flow | 0 |
+| Line-68 `OnEvent` targets | **23 defined** plugin `::OnEvent`, including `Plugin::OnEvent` at `plugin.cpp:35` (H16) |
 
 **Role:** Framework wrapper: `ret = OnEvent(dupEvent)` then pipeline `OnContinue()`. Every plugin’s work is supposed to enter here.
 
-**Resolution:** Line 68 `OnEvent(dupEvent)` is a **virtual** call on `this`. Lowering records callee_text `OnEvent` as **direct**. The solver wires it to a synthesized **unqualified** external `OnEvent`, not to `Plugin::OnEvent` or the **27** defined `::OnEvent` overrides (`EventLogger`, `SysEventStore`, `FreezeDetectorPlugin`, …).
+**Resolution (this run):** Line 68 `OnEvent(dupEvent)` is rewritten as implicit `this->OnEvent` on `Plugin`. CHA from that static type emits **direct** edges to **23 defined** plugin overrides, including `Plugin::OnEvent` itself (`plugin.cpp:35`), `PluginProxy::OnEvent`, `EventLogger`, `SysEventStore`, `FreezeDetectorPlugin`, `Faultlogger`, `PrivacyController`, `SysEventDispatcher`, `UsageEventReport`, and the in-tree examples. Five other defined `::OnEvent` methods are **not** in this set because they override `EventHandler`, not `Plugin` (`TestEventHandler`, `RealEventHandler`, …) — those appear under `EventHandler::OnEventProxy` instead.
 
-The `plugin.cpp` out-of-line `Plugin::OnEvent` body (`plugin.cpp:35`) is **absent** as a defined function (only the `plugin.h:45` declaration exists). Other nearby methods with `__UNUSED` parameters (`CanProcessEvent`, `IsInterestedPipelineEvent`) **are** defined from the `.cpp`.
-
-Unqualified `shared_ptr` methods (`GetPendingProcessorSize`, `OnContinue`, …) are `is_direct=0` with no edges.
+CHA over-approximation also wires nearby implicit calls in the same body (`GetPendingProcessorSize`, `OnContinue`, `HasFinish`, …) to both `Event` and `PipelineEvent` methods.
 
 ---
 
@@ -1214,13 +1307,13 @@ Unqualified `shared_ptr` methods (`GetPendingProcessorSize`, `OnContinue`, …) 
 | Property | Value |
 |----------|-------|
 | File | `base/pipeline.cpp:34-70` |
-| Call sites | 18 |
-| Direct edges | 12, all **external** (`OnFinish`, `OnContinue`, `front`, `PauseDispatch`, `shared_from_this`, …) |
-| Indirect unresolved | `pluginPtr->CanProcessMoreEvents`, `pluginPtr->IsInterestedPipelineEvent`, `pluginPtr->GetWorkLoop`, `workLoop->AddEvent`, `pluginPtr->OnEventProxy`, `std::weak_ptr::lock` |
+| Recursive `OnContinue` | **direct** to `OHOS::HiviewDFX::PipelineEvent::OnContinue` (lines 56 and 67) |
+| Other directs | `PipelineEvent::OnFinish`, `Event::HasFinish` / `HasPending` |
+| Still unresolved | `pluginPtr->CanProcessMoreEvents`, `pluginPtr->IsInterestedPipelineEvent`, `pluginPtr->GetWorkLoop`, `workLoop->AddEvent`, **`pluginPtr->OnEventProxy`** |
 
 **Role:** Pops the next plugin from `processors_` and either posts to its work loop or calls `OnEventProxy` inline.
 
-**Resolution:** Recursive `return OnContinue()` at lines 56 and 67 becomes a **direct external** `OnContinue` (line-56 stub `is_defined=0`), not `PipelineEvent::OnContinue`. The actual plugin dispatch `pluginPtr->OnEventProxy(...)` is indirect with **0** targets — the central hiview call graph is missing.
+**Resolution:** Unqualified `OnContinue()` now binds (H6-style lookup). The actual plugin dispatch `pluginPtr->OnEventProxy(...)` remains **0 targets**: `pluginPtr` is `auto` from `weak_ptr::lock()`, so the receiver type stays `Unknown` (documented: no return-type inference). That is the remaining hole in the central hiview call graph.
 
 ---
 
@@ -1232,11 +1325,11 @@ Unqualified `shared_ptr` methods (`GetPendingProcessorSize`, `OnContinue`, …) 
 | Call sites | 2 |
 
 ```
-auto info = GetGlobalPluginInfo(name);   // direct → external GetGlobalPluginInfo
-return info->getPluginObject();          // indirect, 0 targets (std::function)
+auto info = GetGlobalPluginInfo(name);   // direct → PluginFactory::GetGlobalPluginInfo
+return info->getPluginObject();          // still 0 targets (std::function field)
 ```
 
-`PluginFactory::GetGlobalPluginInfo` **is** defined at line 30, but the same-class call uses the **unqualified** identifier, so it does not bind. `getPluginObject` is `std::function<std::shared_ptr<Plugin>()>` — no function-pointer PAG path.
+Same-class unqualified `GetGlobalPluginInfo` **binds**. `getPluginObject` is a `std::function<std::shared_ptr<Plugin>()>` **field**; constructors are registered through `std::map` elsewhere, so no function address reaches this load. Fixture `cpp_callable` covers the case where the assignment **is** visible (`w->getPluginObject = target`).
 
 ---
 
@@ -1245,15 +1338,11 @@ return info->getPluginObject();          // indirect, 0 targets (std::function)
 | Property | Value |
 |----------|-------|
 | File | `plugins/eventlogger/event_logger.cpp:209+` |
-| Call sites | 23 (9 `is_direct=0`) |
+| Call sites | 18 (0 `is_direct=0`) |
 
-**Resolved:** one **direct** qualified call `OHOS::HiviewDFX::EventLogger::StartLogCollect` (line 248) — the writer used an explicit qualified name.
+**Resolved direct (same class / event API):** `IsValidEventParam`, `GetEventPid`, `CheckContinueReport`, `CheckFfrtEvent`, `IsHandleAppfreeze`, `CheckProcessRepeatFreeze`, `CheckScreenOnRepeat`, `UpdateDB`, `Event::GetValue`, `PipelineEvent::OnFinish` / `OnPending`.
 
-**External stubs:** `IsValidEventParam`, `GetEventPid`, `CheckContinueReport`, `UpdateDB`, `JudgmentRateLimiting`, … (same class, unqualified).
-
-**Unresolved indirect:** `Event::DownCastTo`, `std::shared_ptr::OnFinish` / `GetValue` / `OnPending`, `TimeUtil::GetMilliseconds`, `std::string::c_str`.
-
-This is the typical hiview plugin body: a few qualified directs, many same-TU calls exported as externals, STL/smart-pointer calls dropped.
+**Still external:** `Event::DownCastTo`, `std::string::c_str`, `ffrt::task_attr` / `submit`, `empty`. SDK / STL isolation, not same-TU lookup.
 
 ---
 
@@ -1262,49 +1351,155 @@ This is the typical hiview plugin body: a few qualified directs, many same-TU ca
 | Property | Value |
 |----------|-------|
 | File | `plugins/event_store/sys_event_store.cpp:123-160` |
-| Call sites | 26 (18 `is_direct=0`) |
 
-Same shape as H5: `std::call_once`, `Convert2SysEvent`, `SysEventSequenceManager::GetInstance`, `SaveToStore`, `TriggerExportEngine::GetInstance().ProcessEvent`. Instance/qualified C++ calls do not become in-tree edges.
+Same-class calls now bind (`Convert2SysEvent`, `IsNeedBackup`, `StatisticStorePeriodInfo`, `SysEvent::SetEventSeq`, `Event::GetValue`). Nested `EventStore::SysEventSequenceManager::GetInstance`, `SaveToStore`, `TriggerExportEngine::GetInstance().ProcessEvent`, `TimeUtil`, and `Parameter::*` stay **external** (other namespaces / SDK, or chained `auto` receivers).
 
 ---
 
-### H7. Unresolved-`is_direct=0` taxonomy
+### H7. Unresolved sites (no `call_edge`)
 
-Top `callee_text` values among sites with **no** `call_edge`:
+Top `callee_text` values among sites with **no** `call_edge` (this run):
 
 | callee_text | Count | Kind |
 |-------------|------:|------|
-| `std::string::c_str` | 363 | STL method |
-| `std::make_shared` | 322 | template |
-| `std::to_string` | 318 | template |
-| `std::string` / `std::string::string` | 280+263 | ctor |
-| `std::string::append` / `empty` | 185+174 | STL |
-| `FileUtil::FileExists` | 127 | qualified static, not in tree or not bound |
-| `pluginPtr->OnEventProxy` (and similar arrows) | (in H3) | virtual / member via pointer |
+| `source->GetValue` | 63 | arrow; likely `auto` / SDK type |
+| `creator->SetKeyValue` | 56 | arrow |
+| `resultSet->Close` | 33 | arrow |
+| `source->GetString` | 32 | arrow |
+| `sysEvent->SetEventValue` | 28 | arrow |
+| `event->SetValue` | 22 | arrow |
+| `pluginPtr->OnEventProxy` | 1 | virtual via `auto` after `lock()` |
 
-These are mostly **not** C function-pointer tables. Treating them as “indirect calls” inflates the unresolved-indirect count (9,006) compared to HDF, where `is_direct=0` meant `ops->Dispatch`.
+These are mostly **not** C function-pointer tables. `is_direct=0` sites dropped from 9,006 to 2,519 because implicit-`this` / member typing now classifies many C++ calls as direct. Remaining holes are `auto`, STL, and SDK pointers.
+
+The **10** indirect `call_edges` are `$lambda` invocations in `FaultLogDatabase` / `FaultLogCppCrash` plus JSON `asString` / `isString` — not plugin `OnEvent`.
+
+---
+
+### H10. `OHOS::HiviewDFX::PluginProxy::OnEvent` — smart-ptr **field** receiver
+
+| Property | Value |
+|----------|-------|
+| File | `base/plugin_proxy.cpp:22-30` |
+| Field | `std::shared_ptr<Plugin> plugin_` (`plugin_proxy.h:54`) |
+
+```
+return plugin_->OnEvent(event);
+```
+
+**Pass.** Line 28 CHA-expands to the same 23 defined plugin `::OnEvent` as H4, including `Plugin::OnEvent` (`plugin.cpp:35`). The receiver is the data member `plugin_` (`shared_ptr<Plugin>`), looked up as implicit `this->plugin_`. Same for `plugin_->OnEventListeningCallback` (line 81). Fixture: `Holder { shared_ptr<Plugin> plugin_; void go() { plugin_->OnEvent(); } }` (`cpp_smart_ptr_field_receiver_unwraps`).
+
+Roadmap: C1 still covers `auto` / `lock()` (H5). C6 (concrete class flowing into `plugin_` via the factory) is still open — CHA from `Plugin` is the over-approx until then.
+
+---
+
+### H11. `OHOS::HiviewDFX::Plugin::DelayProcessEvent` — `std::bind` onto the work loop
+
+| Property | Value |
+|----------|-------|
+| File | `base/plugin.cpp:85-96` |
+| Edges | `UpdateTimeByDelay` direct; `Event::OnPending` external + `PipelineEvent::OnPending` CHA; **`std::bind` external**; `AddTimerEvent` **direct** (`EventLoop` / `MockEventLoop`) |
+
+```
+auto task = std::bind(&Plugin::OnEventProxy, this, event);
+workLoop_->AddTimerEvent(nullptr, nullptr, task, delay, false);
+```
+
+No edge to `OnEventProxy`. Delayed plugin work is missing from the graph.
+
+Roadmap: C4.
+
+---
+
+### H12. `OHOS::HiviewDFX::EventLoop::ProcessEvent` — packed vs typed handler
+
+| Property | Value |
+|----------|-------|
+| File | `base/event_loop.cpp:492-510` |
+
+| Site | Result |
+|------|--------|
+| `event.handler->OnEventProxy(event.event)` (line 498) | **Pass** — direct CHA to `EventHandler::OnEventProxy` and `Plugin::OnEventProxy` |
+| `event.task()` (line 496) | **Fail** — 0 targets (`callee_text` `event->task`) |
+| `event.packagedTask->operator()()` (line 504) | **Fail** — 0 targets (`event->packagedTask`) |
+
+`AddEventForResult` stores `std::bind(&EventHandler::OnEventProxy, …)` in a `packaged_task` (`event_loop.cpp:191-199`). The typed handler fallback works; the functor/queue slots do not.
+
+Roadmap: C4.
+
+---
+
+### H13. `Event::DownCastTo<SysEvent>` — template pointer_cast
+
+| Property | Value |
+|----------|-------|
+| Sites | 13 |
+| Resolution | all **external** `Event::DownCastTo` |
+
+Template is in `event.h:201-205` (`static_pointer_cast<Derived>`). Name-stripping does not instantiate it, so the result is not typed as `SysEvent` and `sysEvent->SetEventValue` stays in the unresolved-arrow rain.
+
+Roadmap: C2.
+
+---
+
+### H14. `ffrt::submit` — deferred `$lambda`
+
+| Property | Value |
+|----------|-------|
+| Sites | 34 `ffrt::submit` (all **external**); plus 11 bare `submit` |
+| Example | `passthrough_monitor.cpp:80`, `uc_telemetry_callback.cpp:187` (`[callback = shared_from_this()]`) |
+
+357 `$lambda` functions exist; 7 have in-edges, none from `ffrt::submit`. Capture `this` / `shared_from_this` is unmodeled.
+
+Roadmap: C4.
+
+---
+
+### H15. `dlopen` / `dlsym`
+
+| Site | Result |
+|------|--------|
+| `GraphicMemoryCollectorImpl::GetGraphicUsage` `dlopen`/`dlsym("GetInstance")` (`graphic_memory_collector_impl.cpp:47-59`) | external |
+| `CallDllFunc` `dlsym(module, funcName)` (`hiretrieval_dynamic_loader.cpp:69`) | external |
+| `LoadModule` → `dlopen` (`dynamic_module.cpp:32`) | external (static `REGISTER` in the DSO is C3) |
+| HDF `LoadIpcImpl` `dlsym(..., "SbufObtainIpc")` / `SbufBindIpc` | external — production path vs compile-time `&SbufObtainIpc` used in the eval’s 2-target `HdfSbufReadBuffer` |
+
+Roadmap: C11.
+
+---
+
+### H16. `Plugin::OnEvent` out-of-line body dropped
+
+`plugin.cpp:35-38` is a real definition (`bool Plugin::OnEvent(std::shared_ptr<Event>& event __UNUSED)`). Custom preproc does not define `__GNUC__`, so hiview `defines.h` never `#define __UNUSED`, and the unexpanded token after a **reference** declarator made tree-sitter parse a `declaration` + ERROR (body lost). `__UNUSED` is now a predefined empty object macro, installed even when the shared warm table is cloned.
+
+**Pass on this corpus:** `OHOS::HiviewDFX::Plugin::OnEvent` is a single row at `plugin.cpp:35`, `is_defined=1`. It participates in H4/H10 CHA. Fixture: `Sink::consume(Event &event __UNUSED)`.
 
 ## Observations (hiview)
 
 1. **Hide-set is sufficient for this corpus.** The crash was a single well-known C pattern (X-macro list whose first token is the macro name). The 256-deep cap did not fire.
 
-2. **HDF-style indirect resolution does not transfer.** Hiview’s dispatch is C++ virtuals, `shared_ptr`/`weak_ptr`, `std::function`, and unqualified member calls. Result: **0** indirect `call_edges` vs HDF’s 4,428.
+2. **CHA virtual dispatch now transfers for typed receivers.** `Plugin::OnEventProxy` fans out like HDF `deviceMethod->Dispatch`, via class hierarchy rather than points-to. `final` / virtual bases are tested on fixtures (`cpp_dispatch`); this tree does not stress them.
 
-3. **Unqualified lookup is the dominant FN.** 12,032 external edges go to names **without** `::`. Many of those identifiers exist in-tree under `OHOS::HiviewDFX::…`. `inspect --from OnEventProxy` therefore shows nothing.
+3. **Typed receivers include fields.** Parameter and **field** `shared_ptr<Plugin>` unwrap (H10 **Pass** on this corpus). The pipeline pump (H5) remains `auto` after `lock()`.
 
-4. **`this->OnEvent` is not virtual-expanded.** Unlike HDF `deviceMethod->Dispatch` (78 targets), `Plugin::OnEventProxy` does not fan out to plugin overrides.
+4. **Unqualified in-tree names mostly bind.** Direct edges rose 3,354 → 4,010 on this run (H10 CHA fan-out is the bulk). Remaining externals are largely STL and OHOS SDK.
 
-5. **Parse warnings are per-file and non-fatal** (552), same recovery policy as HDF.
+5. **`std::function` needs a visible store.** Intern-as-`FnPtr` is not enough when the only assignment is through `std::map`. 357 `$lambda` functions were interned; 7 have in-edges (not from `ffrt::submit`).
 
-6. **Isolation from the OHOS SDK** explains a large true-external remainder (`FileUtil`, `TimeUtil`, ffrt). That is expected when analyzing the hiview tree alone; it does not explain the in-tree unqualified misses.
+6. **Parse warnings are per-file and non-fatal** (551), same recovery policy as HDF.
+
+7. **`inspect --from OnEventProxy` works** with suffix match. SQLite `LIKE` `_`/`%` in the user name are escaped (`ESCAPE '!'`); `--from Get_lugin` is empty.
+
+8. **Deferred execution and DSO factories are still dark.** `std::bind` / `ffrt::submit` / `packaged_task` (H11–H12, H14) and `dlsym` (H15) have no in-tree callees. HDF dispatch tables that do **not** go through `dlsym` (73 / 125 / 2) are unchanged.
 
 ### Comparison to HDF (same binary)
 
 | | HDF | Hiview |
 |--|-----|--------|
 | Language mix | C + C++ interop via ops tables | Almost all C++ |
-| Indirect edges | 4,430 | **0** |
-| Direct edges | 16,031 | 549 |
-| External edges | 16,495 | 12,103 |
+| Indirect edges | 4,484 | 10 |
+| Direct edges | 20,820 | 4,010 |
+| External edges | 15,169 | 15,878 |
+| Wall (`--jobs 8`) | 9.5s | 12.1s |
 | Preprocess | Completes | Completes **only with hide-set** |
-| Eval conclusion | Dispatch tables resolved | Platform **indexes**; plugin call graph **not** recovered |
+| Eval conclusion | Dispatch tables **unchanged** (73 / 125 / 2); `dlsym("SbufObtainIpc")` still external | Platform indexes; **typed** virtual plugin graph recovered including field receivers (H10) and `Plugin::OnEvent` body (H16); `auto`/bind/ffrt/`dlsym` still missing |

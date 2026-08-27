@@ -378,3 +378,137 @@ fn direct_fixture_still_resolves() {
     assert_eq!(g.order.len(), 2, "main -> helper");
     let _ = std::fs::remove_file(db);
 }
+
+#[test]
+fn inspect_calls_matches_cpp_qualified_suffix() {
+    let bin = env!("CARGO_BIN_EXE_trace");
+    let tmp = std::env::temp_dir().join(format!(
+        "trace_inspect_suffix_{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let out = Command::new(bin)
+        .args([
+            "analyze",
+            fixture("cpp_implicit_this").to_str().unwrap(),
+            "-o",
+            tmp.to_str().unwrap(),
+        ])
+        .output()
+        .expect("analyze runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(bin)
+        .args([
+            "inspect",
+            tmp.to_str().unwrap(),
+            "calls",
+            "--to",
+            "OnEventProxy",
+        ])
+        .output()
+        .expect("inspect --to runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Plugin::OnEventProxy"),
+        "--to OnEventProxy should match Plugin::OnEventProxy, got:\n{stdout}"
+    );
+
+    let out = Command::new(bin)
+        .args([
+            "inspect",
+            tmp.to_str().unwrap(),
+            "calls",
+            "--from",
+            "OnEventProxy",
+        ])
+        .output()
+        .expect("inspect --from runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Plugin::OnEventProxy") && stdout.contains("Plugin::OnEvent"),
+        "--from OnEventProxy should list implicit this->OnEvent, got:\n{stdout}"
+    );
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[test]
+fn inspect_calls_like_wildcards_are_literal() {
+    let bin = env!("CARGO_BIN_EXE_trace");
+    let tmp = std::env::temp_dir().join(format!(
+        "trace_inspect_like_{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let out = Command::new(bin)
+        .args([
+            "analyze",
+            fixture("cpp_implicit_this").to_str().unwrap(),
+            "-o",
+            tmp.to_str().unwrap(),
+        ])
+        .output()
+        .expect("analyze runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(bin)
+        .args([
+            "inspect",
+            tmp.to_str().unwrap(),
+            "calls",
+            "--from",
+            "f_o",
+        ])
+        .output()
+        .expect("inspect --from f_o");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("ns::foo"),
+        "--from f_o must not match ns::foo via LIKE '_', got:\n{stdout}"
+    );
+
+    let out = Command::new(bin)
+        .args([
+            "inspect",
+            tmp.to_str().unwrap(),
+            "calls",
+            "--from",
+            "foo_bar",
+        ])
+        .output()
+        .expect("inspect --from foo_bar");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ns::foo_bar") && stdout.contains("-> ns::foo ["),
+        "--from foo_bar should match ns::foo_bar -> ns::foo, got:\n{stdout}"
+    );
+    let _ = std::fs::remove_file(tmp);
+}

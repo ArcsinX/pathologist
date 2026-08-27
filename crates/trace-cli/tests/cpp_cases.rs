@@ -126,6 +126,17 @@ fn cpp_overload_resolution_by_arity() {
 }
 
 #[test]
+fn cpp_namespace_qualified_call() {
+    let root = fixture("cpp_basic");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+    assert!(
+        has_direct(&program, &analysis, "main", "util::tag"),
+        "namespaced util::tag should be a direct callee of main"
+    );
+}
+
+#[test]
 fn cpp_anonymous_namespace_is_internal() {
     let root = fixture("cpp_basic");
     let program = build_program(&root, &default_opts(&root)).expect("build");
@@ -249,6 +260,295 @@ fn cpp_inherited_non_virtual_via_derived_receiver() {
     assert!(has_direct(&program, &analysis, "sink_w", "Widget::make"));
 }
 
+// --- cpp_implicit_this: bare method calls, smart_ptr unwrap ---
+
+#[test]
+fn cpp_implicit_this_virtual_call_expands() {
+    let root = fixture("cpp_implicit_this");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(has_direct(&program, &analysis, "drive", "Base::go"));
+    let hooks = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "Base::go"
+                && e.resolution == ResolutionKind::Direct
+        })
+        .map(|e| fn_name(&program, e.callee))
+        .collect::<Vec<_>>();
+    assert!(
+        hooks.iter().any(|t| t == "Base::hook"),
+        "implicit this->hook should hit Base::hook, got {hooks:?}"
+    );
+    assert!(
+        hooks.iter().any(|t| t == "Derived::hook"),
+        "virtual expansion should include Derived::hook, got {hooks:?}"
+    );
+}
+
+#[test]
+fn cpp_smart_ptr_member_call_unwraps_pointee() {
+    let root = fixture("cpp_implicit_this");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_direct(&program, &analysis, "call_sp", "Plugin::OnEventProxy"),
+        "shared_ptr<Plugin> p; p->OnEventProxy should type as Plugin"
+    );
+    assert!(
+        has_direct(&program, &analysis, "call_sp_ref", "Plugin::OnEventProxy"),
+        "const shared_ptr<Plugin> & should unwrap to Plugin"
+    );
+    assert!(
+        has_direct(
+            &program,
+            &analysis,
+            "Plugin::OnEventProxy",
+            "Plugin::OnEvent"
+        ),
+        "OnEventProxy body implicit this->OnEvent"
+    );
+    assert!(
+        has_direct(&program, &analysis, "call_up", "Plugin::OnEventProxy"),
+        "unique_ptr<Plugin> should unwrap like shared_ptr"
+    );
+    assert!(
+        has_direct(&program, &analysis, "call_wp", "Plugin::OnEventProxy"),
+        "weak_ptr<Plugin> should unwrap like shared_ptr"
+    );
+}
+
+#[test]
+fn cpp_smart_ptr_field_receiver_unwraps() {
+    let root = fixture("cpp_implicit_this");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_direct(&program, &analysis, "Holder::go", "Plugin::OnEvent"),
+        "plugin_->OnEvent on a shared_ptr field should type as Plugin"
+    );
+}
+
+#[test]
+fn cpp_member_virtual_overload_filters_by_arity() {
+    let root = fixture("cpp_implicit_this");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let unary: Vec<(String, usize)> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "call_unary"
+                && e.resolution == ResolutionKind::Direct
+                && fn_name(&program, e.callee).ends_with("::foo")
+        })
+        .map(|e| {
+            (
+                fn_name(&program, e.callee),
+                program.symbols.function(e.callee).params.len(),
+            )
+        })
+        .collect();
+    assert!(
+        unary.iter().any(|(t, _)| t == "Over::foo")
+            && unary.iter().any(|(t, _)| t == "OverD::foo"),
+        "p->foo(1) should CHA to unary Over::foo / OverD::foo, got {unary:?}"
+    );
+    for (t, n) in &unary {
+        assert_eq!(*n, 2, "{t} should be this+int, params={n}, all={unary:?}");
+    }
+
+    let binary: Vec<(String, usize)> = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "call_binary"
+                && e.resolution == ResolutionKind::Direct
+                && fn_name(&program, e.callee).ends_with("::foo")
+        })
+        .map(|e| {
+            (
+                fn_name(&program, e.callee),
+                program.symbols.function(e.callee).params.len(),
+            )
+        })
+        .collect();
+    for (t, n) in &binary {
+        assert_eq!(
+            *n, 3,
+            "{t} should be this+int+int, params={n}, all={binary:?}"
+        );
+    }
+}
+
+#[test]
+fn cpp_unused_attr_on_ref_param_keeps_definition() {
+    let root = fixture("cpp_implicit_this");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let sink = program
+        .symbols
+        .resolve_function("Sink::consume")
+        .expect("Sink::consume");
+    assert!(
+        program.symbols.function(sink).is_defined,
+        "T& param __UNUSED must remain a function_definition"
+    );
+}
+
+// --- cpp_callable: lambdas, std::function, functors, fn-ptr fields ---
+
+fn has_resolution(
+    program: &Program,
+    analysis: &AnalysisResult,
+    caller: &str,
+    callee: &str,
+    resolution: ResolutionKind,
+) -> bool {
+    analysis.call_edges.iter().any(|e| {
+        fn_name(&program, e.caller) == caller
+            && fn_name(&program, e.callee) == callee
+            && e.resolution == resolution
+    })
+}
+
+#[test]
+fn cpp_fn_ptr_field_and_local_resolve_indirect() {
+    let root = fixture("cpp_callable");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(has_resolution(
+        &program,
+        &analysis,
+        "call_field",
+        "target",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_resolution(
+        &program,
+        &analysis,
+        "call_local",
+        "target",
+        ResolutionKind::Indirect
+    ));
+}
+
+#[test]
+fn cpp_lambda_is_addr_of_fn_and_indirect_call() {
+    let root = fixture("cpp_callable");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let lambda_names: Vec<String> = program
+        .symbols
+        .functions
+        .iter()
+        .filter(|f| f.name.contains("$lambda"))
+        .map(|f| f.name.clone())
+        .collect();
+    assert!(
+        !lambda_names.is_empty(),
+        "lambda_expression should lower to a $lambda function"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller).contains("$lambda")
+                && fn_name(&program, e.callee) == "target"
+        }),
+        "lambda body should call target, lambdas={lambda_names:?}"
+    );
+    assert!(
+        analysis.call_edges.iter().any(|e| {
+            fn_name(&program, e.caller) == "call_lambda"
+                && fn_name(&program, e.callee).contains("$lambda")
+                && e.resolution == ResolutionKind::Indirect
+        }),
+        "g() should be an indirect call to the lambda"
+    );
+}
+
+#[test]
+fn cpp_functor_operator_call_resolves() {
+    let root = fixture("cpp_callable");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_direct(&program, &analysis, "call_functor", "Fn::operator()"),
+        "f() on a functor should target operator()"
+    );
+    assert!(
+        has_direct(&program, &analysis, "call_functor_field", "Fn::operator()"),
+        "w->cb() when cb is a functor field should target operator()"
+    );
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "Fn::operator()",
+        "target"
+    ));
+    assert!(
+        has_direct(
+            &program,
+            &analysis,
+            "call_bare_function_type",
+            "function::operator()"
+        ),
+        "a class named function (not std::function) should still be a functor"
+    );
+}
+
+#[test]
+fn cpp_std_function_resolves_like_fn_ptr() {
+    let root = fixture("cpp_callable");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "call_std_function",
+            "target",
+            ResolutionKind::Indirect
+        ),
+        "std::function local assigned a function should call it indirectly"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "call_std_field",
+            "target",
+            ResolutionKind::Indirect
+        ),
+        "std::function field call should resolve like a fn-ptr field"
+    );
+}
+
+#[test]
+fn cpp_qualified_undeclared_becomes_external() {
+    let root = fixture("cpp_callable");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "check_exists",
+            "FileUtil::Exists",
+            ResolutionKind::External
+        ),
+        "qualified FileUtil::Exists prototype should be an external edge, not unresolved indirect"
+    );
+}
+
 // --- cpp_flow: cross-language C dispatcher + C++ impl (HDF sbuf pattern) ---
 
 #[test]
@@ -271,4 +571,129 @@ fn cpp_impl_registered_into_c_ops_table_resolves_indirect() {
             "{target} must be an indirect target of s->impl->read exactly once"
         );
     }
+}
+
+// --- cpp_dispatch: virtual inheritance + final class/method ---
+
+fn cpp_direct_set(program: &Program, analysis: &AnalysisResult, caller: &str) -> Vec<String> {
+    let mut v = direct_targets(program, analysis, caller);
+    v.sort();
+    v.dedup();
+    v
+}
+
+#[test]
+fn cpp_virtual_inheritance_diamond_resolves_overrides() {
+    let root = fixture("cpp_dispatch");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        program.bases_of("Left").iter().any(|b| b == "VBase"),
+        "virtual base Left : virtual VBase must be recorded"
+    );
+    assert!(
+        program.bases_of("Right").iter().any(|b| b == "VBase"),
+        "virtual base Right : virtual VBase must be recorded"
+    );
+    let hits = cpp_direct_set(&program, &analysis, "diamond_drive");
+    assert!(
+        hits.iter().any(|t| t == "VBase::id"),
+        "diamond through VBase* should include VBase::id, got {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|t| t == "Left::id"),
+        "diamond through VBase* should include Left::id, got {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|t| t == "Diamond::id"),
+        "diamond through VBase* should include Diamond::id, got {hits:?}"
+    );
+}
+
+#[test]
+fn cpp_final_class_devirtualizes_receiver() {
+    let root = fixture("cpp_dispatch");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(
+        program.class_is_final("Sealed"),
+        "class Sealed final must be recorded"
+    );
+    let sealed = cpp_direct_set(&program, &analysis, "sealed_drive");
+    assert_eq!(
+        sealed,
+        vec!["Sealed::f".to_string()],
+        "Sealed* is final: only Sealed::f, not OpenSib::f"
+    );
+    let open = cpp_direct_set(&program, &analysis, "open_drive");
+    assert!(open.iter().any(|t| t == "Open::f"), "got {open:?}");
+    assert!(open.iter().any(|t| t == "Sealed::f"), "got {open:?}");
+    assert!(open.iter().any(|t| t == "OpenSib::f"), "got {open:?}");
+}
+
+#[test]
+fn cpp_final_method_stops_further_overrides() {
+    let root = fixture("cpp_dispatch");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    let mid_fn = program
+        .symbols
+        .resolve_function("MMid::g")
+        .expect("MMid::g");
+    assert!(
+        program.symbols.function(mid_fn).is_final,
+        "int g() final must set is_final"
+    );
+    let mid = cpp_direct_set(&program, &analysis, "mid_drive");
+    assert_eq!(
+        mid,
+        vec!["MMid::g".to_string()],
+        "MMid* with g() final is a unique target"
+    );
+    let base = cpp_direct_set(&program, &analysis, "mbase_drive");
+    assert!(base.iter().any(|t| t == "MBase::g"), "got {base:?}");
+    assert!(base.iter().any(|t| t == "MMid::g"), "got {base:?}");
+    assert!(
+        !base.iter().any(|t| t.contains("MLeaf")),
+        "final method must not pick up MLeaf, got {base:?}"
+    );
+}
+
+// --- cpp_extern_c_driver: C caller + C++ `extern "C"` heap/ops registration ---
+
+#[test]
+fn cpp_extern_c_driver_resolves_ipc_and_dispatch() {
+    let root = fixture("cpp_extern_c_driver");
+    let program = build_program(&root, &default_opts(&root)).expect("build");
+    let (_pag, analysis) = analyze(&program);
+
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "test_ipc_read",
+        "SbufObtainIpc"
+    ));
+    assert!(has_resolution(
+        &program,
+        &analysis,
+        "test_ipc_read",
+        "MParcelReadBuffer",
+        ResolutionKind::Indirect
+    ));
+    assert!(has_direct(
+        &program,
+        &analysis,
+        "test_ipc_dispatch",
+        "GetServiceOps"
+    ));
+    assert!(has_resolution(
+        &program,
+        &analysis,
+        "test_ipc_dispatch",
+        "ServiceDispatch",
+        ResolutionKind::Indirect
+    ));
 }

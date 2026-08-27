@@ -113,8 +113,8 @@ contains the substring.
 | Option | Description |
 |--------|-------------|
 | `<DB>` | Path to SQLite file produced by `trace analyze`. |
-| `--from <FN>` | Filter edges where the **caller** function name equals `FN`. |
-| `--to <FN>` | Filter edges where the **callee** function name equals `FN`. |
+| `--from <FN>` | Filter edges where the **caller** name equals `FN` or ends with `::FN` (C++ qualified methods). `_` and `%` in `FN` are literal, not `LIKE` wildcards. |
+| `--to <FN>` | Filter edges where the **callee** name equals `FN` or ends with `::FN`. Same escaping as `--from`. |
 
 Both filters may be combined. Output format:
 
@@ -498,7 +498,7 @@ tests/fixtures/    Integration test C corpora
 
 ## Limitations
 
-- **C++ first step** — namespaces, overloads (arity), classes/virtual dispatch, ctors/dtors are modeled; implicit `this->member` accesses, type-based overload ranking, and templates beyond name-stripping are not (see docs/ANALYSIS.md).
+- **C++ first step** — namespaces, overloads (arity), classes/virtual dispatch (including virtual bases), `final` class/method devirtualization, ctors/dtors, implicit `this->method()`, `shared_ptr`/`unique_ptr`/`weak_ptr` unwrap, and callables (`std::function`, lambdas, `operator()`) are modeled; type-based overload ranking and templates beyond name-stripping are not (see [docs/ANALYSIS.md](docs/ANALYSIS.md)). Next slices from hiview: [docs/CPP_ROADMAP.md](docs/CPP_ROADMAP.md).
 - **May-analysis** — indirect calls can list multiple targets; absence of an edge does not prove unreachability.
 - **No path sensitivity** — all branches and paths are merged.
 - **Preprocessor subset** — not gcc/clang compatible for all extensions; see [docs/PREPROCESSOR.md](docs/PREPROCESSOR.md).
@@ -512,6 +512,7 @@ tests/fixtures/    Integration test C corpora
 - [Preprocessor spec](docs/PREPROCESSOR.md)
 - [SQLite schema (detailed)](docs/SQLITE_SCHEMA.md)
 - [Roadmap](docs/ROADMAP.md)
+- [C++ next slices (hiview)](docs/CPP_ROADMAP.md)
 - [Contributor / agent guide](AGENTS.md)
 
 ## License

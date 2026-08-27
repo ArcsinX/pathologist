@@ -53,6 +53,9 @@ pub struct Function {
     /// method as virtual if *any* entry with its qualified name carries this
     /// flag, so out-of-class definitions without the token still participate.
     pub is_virtual: bool,
+    /// Declared `final` (C++ methods). CHA does not look for overrides in
+    /// subclasses of a class that finalizes this method.
+    pub is_final: bool,
     /// Entry may coexist with same-name externals of a different signature
     /// (C++ overloads). When neither side sets this, name merges behave
     /// exactly as in C (prototype + definition collapse into one entry).
@@ -79,6 +82,10 @@ pub struct CallSite {
     pub addr_of_member_args: Vec<u32>,
     pub span: Span,
     pub is_direct: bool,
+    /// Static class of a C++ member-call receiver (`this`, typed pointer).
+    /// Post-merge virtual expansion uses this so `final` types are not
+    /// re-expanded from the declaring base.
+    pub receiver_class: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +203,9 @@ impl SymbolTable {
                         if func.is_virtual {
                             existing.is_virtual = true;
                         }
+                        if func.is_final {
+                            existing.is_final = true;
+                        }
                     }
                     let bucket = self.externals_by_name.entry(func.name.clone()).or_default();
                     if !bucket.contains(&existing_id) {
@@ -229,6 +239,12 @@ impl SymbolTable {
                             }
                         } else if !func.is_defined && existing.params.is_empty() && !func.params.is_empty() {
                             existing.params = func.params.clone();
+                        }
+                        if func.is_virtual {
+                            existing.is_virtual = true;
+                        }
+                        if func.is_final {
+                            existing.is_final = true;
                         }
                         return existing_id;
                     }

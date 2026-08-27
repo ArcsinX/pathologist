@@ -79,6 +79,8 @@ pub struct Program {
     /// (`ns::Cls`). Populated at lowering, consumed post-merge by virtual
     /// dispatch expansion.
     pub inheritance: Vec<(String, String)>,
+    /// Classes declared `final` — CHA does not walk into their subclasses.
+    pub final_classes: Vec<String>,
 }
 
 impl Program {
@@ -98,6 +100,27 @@ impl Program {
         if !self.inheritance.contains(&edge) {
             self.inheritance.push(edge);
         }
+    }
+
+    /// Record that `cls` is a `final` class.
+    pub fn mark_class_final(&mut self, cls: &str) {
+        if cls.is_empty() {
+            return;
+        }
+        if !self.final_classes.iter().any(|c| c == cls) {
+            self.final_classes.push(cls.to_string());
+        }
+    }
+
+    pub fn class_is_final(&self, cls: &str) -> bool {
+        self.final_classes.iter().any(|c| c == cls)
+    }
+
+    fn class_method_is_final(&self, cls: &str, kind: &MethodKind) -> bool {
+        self.symbols
+            .functions_named(&kind.name_on(cls))
+            .iter()
+            .any(|&id| self.symbols.function(id).is_final)
     }
 
     /// Direct base classes of `cls`.
@@ -125,16 +148,52 @@ impl Program {
         out
     }
 
-    /// Every declared member matching `kind` on `cls` or any of its
-    /// subclasses — the virtual override set. Order: root first, then
-    /// subclasses in discovery order.
+    /// Subclass closure used for virtual dispatch: stop at `final` classes
+    /// and at classes that declare this method `final`.
+    pub fn dispatch_subclass_closure(&self, root: &str, kind: &MethodKind) -> Vec<String> {
+        let mut out = vec![root.to_string()];
+        let mut i = 0;
+        while i < out.len() {
+            let cur = out[i].clone();
+            i += 1;
+            if self.class_is_final(&cur) || self.class_method_is_final(&cur, kind) {
+                continue;
+            }
+            for (derived, base) in &self.inheritance {
+                if base == &cur && !out.iter().any(|c| c == derived) {
+                    out.push(derived.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Every method that CHA may select for a virtual call whose static
+    /// receiver type is `cls`. For each class in the (final-cut) subclass
+    /// closure, the nearest declaration walking toward bases is a target —
+    /// so a `final` class that does not override still resolves to the
+    /// inherited implementation, not to sibling overrides.
     pub fn method_targets(&self, cls: &str, kind: &MethodKind) -> Vec<FnId> {
         let mut out = Vec::new();
-        for c in self.subclass_closure(cls) {
-            let full = kind.name_on(&c);
-            for id in self.symbols.functions_named(&full) {
-                if !out.contains(&id) {
-                    out.push(id);
+        for c in self.dispatch_subclass_closure(cls, kind) {
+            let mut queue = std::collections::VecDeque::new();
+            let mut seen = std::collections::BTreeSet::new();
+            queue.push_back(c);
+            while let Some(cur) = queue.pop_front() {
+                if !seen.insert(cur.clone()) {
+                    continue;
+                }
+                let ids = self.symbols.functions_named(&kind.name_on(&cur));
+                if !ids.is_empty() {
+                    for id in ids {
+                        if !out.contains(&id) {
+                            out.push(id);
+                        }
+                    }
+                    break;
+                }
+                for base in self.bases_of(&cur) {
+                    queue.push_back(base);
                 }
             }
         }

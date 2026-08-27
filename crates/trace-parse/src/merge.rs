@@ -23,6 +23,8 @@ pub struct UnitIndex {
     pub anon_type_counter: u32,
     /// Per-unit `(derived, base)` class edges (C++).
     pub inheritance: Vec<(String, String)>,
+    /// Classes declared `final` in this unit.
+    pub final_classes: Vec<String>,
 }
 
 type SiteKey = (trace_ir::FileId, u32, u32, String);
@@ -32,6 +34,9 @@ pub fn merge_unit_index(program: &mut Program, unit: UnitIndex) {
     program.anon_type_counter = program.anon_type_counter.max(unit.anon_type_counter);
     for (derived, base) in unit.inheritance {
         program.add_inheritance(&derived, &base);
+    }
+    for cls in unit.final_classes {
+        program.mark_class_final(&cls);
     }
 
     let type_map = merge_types(&mut program.types, &unit.types);

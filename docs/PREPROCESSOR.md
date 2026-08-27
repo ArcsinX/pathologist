@@ -51,8 +51,8 @@ flowchart LR
 | Conditionals | `#ifdef`, `#ifndef`, `#if` / `#elif` (macro-expanded), `#else`, `#endif` |
 | `#line` | Location tracking in `LineMap` |
 | `#undef` | |
-| Predefined | `__FILE__`, `__LINE__` |
-| CLI defines | `-D NAME=VALUE` |
+| Predefined | `__FILE__`, `__LINE__`; empty object macro `__UNUSED` (applied even when the shared warm table is cloned, so `T &x __UNUSED` is not left as an identifier that breaks tree-sitter function definitions) |
+| Token spacing | No space before `)` / `]`; space between `>` and `&` / `*` so `operator()` and `shared_ptr<T> &p` survive re-lexing |
 
 ### P1 (planned)
 

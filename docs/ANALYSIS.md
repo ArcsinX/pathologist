@@ -393,8 +393,38 @@ C++-aware only where it must be — everything else reuses the C machinery.
   methods resolve exactly to that declaring function; **`virtual` methods and
   destructors** additionally expand downward through the subclass closure
   (one site per target — delete-through-base is the dominant dtor pattern).
-  When no ancestor declares the member, the call falls back to the receiver's
-  static-type subclass closure (receiver types can be imprecise).
+  Expansion runs again **after TU merge** so overrides declared later in the
+  same file or in other TUs are included. Downward expansion is rooted at the
+  **static receiver type**. Targets are filtered by **explicit arity**
+  (`params` minus implicit `this`; empty parameter lists stay, and an empty
+  filtered set falls back to all candidates so varargs still resolve). A
+  `final` class, or a method declared `final`,
+  cuts off further subclasses (devirtualization). C++ `struct` inheritance
+  and **virtual bases** (`class D : virtual B`) are recorded the same way as
+  ordinary bases for CHA (diamond override sets include the most-derived
+  override). When no ancestor declares the member, the call falls back to
+  the receiver's static-type subclass closure.
+- **Implicit `this->method()`**: a bare identifier call inside a method
+  (`OnEvent()` from `OnEventProxy`) is rewritten as a member call on the
+  enclosing class when that class (or a base) declares the method. This
+  runs before free-function name lookup so it does not synthesize an
+  unqualified external stub.
+- **Field receivers**: a bare identifier used as a member-call receiver
+  (`plugin_->OnEvent()` inside a method) is looked up as a data member of
+  the enclosing class (and bases) when it is not a local/param, so
+  `shared_ptr<Plugin>` fields unwrap like parameters.
+- **Smart pointers**: `std::shared_ptr<T>` / `unique_ptr` / `weak_ptr`
+  intern as `Ptr(Struct{T})`, so `p->method` types as `T`. Nested pointer
+  layers (`T &`, `T *`) are peeled for the same reason.
+- **Callables**: only `std::function<Sig>` / `::std::function<Sig>` intern
+  as `FnPtr` so assignment and field stores of function addresses
+  participate in indirect-call resolution. Other types whose last segment
+  is `function` stay ordinary classes. Lambdas lower to synthetic
+  `$lambda` functions with `AddrOfFn` on init/assign/arg (captures
+  unmodeled). Functors (`operator()`) are member calls, including `obj()`
+  and `h->field()` when `field`'s type declares `operator()`. Callable
+  data members that are not methods fall through to the C fn-ptr
+  field-load path.
 - **Methods**: out-of-class definitions (`Ret Cls::m()`) merge with their
   in-class prototypes. An implicit `this` parameter (`Ptr(Struct{Cls})`,
   param index 0) is prepended. `virtual` flags survive merges.
@@ -406,18 +436,28 @@ C++-aware only where it must be — everything else reuses the C machinery.
 
 Known C++ imprecision (in addition to the general list below):
 
-- Implicit `this->member` accesses (bare identifiers inside methods) are
-  **not** modeled; only explicit member access chains are.
+- Lambda **captures** are unmodeled (including `[this]`); the lambda body
+  still participates in the call graph as a nested function.
+- `auto` from a call (`auto p = wp.lock()`) stays `Unknown`; there is no
+  return-type inference, so member calls on such pointers do not unwrap.
+- `std::bind` / generic functors without a visible `operator()` stay
+  unresolved-indirect unless a function address flows into them.
 - Default construction without parens (`Cls o;`) emits no ctor site.
 - Objects at namespace scope emit no ctor/dtor sites (no enclosing function).
 - Anonymous-namespace overload ties degrade to first-wins.
 - Overload resolution is arity-only (no type-based ranking, conversions).
+  Unnamed parameters (`void foo(int)`) still occupy a slot so
+  `foo(int)` and `foo(int, int)` stay distinct; `void f(void)` does not.
 - Template specializations collapse into the primary entry; no
   dependent-type modeling.
-- Virtual expansion assumes single inheritance for the upward walk
-  (multiple bases still resolve, nearest declarer wins).
+- Virtual expansion is CHA from the static receiver type (not points-to).
+  Multiple bases resolve; nearest declarer wins when walking up.
+  `override` implies virtual. `final` on a class or method stops further
+  subclass targets. Virtual inheritance is recorded as a normal base edge.
 - Headers shared between `.c` and `.cpp` TUs parse under whichever
   grammar reaches them first at merge time.
+
+Next slices (hiview-grounded): [docs/CPP_ROADMAP.md](CPP_ROADMAP.md).
 
 ## Known imprecision
 
@@ -443,7 +483,12 @@ Known C++ imprecision (in addition to the general list below):
 - **`memcpy` / `memmove`**: modeled through function models (see above);
   unmodeled copier names remain invisible.
 - Macro-generated identifiers may be skipped when classified as macro-like callees.
-- Function pointer resolution is name/linkage based; dynamic `dlsym` not modeled.
+- Function pointer resolution is name/linkage based; dynamic `dlsym` /
+  `dlopen` is **not** modeled (future: [CPP_ROADMAP.md](CPP_ROADMAP.md) C11).
+  Literal-name `dlsym(h, "SbufObtainIpc")` / `dlsym(h, "GetInstance")` should
+  eventually behave like taking the address of that in-tree symbol; out-of-tree
+  DSOs stay external. `dlopen` that only runs `REGISTER` static constructors
+  is the C3 factory path, not a separate points-to problem.
 
 ## Performance notes
 

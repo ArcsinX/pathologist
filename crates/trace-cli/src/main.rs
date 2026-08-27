@@ -59,8 +59,12 @@ enum Commands {
 enum InspectCommands {
     /// List call graph edges.
     Calls {
+        /// Filter edges whose caller name equals FN or ends with `::FN`
+        /// (C++ qualified methods: `--from OnEventProxy` matches
+        /// `ns::Plugin::OnEventProxy`).
         #[arg(long)]
         from: Option<String>,
+        /// Filter edges whose callee name equals FN or ends with `::FN`.
         #[arg(long)]
         to: Option<String>,
         /// Only edges whose caller or callee file path contains this substring
@@ -294,6 +298,32 @@ fn run_analyze(
     Ok(())
 }
 
+/// Exact name or C++ qualified suffix (`Foo::Bar` matches `--from Bar`).
+/// User text is escaped so SQLite `LIKE` wildcards `_` / `%` are literal.
+fn push_fn_name_filter(sql: &mut String, params: &mut Vec<String>, column: &str, name: &str) {
+    params.push(name.to_string());
+    let eq = params.len();
+    params.push(format!("%::{}", like_escape(name)));
+    let like = params.len();
+    sql.push_str(&format!(
+        " AND ({column} = ?{eq} OR {column} LIKE ?{like} ESCAPE '!')"
+    ));
+}
+
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '!' | '%' | '_' => {
+                out.push('!');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
     let conn = open_db(&db)?;
     match command {
@@ -309,18 +339,16 @@ fn run_inspect(db: PathBuf, command: InspectCommands) -> Result<()> {
             );
             let mut params: Vec<String> = Vec::new();
             if let Some(f) = from.as_deref() {
-                params.push(f.to_string());
-                sql.push_str(&format!(" AND caller.name = ?{}", params.len()));
+                push_fn_name_filter(&mut sql, &mut params, "caller.name", f);
             }
             if let Some(t) = to.as_deref() {
-                params.push(t.to_string());
-                sql.push_str(&format!(" AND callee.name = ?{}", params.len()));
+                push_fn_name_filter(&mut sql, &mut params, "callee.name", t);
             }
             if let Some(p) = file.as_deref() {
-                params.push(format!("%{p}%"));
+                params.push(format!("%{}%", like_escape(p)));
                 let n = params.len();
                 sql.push_str(&format!(
-                    " AND (csf.path LIKE ?{n} OR callee_f.path LIKE ?{n})"
+                    " AND (csf.path LIKE ?{n} ESCAPE '!' OR callee_f.path LIKE ?{n} ESCAPE '!')"
                 ));
             }
             sql.push_str(" ORDER BY csf.path, cs.line");

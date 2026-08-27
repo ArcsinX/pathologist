@@ -76,15 +76,30 @@ impl PreprocessorState {
                 state.macros = guard.clone();
             }
         } else {
-            state.init_predefined_macros();
+            state.init_cli_defines();
         }
+        // Builtins are local to each preprocess so they apply even when
+        // the shared warm table is cloned (hiview `__UNUSED` lives in .cpp
+        // files, not in the header that `#ifndef`s it).
+        state.install_builtin_macros();
         state
     }
 
-    fn init_predefined_macros(&mut self) {
-        if self.opts.shared_macros.is_some() {
-            return;
+    /// GNU/MSVC unused-parameter markers. Without this, an undefined
+    /// `__UNUSED` after a reference declarator (`T &event __UNUSED`) is
+    /// parsed as a broken `declaration` and the function body is dropped.
+    fn install_builtin_macros(&mut self) {
+        if !self.macros.contains_key("__UNUSED") {
+            self.macros.insert(
+                "__UNUSED".to_string(),
+                MacroDef::Object {
+                    replacement: Vec::new(),
+                },
+            );
         }
+    }
+
+    fn init_cli_defines(&mut self) {
         let defines: Vec<_> = self
             .opts
             .defines
@@ -1208,7 +1223,15 @@ fn needs_leading_space(output: &str, kind: &TokenKind) -> bool {
         return false;
     }
     match kind {
-        TokenKind::Punct(s) => matches!(s.as_str(), ";" | "," | ")" | "]" | "}" | "::" | "."),
+        // Closing `)` / `]` must not gain a space (`operator()`, `foo[]`).
+        // After a template `>`, a space before `&` / `*` keeps
+        // `shared_ptr<T> &p` from gluing into `>&` which tree-sitter
+        // fails to parse as a reference parameter.
+        TokenKind::Punct(s) => match s.as_str() {
+            ";" | "," | "}" | "::" | "." => true,
+            "&" | "*" => last == '>',
+            _ => false,
+        },
         TokenKind::Newline => false,
         _ => !matches!(last, '(' | '[' | '{' | '.' | ';'),
     }
@@ -1298,7 +1321,7 @@ pub fn preprocess_string(source: &str, file: &Path, opts: &PreprocessOptions) ->
 mod tests {
     use super::*;
     use crate::options::IncludeExpansion;
-    use std::sync::RwLock;
+    use std::sync::{Arc, RwLock};
 
     #[test]
     fn expands_function_like_macro() {
@@ -1499,6 +1522,58 @@ enum { PRIVATE_MESSAGE_TYPE };\n";
         assert!(
             result.output.contains("1") && result.output.contains("3"),
             "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn cpp_operator_call_keeps_adjacent_parens() {
+        let src = "struct Fn { void operator()() {} };\n";
+        let result = preprocess_string(src, Path::new("t.cpp"), &PreprocessOptions::new());
+        assert!(
+            result.output.contains("operator()"),
+            "operator() must not become operator( ): {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("operator( )"),
+            "{}",
+            result.output
+        );
+        let src = "void f(const std::shared_ptr<Plugin> &p);\n";
+        let result = preprocess_string(src, Path::new("t.cpp"), &PreprocessOptions::new());
+        assert!(
+            result.output.contains("> &") || result.output.contains("> &p"),
+            "template-id and reference must not glue: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn unused_macro_is_predefined_empty() {
+        let src = "void f(int &x __UNUSED) { (void)x; }\n";
+        let result = preprocess_string(src, Path::new("t.cpp"), &PreprocessOptions::new());
+        assert!(
+            !result.output.contains("__UNUSED"),
+            "__UNUSED must expand away: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("int") && result.output.contains("&"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn unused_macro_applies_with_shared_table() {
+        let shared = Arc::new(RwLock::new(MacroTable::new()));
+        let opts = PreprocessOptions::new().with_shared_macros(Arc::clone(&shared));
+        let src = "void f(int &x __UNUSED) {}\n";
+        let result = preprocess_string(src, Path::new("t.cpp"), &opts);
+        assert!(
+            !result.output.contains("__UNUSED"),
+            "builtins must apply after cloning the shared table: {}",
             result.output
         );
     }

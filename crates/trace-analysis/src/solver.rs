@@ -1238,6 +1238,7 @@ mod tests {
                 col: 1,
             },
             is_direct,
+            receiver_class: None,
         };
         assert!(direct_by_name(&mk("OsalMemCalloc", None, false)));
         assert!(direct_by_name(&mk("f", None, true)));
