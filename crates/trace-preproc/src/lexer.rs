@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenKind {
@@ -17,6 +19,54 @@ pub struct Token {
     pub kind: TokenKind,
     pub line: u32,
     pub col: u32,
+    /// Macros that must not expand this token again (C11 6.10.3.4 hide set).
+    pub(crate) hidden: Option<Arc<HashSet<String>>>,
+}
+
+impl Token {
+    pub fn new(kind: TokenKind, line: u32, col: u32) -> Self {
+        Self {
+            kind,
+            line,
+            col,
+            hidden: None,
+        }
+    }
+
+    pub(crate) fn is_hidden(&self, name: &str) -> bool {
+        self.hidden.as_ref().is_some_and(|h| h.contains(name))
+    }
+
+    /// Paint this replacement-list token with the invoking token's hide set
+    /// plus `name` so the macro is not re-expanded (C11 6.10.3.4).
+    pub(crate) fn with_macro_hide(&self, origin: &Token, name: &str) -> Token {
+        let mut set = HashSet::new();
+        if let Some(h) = &origin.hidden {
+            set.extend(h.iter().cloned());
+        }
+        if let Some(h) = &self.hidden {
+            set.extend(h.iter().cloned());
+        }
+        set.insert(name.to_string());
+        Token {
+            kind: self.kind.clone(),
+            line: self.line,
+            col: self.col,
+            hidden: Some(Arc::new(set)),
+        }
+    }
+
+    pub(crate) fn union_hidden(left: &Token, right: &Token) -> Option<Arc<HashSet<String>>> {
+        match (&left.hidden, &right.hidden) {
+            (None, None) => None,
+            (Some(x), None) | (None, Some(x)) => Some(Arc::clone(x)),
+            (Some(x), Some(y)) => {
+                let mut s = (**x).clone();
+                s.extend(y.iter().cloned());
+                Some(Arc::new(s))
+            }
+        }
+    }
 }
 
 pub struct Lexer<'a> {
@@ -55,40 +105,24 @@ impl<'a> Lexer<'a> {
         let col = self.col;
 
         if self.is_at_end() {
-            return Token {
-                kind: TokenKind::Eof,
-                line,
-                col,
-            };
+            return Token::new(TokenKind::Eof, line, col);
         }
 
         let ch = self.peek_char();
 
         if ch == '\n' {
             self.advance_char();
-            return Token {
-                kind: TokenKind::Newline,
-                line,
-                col,
-            };
+            return Token::new(TokenKind::Newline, line, col);
         }
 
         if ch == '#' {
             if self.peek_char_at(1) == '#' {
                 self.advance_char();
                 self.advance_char();
-                return Token {
-                    kind: TokenKind::Punct("##".to_string()),
-                    line,
-                    col,
-                };
+                return Token::new(TokenKind::Punct("##".to_string()), line, col);
             }
             self.advance_char();
-            return Token {
-                kind: TokenKind::Hash,
-                line,
-                col,
-            };
+            return Token::new(TokenKind::Hash, line, col);
         }
 
         if ch == '"' {
@@ -139,11 +173,7 @@ impl<'a> Lexer<'a> {
                     self.advance_char();
                 }
             }
-            return Token {
-                kind: TokenKind::Punct(s),
-                line,
-                col,
-            };
+            return Token::new(TokenKind::Punct(s), line, col);
         }
 
         // Unknown char - skip
@@ -172,11 +202,7 @@ impl<'a> Lexer<'a> {
         if !self.is_at_end() && self.peek_char() == '"' {
             self.advance_char();
         }
-        Token {
-            kind: TokenKind::String(s),
-            line,
-            col,
-        }
+        Token::new(TokenKind::String(s), line, col)
     }
 
     fn read_char(&mut self, line: u32, col: u32) -> Token {
@@ -198,11 +224,7 @@ impl<'a> Lexer<'a> {
         if !self.is_at_end() {
             self.advance_char();
         }
-        Token {
-            kind: TokenKind::Char(s),
-            line,
-            col,
-        }
+        Token::new(TokenKind::Char(s), line, col)
     }
 
     fn read_number(&mut self, line: u32, col: u32) -> Token {
@@ -224,11 +246,7 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        Token {
-            kind: TokenKind::Number(s),
-            line,
-            col,
-        }
+        Token::new(TokenKind::Number(s), line, col)
     }
 
     fn read_identifier(&mut self, line: u32, col: u32) -> Token {
@@ -242,11 +260,7 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        Token {
-            kind: TokenKind::Identifier(s),
-            line,
-            col,
-        }
+        Token::new(TokenKind::Identifier(s), line, col)
     }
 
     fn skip_whitespace_and_comments(&mut self) {

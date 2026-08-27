@@ -1,10 +1,36 @@
-# Evaluation Report: `trace` Analysis of `drivers_hdf_core`
+# Evaluation Report: `trace` on OpenHarmony corpora
 
-**Date:** 2026-08-25 (updated 2026-08-26 with cross-struct FieldId guard fix)
-**Target:** `~/drivers_hdf_core` (OpenHarmony HDF kernel driver framework)
-**Binary:** `target/release/trace` (commit from current branch)
-**Flags:** `--full-export --debug-points-to`
+**Date:** 2026-08-25 (updated 2026-08-26 with cross-struct FieldId guard fix; **2026-08-27** preprocessor hide-set + `hiviewdfx_hiview` eval)
+**Binary:** `target/release/trace` (current tree)
 **Solver budget:** 800,000 pops (default; override via `TRACE_SOLVE_BUDGET_POPS`)
+
+This document covers two trees:
+
+| Corpus | Path | Role |
+|--------|------|------|
+| HDF (original) | `~/drivers_hdf_core` | C/C++ driver framework; function-pointer dispatch |
+| Hiview (2026-08-27) | `~/hiviewdfx_hiview` | C++ plugin platform; preprocessor X-macros + virtual dispatch |
+
+---
+
+# Part 1 — `drivers_hdf_core`
+
+**Target:** `~/drivers_hdf_core` (OpenHarmony HDF kernel driver framework)
+**Flags (original eval):** `--full-export --debug-points-to`
+
+### Hide-set revalidation (2026-08-27)
+
+After C11 macro hide-set + expansion-depth cap, the same tree was re-analyzed (minimal export, `--jobs 8`):
+
+| Metric | Original eval | After hide-set |
+|--------|---------------|----------------|
+| Files | 1,356 | 1,356 |
+| Functions | 11,899 | 11,903 |
+| Call edges | 36,957 | 36,956 |
+| Direct / indirect / external | 16,037 / 4,428 / 16,492 | 16,031 / 4,430 / 16,495 |
+| Arg-flow edges | 26,057 | 26,056 |
+
+No stack overflow. Counts match within a few edges (noise / cache order). The hide-set change does not regress HDF pointer analysis.
 
 ## Executive Summary
 
@@ -1063,3 +1089,222 @@ At 800K pops: **both targets resolved** (37s on 1,198-file corpus).
 - Default: 800K pops (required for comprehensive analysis on large corpora)
 - `TRACE_SOLVE_BUDGET_POPS=<n>`: override budget (e.g. 200000 for quick smoke test)
 - `TRACE_SOLVE_BUDGET_POPS=0`: unlimited (for debugging; may run indefinitely)
+
+---
+
+# Part 2 — `hiviewdfx_hiview` (2026-08-27)
+
+**Target:** `~/hiviewdfx_hiview` (OpenHarmony HiView DFX plugin platform)
+**Flags:** default (minimal SQLite export; flow graph always written)
+**Command:** `trace analyze ~/hiviewdfx_hiview -o hiview.db --jobs 8`
+**Index time:** 9.3s
+
+Hiview previously **aborted with a stack overflow** in `PreprocessorState::expand_tokens_no_directives`. After C11 hide-set painting (and a 256-deep expansion cap), the tree indexes to completion.
+
+## Executive summary
+
+Analysis of **1,322 files** (5,790 defined + 4,110 external functions) produced:
+
+- **12,652 call edges** (549 direct, **0 indirect**, 12,103 external)
+- **9,006** `call_sites` with `is_direct=0`, **none** of which gained a `call_edge`
+- **673** arg-flow edges
+- **430,156** flow nodes / **200,350** flow edges (dominated by `points_to`)
+- **552** parse warnings, 0 preprocess “expansion depth exceeded” diagnostics, 0 analysis errors
+
+The preprocessor fix is **confirmed**: the `PRIVATE_MESSAGE_TYPE` X-macro in `base/include/defines.h` (invoked from `Event::MessageType` in `event.h`) expands as gcc does (`PRIVATE_MESSAGE_TYPE, ENGINE_UPLOAD_READY_MSG, …`) instead of recursing.
+
+C++ plugin dispatch is **not** resolved the way HDF C function-pointer tables are. Almost every interesting call is either:
+
+1. an **unqualified** member/static call lowered as a **direct external** stub (`OnEvent`, `OnContinue`, `GetGlobalPluginInfo`), or
+2. an arrow/qualified call (`pluginPtr->OnEventProxy`, `std::string::c_str`) classified as **indirect** with **zero** solver targets.
+
+## Overall metrics
+
+| Metric | Value |
+|--------|-------|
+| Files indexed | 1,322 |
+| Functions total | 9,900 |
+| Functions defined | 5,790 |
+| External functions | 4,110 |
+| Call sites | 21,435 |
+| Call sites `is_direct=0` | 9,006 |
+| Call edges | 12,652 |
+| Direct call edges | 549 |
+| Indirect call edges | **0** |
+| External call edges | 12,103 |
+| Arg-flow edges | 673 |
+| Flow nodes | 430,156 |
+| Flow edges | 200,350 |
+
+### Flow edge breakdown
+
+| Kind | Count |
+|------|-------|
+| points_to | 195,897 |
+| copy | 2,369 |
+| gep | 1,232 |
+| call_arg | 538 |
+| store | 125 |
+| load | 113 |
+| addr_of | 70 |
+| terminates | 6 |
+
+### Diagnostics
+
+| Severity | Stage | Count |
+|----------|-------|-------|
+| warning | parse | 552 |
+
+No `macro expansion depth exceeded` warnings — hide-set, not the depth cap, stopped the X-macro recursion.
+
+## Feature coverage matrix (hiview)
+
+| # | Feature | Result |
+|---|---------|--------|
+| H1 | Self-referential object macro / X-macro enum list | **Pass** — `PRIVATE_MESSAGE_TYPE` / `PRIVATE_AUDIT_EVENT_TYPE` in `defines.h`; analysis completes |
+| H2 | Nested function-like macros (`MIN(MIN(a,b),c)`) | **Pass** (unit + fixture `self_ref_macro.c`) |
+| H3 | Mutual object macros (`#define A B+B` / `#define B A`) | **Pass** — terminates as `A+A` (gcc-compatible) |
+| H4 | Virtual `Plugin::OnEvent` via `OnEventProxy` | **Fail** — `OnEvent()` is a direct **external** stub, not the 27 in-tree `::OnEvent` overrides |
+| H5 | Pipeline plugin dispatch `pluginPtr->OnEventProxy` | **Fail** — site is indirect, 0 targets |
+| H6 | Same-class static call `PluginFactory::GetPlugin` → `GetGlobalPluginInfo` | **Fail** — unqualified name → external stub (qualified definition exists) |
+| H7 | `std::function` factory `info->getPluginObject()` | **Fail** — indirect, 0 targets |
+| H8 | Plugin body `EventLogger::OnEvent` | **Partial** — one qualified direct (`StartLogCollect`); other same-class calls external; `shared_ptr` methods unresolved |
+| H9 | `inspect calls --from OnEventProxy` | **Fail** — CLI is exact `functions.name` match; IR stores `OHOS::HiviewDFX::Plugin::OnEventProxy` |
+
+## Individual function evaluations
+
+### H1. `PRIVATE_MESSAGE_TYPE` — X-macro enumerator list (preprocessor)
+
+| Property | Value |
+|----------|-------|
+| File | `base/include/defines.h:39-70` (invoked at `base/include/event.h:127`) |
+| Pattern | `#define PRIVATE_MESSAGE_TYPE PRIVATE_MESSAGE_TYPE, ENGINE_UPLOAD_READY_MSG, …` |
+| gcc `-E` | `PRIVATE_MESSAGE_TYPE, ENGINE_UPLOAD_READY_MSG, …` (token painted, not re-expanded) |
+
+**Before hide-set:** `expand_tokens_no_directives` recursed on the first replacement token until stack overflow. Any TU that included `event.h` (most of the plugin tree) could not be indexed.
+
+**After hide-set:** replacement-list tokens inherit `{PRIVATE_MESSAGE_TYPE}` plus the invoking token’s hide set. The enumerator name is emitted; sibling enumerators are not macros and pass through. Same pattern: `PRIVATE_AUDIT_EVENT_TYPE`.
+
+**Regression tests:** `self_referential_object_macro_is_not_reexpanded`, `self_ref_macro_fixture`, `mutual_object_macros_terminate`, `nested_same_function_macro_still_expands`.
+
+---
+
+### H2. `OHOS::HiviewDFX::Plugin::OnEventProxy` — virtual plugin entry
+
+| Property | Value |
+|----------|-------|
+| File | `base/plugin.cpp:55-83` |
+| Linkage | external (defined) |
+| Call sites | 10 (1 direct, 9 `is_direct=0`) |
+| Call edges | 1 — `OnEvent` **external** at line 68 |
+| Arg-flow | 0 |
+
+**Role:** Framework wrapper: `ret = OnEvent(dupEvent)` then pipeline `OnContinue()`. Every plugin’s work is supposed to enter here.
+
+**Resolution:** Line 68 `OnEvent(dupEvent)` is a **virtual** call on `this`. Lowering records callee_text `OnEvent` as **direct**. The solver wires it to a synthesized **unqualified** external `OnEvent`, not to `Plugin::OnEvent` or the **27** defined `::OnEvent` overrides (`EventLogger`, `SysEventStore`, `FreezeDetectorPlugin`, …).
+
+The `plugin.cpp` out-of-line `Plugin::OnEvent` body (`plugin.cpp:35`) is **absent** as a defined function (only the `plugin.h:45` declaration exists). Other nearby methods with `__UNUSED` parameters (`CanProcessEvent`, `IsInterestedPipelineEvent`) **are** defined from the `.cpp`.
+
+Unqualified `shared_ptr` methods (`GetPendingProcessorSize`, `OnContinue`, …) are `is_direct=0` with no edges.
+
+---
+
+### H3. `OHOS::HiviewDFX::PipelineEvent::OnContinue` — pipeline pump
+
+| Property | Value |
+|----------|-------|
+| File | `base/pipeline.cpp:34-70` |
+| Call sites | 18 |
+| Direct edges | 12, all **external** (`OnFinish`, `OnContinue`, `front`, `PauseDispatch`, `shared_from_this`, …) |
+| Indirect unresolved | `pluginPtr->CanProcessMoreEvents`, `pluginPtr->IsInterestedPipelineEvent`, `pluginPtr->GetWorkLoop`, `workLoop->AddEvent`, `pluginPtr->OnEventProxy`, `std::weak_ptr::lock` |
+
+**Role:** Pops the next plugin from `processors_` and either posts to its work loop or calls `OnEventProxy` inline.
+
+**Resolution:** Recursive `return OnContinue()` at lines 56 and 67 becomes a **direct external** `OnContinue` (line-56 stub `is_defined=0`), not `PipelineEvent::OnContinue`. The actual plugin dispatch `pluginPtr->OnEventProxy(...)` is indirect with **0** targets — the central hiview call graph is missing.
+
+---
+
+### H4. `OHOS::HiviewDFX::PluginFactory::GetPlugin` — constructor registry
+
+| Property | Value |
+|----------|-------|
+| File | `base/plugin_factory.cpp:40-47` |
+| Call sites | 2 |
+
+```
+auto info = GetGlobalPluginInfo(name);   // direct → external GetGlobalPluginInfo
+return info->getPluginObject();          // indirect, 0 targets (std::function)
+```
+
+`PluginFactory::GetGlobalPluginInfo` **is** defined at line 30, but the same-class call uses the **unqualified** identifier, so it does not bind. `getPluginObject` is `std::function<std::shared_ptr<Plugin>()>` — no function-pointer PAG path.
+
+---
+
+### H5. `OHOS::HiviewDFX::EventLogger::OnEvent` — plugin implementation
+
+| Property | Value |
+|----------|-------|
+| File | `plugins/eventlogger/event_logger.cpp:209+` |
+| Call sites | 23 (9 `is_direct=0`) |
+
+**Resolved:** one **direct** qualified call `OHOS::HiviewDFX::EventLogger::StartLogCollect` (line 248) — the writer used an explicit qualified name.
+
+**External stubs:** `IsValidEventParam`, `GetEventPid`, `CheckContinueReport`, `UpdateDB`, `JudgmentRateLimiting`, … (same class, unqualified).
+
+**Unresolved indirect:** `Event::DownCastTo`, `std::shared_ptr::OnFinish` / `GetValue` / `OnPending`, `TimeUtil::GetMilliseconds`, `std::string::c_str`.
+
+This is the typical hiview plugin body: a few qualified directs, many same-TU calls exported as externals, STL/smart-pointer calls dropped.
+
+---
+
+### H6. `OHOS::HiviewDFX::SysEventStore::OnEvent` — event store plugin
+
+| Property | Value |
+|----------|-------|
+| File | `plugins/event_store/sys_event_store.cpp:123-160` |
+| Call sites | 26 (18 `is_direct=0`) |
+
+Same shape as H5: `std::call_once`, `Convert2SysEvent`, `SysEventSequenceManager::GetInstance`, `SaveToStore`, `TriggerExportEngine::GetInstance().ProcessEvent`. Instance/qualified C++ calls do not become in-tree edges.
+
+---
+
+### H7. Unresolved-`is_direct=0` taxonomy
+
+Top `callee_text` values among sites with **no** `call_edge`:
+
+| callee_text | Count | Kind |
+|-------------|------:|------|
+| `std::string::c_str` | 363 | STL method |
+| `std::make_shared` | 322 | template |
+| `std::to_string` | 318 | template |
+| `std::string` / `std::string::string` | 280+263 | ctor |
+| `std::string::append` / `empty` | 185+174 | STL |
+| `FileUtil::FileExists` | 127 | qualified static, not in tree or not bound |
+| `pluginPtr->OnEventProxy` (and similar arrows) | (in H3) | virtual / member via pointer |
+
+These are mostly **not** C function-pointer tables. Treating them as “indirect calls” inflates the unresolved-indirect count (9,006) compared to HDF, where `is_direct=0` meant `ops->Dispatch`.
+
+## Observations (hiview)
+
+1. **Hide-set is sufficient for this corpus.** The crash was a single well-known C pattern (X-macro list whose first token is the macro name). The 256-deep cap did not fire.
+
+2. **HDF-style indirect resolution does not transfer.** Hiview’s dispatch is C++ virtuals, `shared_ptr`/`weak_ptr`, `std::function`, and unqualified member calls. Result: **0** indirect `call_edges` vs HDF’s 4,428.
+
+3. **Unqualified lookup is the dominant FN.** 12,032 external edges go to names **without** `::`. Many of those identifiers exist in-tree under `OHOS::HiviewDFX::…`. `inspect --from OnEventProxy` therefore shows nothing.
+
+4. **`this->OnEvent` is not virtual-expanded.** Unlike HDF `deviceMethod->Dispatch` (78 targets), `Plugin::OnEventProxy` does not fan out to plugin overrides.
+
+5. **Parse warnings are per-file and non-fatal** (552), same recovery policy as HDF.
+
+6. **Isolation from the OHOS SDK** explains a large true-external remainder (`FileUtil`, `TimeUtil`, ffrt). That is expected when analyzing the hiview tree alone; it does not explain the in-tree unqualified misses.
+
+### Comparison to HDF (same binary)
+
+| | HDF | Hiview |
+|--|-----|--------|
+| Language mix | C + C++ interop via ops tables | Almost all C++ |
+| Indirect edges | 4,430 | **0** |
+| Direct edges | 16,031 | 549 |
+| External edges | 16,495 | 12,103 |
+| Preprocess | Completes | Completes **only with hide-set** |
+| Eval conclusion | Dispatch tables resolved | Platform **indexes**; plugin call graph **not** recovered |

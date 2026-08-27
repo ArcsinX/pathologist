@@ -45,6 +45,8 @@ flowchart LR
 | `#include "..."` / `<...>` | Include path stack + `--include` |
 | `#define` | Object-like and **function-like** (non-variadic) |
 | Macro rescanning | Function-like macros invoked inside another macro's expansion are expanded too (C11 6.10.3.4); uninvoked function-like names are emitted verbatim |
+| Macro hide set | Replacement-list tokens are painted with the macro name (and the invoking token's hide set) so self-referential macros such as `#define FOO FOO, BAR` terminate; nested `MIN(MIN(a,b),c)` still expands because argument tokens are not painted |
+| Expansion depth cap | 256 nested expansions; further expansion is skipped with a warning (backstop if hide-set does not apply) |
 | `##` token pasting | In macro bodies after argument substitution |
 | Conditionals | `#ifdef`, `#ifndef`, `#if` / `#elif` (macro-expanded), `#else`, `#endif` |
 | `#line` | Location tracking in `LineMap` |
@@ -149,6 +151,6 @@ A mid-run stop inside ONE nested header must not invalidate the whole TU: indexi
 ## Testing
 
 - Unit tests: `trace-preproc/src/`
-- Integration fixtures: `tests/fixtures/preproc/`
+- Integration fixtures: `tests/fixtures/preproc/` (including `self_ref_macro.c` for C11 hide-set / X-macro lists)
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how preprocessing fits the full workflow.

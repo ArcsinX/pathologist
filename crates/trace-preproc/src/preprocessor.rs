@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
+/// Nested macro-expansion cap (C11 hide-set is the primary recursion brake;
+/// this is a backstop for pathological `##` / hide-set edge cases).
+const MAX_MACRO_EXPANSION_DEPTH: u32 = 256;
+
 #[derive(Debug, Error)]
 pub enum PreprocessError {
     #[error("failed to read {path}: {source}")]
@@ -44,6 +48,9 @@ struct PreprocessorState {
     /// Interned index of `current_file` in `line_map.files`; `u32::MAX`
     /// means "not interned yet" (re-interned lazily when the file changes).
     lm_cur_file: u32,
+    /// Current nested macro-expansion depth (hide-set rescan frames).
+    expansion_depth: u32,
+    expansion_limit_warned: bool,
 }
 
 impl PreprocessorState {
@@ -61,6 +68,8 @@ impl PreprocessorState {
             current_line: 1,
             emitted_bytes: HashMap::new(),
             lm_cur_file: u32::MAX,
+            expansion_depth: 0,
+            expansion_limit_warned: false,
         };
         if let Some(shared) = &state.opts.shared_macros {
             if let Ok(guard) = shared.read() {
@@ -121,6 +130,34 @@ impl PreprocessorState {
 
     fn is_active(&self) -> bool {
         self.conditional_stack.iter().all(|&b| b)
+    }
+
+    fn push_expansion(&mut self, line: u32) -> bool {
+        if self.expansion_depth >= MAX_MACRO_EXPANSION_DEPTH {
+            if !self.expansion_limit_warned {
+                self.warn(
+                    line,
+                    format!(
+                        "macro expansion depth exceeded ({MAX_MACRO_EXPANSION_DEPTH}); skipping further expansion"
+                    ),
+                );
+                self.expansion_limit_warned = true;
+            }
+            return false;
+        }
+        self.expansion_depth += 1;
+        true
+    }
+
+    fn pop_expansion(&mut self) {
+        self.expansion_depth = self.expansion_depth.saturating_sub(1);
+    }
+
+    fn paint_replacement(tokens: &[Token], origin: &Token, name: &str) -> Vec<Token> {
+        tokens
+            .iter()
+            .map(|t| t.with_macro_hide(origin, name))
+            .collect()
     }
 
     /// Intern a path into the line-map file table (no-op if present).
@@ -414,32 +451,59 @@ impl PreprocessorState {
                         i += 1;
                         continue;
                     }
-                    if let Some(macro_def) = self.macros.get(name).cloned() {
-                        match macro_def {
-                            MacroDef::Function {
-                                params,
-                                replacement,
-                                variadic,
-                            } => {
-                                if self.next_non_newline_is(tokens, i + 1, "(") {
+                    if !tok.is_hidden(name) {
+                        if let Some(macro_def) = self.macros.get(name).cloned() {
+                            match macro_def {
+                                MacroDef::Function {
+                                    params,
+                                    replacement,
+                                    variadic,
+                                } => {
+                                    if self.next_non_newline_is(tokens, i + 1, "(") {
+                                        if !self.push_expansion(tok.line) {
+                                            self.emit_token(tok);
+                                            i += 1;
+                                            continue;
+                                        }
+                                        i += 1;
+                                        let args = match self.parse_macro_args(tokens, &mut i) {
+                                            Ok(a) => a,
+                                            Err(e) => {
+                                                self.pop_expansion();
+                                                return Err(e);
+                                            }
+                                        };
+                                        let expanded = apply_concatenation(substitute_macro(
+                                            name,
+                                            tok,
+                                            &replacement,
+                                            &params,
+                                            &args,
+                                            variadic,
+                                        ));
+                                        let r = self.process_tokens(&expanded);
+                                        self.pop_expansion();
+                                        r?;
+                                        continue;
+                                    }
+                                    self.emit_token(tok);
+                                }
+                                MacroDef::Object { replacement } => {
+                                    if !self.push_expansion(tok.line) {
+                                        self.emit_token(tok);
+                                        i += 1;
+                                        continue;
+                                    }
+                                    let painted = Self::paint_replacement(&replacement, tok, name);
+                                    let r = self.expand_tokens_no_directives(&painted);
+                                    self.pop_expansion();
+                                    r?;
                                     i += 1;
-                                    let args = self.parse_macro_args(tokens, &mut i)?;
-                                    let expanded = apply_concatenation(substitute_macro(
-                                        &replacement,
-                                        &params,
-                                        &args,
-                                        variadic,
-                                    ));
-                                    self.process_tokens(&expanded)?;
                                     continue;
                                 }
-                                self.emit_token(tok);
                             }
-                            MacroDef::Object { replacement } => {
-                                self.expand_tokens_no_directives(&replacement)?;
-                                i += 1;
-                                continue;
-                            }
+                        } else {
+                            self.emit_token(tok);
                         }
                     } else {
                         self.emit_token(tok);
@@ -477,36 +541,61 @@ impl PreprocessorState {
             }
             if self.is_active() {
                 if let TokenKind::Identifier(name) = &tok.kind {
-                    match self.macros.get(name).cloned() {
-                        Some(MacroDef::Object { replacement }) => {
-                            self.expand_tokens_no_directives(&replacement)?;
-                            i += 1;
-                            continue;
-                        }
-                        // Function-like macros appearing inside another
-                        // macro's expansion must be invoked and their
-                        // expansion rescanned (C11 6.10.3.4); otherwise
-                        // nested definitions like
-                        // `#define A SHARED_OBJ(T)` leak `SHARED_OBJ(T)`
-                        // verbatim into the output.
-                        Some(MacroDef::Function {
-                            params,
-                            replacement,
-                            variadic,
-                        }) if self.next_non_newline_is(tokens, i + 1, "(") => {
-                            let mut j = i + 1;
-                            let args = self.parse_macro_args(tokens, &mut j)?;
-                            let expanded = apply_concatenation(substitute_macro(
-                                &replacement,
-                                &params,
-                                &args,
+                    if !tok.is_hidden(name) {
+                        match self.macros.get(name).cloned() {
+                            Some(MacroDef::Object { replacement }) => {
+                                if !self.push_expansion(tok.line) {
+                                    self.emit_token(tok);
+                                    i += 1;
+                                    continue;
+                                }
+                                let painted = Self::paint_replacement(&replacement, tok, name);
+                                let r = self.expand_tokens_no_directives(&painted);
+                                self.pop_expansion();
+                                r?;
+                                i += 1;
+                                continue;
+                            }
+                            // Function-like macros appearing inside another
+                            // macro's expansion must be invoked and their
+                            // expansion rescanned (C11 6.10.3.4); otherwise
+                            // nested definitions like
+                            // `#define A SHARED_OBJ(T)` leak `SHARED_OBJ(T)`
+                            // verbatim into the output.
+                            Some(MacroDef::Function {
+                                params,
+                                replacement,
                                 variadic,
-                            ));
-                            self.expand_tokens_no_directives(&expanded)?;
-                            i = j;
-                            continue;
+                            }) if self.next_non_newline_is(tokens, i + 1, "(") => {
+                                if !self.push_expansion(tok.line) {
+                                    self.emit_token(tok);
+                                    i += 1;
+                                    continue;
+                                }
+                                let mut j = i + 1;
+                                let args = match self.parse_macro_args(tokens, &mut j) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        self.pop_expansion();
+                                        return Err(e);
+                                    }
+                                };
+                                let expanded = apply_concatenation(substitute_macro(
+                                    name,
+                                    tok,
+                                    &replacement,
+                                    &params,
+                                    &args,
+                                    variadic,
+                                ));
+                                let r = self.expand_tokens_no_directives(&expanded);
+                                self.pop_expansion();
+                                r?;
+                                i = j;
+                                continue;
+                            }
+                            Some(MacroDef::Function { .. }) | None => {}
                         }
-                        Some(MacroDef::Function { .. }) | None => {}
                     }
                 }
                 self.emit_token(tok);
@@ -975,6 +1064,8 @@ fn at_beginning_of_line(tokens: &[Token], i: usize) -> bool {
 }
 
 fn substitute_macro(
+    macro_name: &str,
+    origin: &Token,
     body: &[Token],
     params: &[String],
     args: &[Vec<Token>],
@@ -1008,11 +1099,10 @@ fn substitute_macro(
                 let start = params.len().saturating_sub(1);
                 for (ai, arg) in args.iter().enumerate().skip(start) {
                     if ai > start {
-                        out.push(Token {
-                            kind: TokenKind::Punct(",".into()),
-                            line: body[i].line,
-                            col: body[i].col,
-                        });
+                        out.push(
+                            Token::new(TokenKind::Punct(",".into()), body[i].line, body[i].col)
+                                .with_macro_hide(origin, macro_name),
+                        );
                     }
                     out.extend(arg.iter().cloned());
                 }
@@ -1023,11 +1113,10 @@ fn substitute_macro(
                 if variadic && idx + 1 == params.len() {
                     for (ai, arg) in args.iter().enumerate().skip(idx) {
                         if ai > idx {
-                            out.push(Token {
-                                kind: TokenKind::Punct(",".into()),
-                                line: body[i].line,
-                                col: body[i].col,
-                            });
+                            out.push(
+                                Token::new(TokenKind::Punct(",".into()), body[i].line, body[i].col)
+                                    .with_macro_hide(origin, macro_name),
+                            );
                         }
                         out.extend(arg.iter().cloned());
                     }
@@ -1038,7 +1127,8 @@ fn substitute_macro(
                 continue;
             }
         }
-        out.push(body[i].clone());
+        // Replacement-list tokens (not from arguments) inherit the hide set.
+        out.push(body[i].with_macro_hide(origin, macro_name));
         i += 1;
     }
     out
@@ -1093,6 +1183,7 @@ fn paste_two_tokens(left: &Token, right: &Token) -> Token {
         kind: TokenKind::Identifier(text),
         line: left.line,
         col: left.col,
+        hidden: Token::union_hidden(left, right),
     }
 }
 
@@ -1342,6 +1433,112 @@ mod tests {
         assert!(!result.output.contains("unguarded"), "{}", result.output);
         assert!(result.output.contains("present"), "{}", result.output);
         assert!(!result.output.contains("missing"), "{}", result.output);
+    }
+
+    #[test]
+    fn self_referential_object_macro_is_not_reexpanded() {
+        // Hiview `PRIVATE_MESSAGE_TYPE` X-macro: the replacement list starts
+        // with the macro's own name (an enumerator). C11 6.10.3.4 paints
+        // that token so expansion terminates; without a hide set this
+        // recurses until the stack overflows.
+        let src = "\
+#define PRIVATE_MESSAGE_TYPE \\\n\
+        PRIVATE_MESSAGE_TYPE, \\\n\
+        ENGINE_UPLOAD_READY_MSG\n\
+enum { PRIVATE_MESSAGE_TYPE };\n";
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(
+            result.output.contains("PRIVATE_MESSAGE_TYPE")
+                && result.output.contains("ENGINE_UPLOAD_READY_MSG"),
+            "{}",
+            result.output
+        );
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("expansion depth exceeded")),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn mutual_object_macros_terminate() {
+        let src = "#define A B+B\n#define B A\nint x = A;\n";
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        let compact: String = result
+            .output
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            compact.contains("A+A") || compact.contains("x=A+A"),
+            "{}",
+            result.output
+        );
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("expansion depth exceeded")),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn nested_same_function_macro_still_expands() {
+        let src = "#define MIN(a, b) ((a) < (b) ? (a) : (b))\nint x = MIN(MIN(1, 2), 3);\n";
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(
+            !result.output.contains("MIN"),
+            "nested MIN must fully expand: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("1") && result.output.contains("3"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn self_referential_function_macro_terminates() {
+        let src = "#define F(x) F(x)\nint y = F(1);\n";
+        let result = preprocess_string(src, Path::new("t.c"), &PreprocessOptions::new());
+        assert!(
+            result.output.contains("F") && result.output.contains("1"),
+            "{}",
+            result.output
+        );
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("expansion depth exceeded")),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn self_ref_macro_fixture() {
+        use std::path::PathBuf;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/preproc/self_ref_macro.c");
+        let result = preprocess_file(&path, &PreprocessOptions::new()).unwrap();
+        assert!(
+            result.output.contains("PRIVATE_MESSAGE_TYPE")
+                && result.output.contains("ENGINE_UPLOAD_READY_MSG"),
+            "{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("MIN"),
+            "nested MIN leaked: {}",
+            result.output
+        );
     }
 
     #[test]
