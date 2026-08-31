@@ -1,5 +1,5 @@
 {
-  "note": "Regression expectations for scripts/eval_check.py. Each corpus pins repo + rev (commit SHA) and its checkout dir under the corpus base (~ by default, or $TRACE_CORPUS_BASE / --corpus-base); scripts/fetch_corpora.py checks the pinned revisions out and eval_check.py refuses a checkout at any other revision. 'exact' must match; 'band' compares abs(actual-expected) <= N; 'min' requires actual >= N. Site checks count distinct callee NAMES at one dispatch call_site (caller name LIKE, line). Values were captured from a fresh 2026-09-02 run of master (c7c6def, after #12) at the pinned revisions (see docs/EVAL_REPORT.md); bulk function/edge totals drift a little run-to-run (parallel index), correctness numbers do not.",
+  "note": "Regression expectations for scripts/eval_check.py. Each corpus pins repo + rev (commit SHA) and its checkout dir under the corpus base (~ by default, or $TRACE_CORPUS_BASE / --corpus-base); scripts/fetch_corpora.py checks the pinned revisions out and eval_check.py refuses a checkout at any other revision. 'exact' must match; 'band' compares abs(actual-expected) <= N; 'min' requires actual >= N. Site checks count distinct callee NAMES at one dispatch call_site (caller name LIKE, line). Values were captured from a fresh 2026-09-02 run after IPC bridge support (#18); bulk function/edge totals drift a little run-to-run (parallel index), correctness numbers do not.",
   "budget_pops": 800000,
   "jobs": 8,
   "corpora": {
@@ -19,7 +19,8 @@
         "edges_external": {"cmp": "band", "value": 15213, "tol": 200},
         "arg_flow_edges": {"cmp": "band", "value": 33996, "tol": 150},
         "diagnostics": {"cmp": "exact", "value": 191},
-        "dlsym_edges": {"cmp": "exact", "value": 4}
+        "dlsym_edges": {"cmp": "exact", "value": 4},
+        "edges_ipc": {"cmp": "exact", "value": 0}
       },
       "sites": [
         {"case": "DeviceNodeExtDispatch", "caller": "%DeviceNodeExtDispatch", "line": 0, "resolution": "indirect", "expected": 74},
@@ -56,7 +57,8 @@
         "edges_external": {"cmp": "band", "value": 21946, "tol": 160},
         "arg_flow_edges": {"cmp": "band", "value": 7297, "tol": 120},
         "diagnostics": {"cmp": "exact", "value": 57},
-        "dlsym_edges": {"cmp": "exact", "value": 1}
+        "dlsym_edges": {"cmp": "exact", "value": 1},
+        "edges_ipc": {"cmp": "exact", "value": 9}
       },
       "sites": [
         {"case": "Plugin::OnEventProxy dispatch", "caller": "%Plugin::OnEventProxy", "line": 68, "resolution": "all", "expected": 23},
@@ -70,6 +72,33 @@
       "probes": [
         {"name": "defined overload groups (C++ overload splitting)", "sql": "SELECT COUNT(*) FROM (SELECT name FROM functions WHERE is_defined=1 GROUP BY name HAVING COUNT(*)>1)", "cmp": "min", "value": 120},
         {"name": "EventHandler::OnEvent family overrides resolved at the CHA site (base + subclasses)", "sql": "SELECT COUNT(DISTINCT tf.name) FROM call_sites cs JOIN call_edges e ON e.call_site_id=cs.id JOIN functions cf ON cf.id=cs.caller_fn_id JOIN functions tf ON tf.id=e.callee_fn_id WHERE cf.name LIKE '%EventHandler::OnEventProxy' AND cs.line=232 AND tf.name LIKE '%EventHandler::OnEvent'", "cmp": "exact", "value": 4}
+      ]
+    },
+    "dmsfwk": {
+      "name": "ability_dmsfwk",
+      "repo": "https://github.com/openharmony/ability_dmsfwk.git",
+      "rev": "703530039be0d973ced48588b731a94fec223738",
+      "dir": "ability_dmsfwk",
+      "globals": {
+        "files": {"cmp": "exact", "value": 851},
+        "functions_total": {"cmp": "band", "value": 12251, "tol": 60},
+        "functions_defined": {"cmp": "band", "value": 8797, "tol": 60},
+        "functions_external": {"cmp": "band", "value": 3454, "tol": 60},
+        "edges_total": {"cmp": "band", "value": 36764, "tol": 120},
+        "edges_direct": {"cmp": "band", "value": 5142, "tol": 120},
+        "edges_indirect": {"cmp": "exact", "value": 6},
+        "edges_external": {"cmp": "band", "value": 31608, "tol": 120},
+        "arg_flow_edges": {"cmp": "band", "value": 6889, "tol": 120},
+        "diagnostics": {"cmp": "exact", "value": 90},
+        "dlsym_edges": {"cmp": "exact", "value": 0},
+        "edges_ipc": {"cmp": "exact", "value": 8}
+      },
+      "sites": [
+      ],
+      "probes": [
+        {"name": "IPC edge to a defined stub handler (2 AbilityConnectionWrapper bridges)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN functions tf ON tf.id=e.callee_fn_id WHERE e.resolution='ipc' AND tf.is_defined=1", "cmp": "exact", "value": 2},
+        {"name": "IPC edge to an external interface handler (6 interface-fallback bridges)", "sql": "SELECT COUNT(*) FROM call_edges e JOIN functions tf ON tf.id=e.callee_fn_id WHERE e.resolution='ipc' AND tf.is_defined=0", "cmp": "exact", "value": 6},
+        {"name": "defined overload groups (C++ overload splitting)", "sql": "SELECT COUNT(*) FROM (SELECT name FROM functions WHERE is_defined=1 GROUP BY name HAVING COUNT(*)>1)", "cmp": "min", "value": 60}
       ]
     },
     "camera": {
@@ -88,7 +117,8 @@
         "edges_external": {"cmp": "band", "value": 46522, "tol": 420},
         "arg_flow_edges": {"cmp": "band", "value": 16012, "tol": 250},
         "diagnostics": {"cmp": "exact", "value": 93},
-        "dlsym_edges": {"cmp": "exact", "value": 0}
+        "dlsym_edges": {"cmp": "exact", "value": 0},
+        "edges_ipc": {"cmp": "exact", "value": 2}
       },
       "sites": [
         {"case": "Command::Do GetCommandName", "caller": "%DeferredProcessing::Command::Do", "line": 35, "resolution": "all", "expected": 31},

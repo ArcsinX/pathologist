@@ -1,6 +1,6 @@
 # Evaluation Report
 
-**Date:** 2026-08-28  
+**Date:** 2026-09-02  
 **Binary:** current tree (`trace-cli` release)  
 **Solver budget:** 800,000 pops (`TRACE_SOLVE_BUDGET_POPS`)  
 **Machine:** Linux, 16 logical CPUs, `--jobs 8`, minimal SQLite export  
@@ -24,6 +24,45 @@ hiview and camera are identical. hdf differs only by **+6 direct call edges** to
 `(HcsIsByteAlign() ? …)`, were dropped as malformed function-like definitions and now expand.
 Every hub target set, the indirect-edge count, diagnostics, and the parse-failure file sets are
 unchanged, so `scripts/eval_expected.json` and the tables below are not touched by this change.
+
+**Re-verified 2026-09-02 (IPC bridge support, #18):** IPC proxy→stub bridge detection is now
+enabled by default. New `edges_ipc` resolution type tracks synthetic call edges across Binder
+IPC boundaries. Detected bridges:
+- **hiview**: 9 IPC edges — 4 direct handler matches (`FaultLoggerServiceProxy` →
+  `FaultLoggerServiceStub::Handle*` for GwpAsanGrayscale/Inner) plus 5 interface-fallback
+  bridges where the stub delegates to inherited interface methods:
+  `FaultLogQueryResultProxy::{HasNext,GetNext}` → `IFaultLogQueryResult::{HasNext,GetNext}` (2),
+  `FaultLoggerServiceProxy::{AddFaultLog,QuerySelfFaultLog,Destroy}` →
+  `IFaultLoggerService::{AddFaultLog,QuerySelfFaultLog,Destroy}` (3)
+- **camera**: 2 IPC edges (`HStreamCaptureThumbnailCallbackProxy` → `HStreamCaptureThumbnailCallbackStub`,
+  `HStreamCapturePhotoCallbackProxy` → `HStreamCapturePhotoCallbackStub`). Other `*Proxy` classes
+  in tree with `SendRequest` calls (`HCameraProxy`, `HCameraRgmProxy`,
+  `CameraSceneSessionManagerProxy`, `CameraMockSessionManagerProxy`,
+  `CameraWindowSessionManagerProxy`, `DeviceProtectionAbilityConnection`,
+  `NoFrontCameraAbilityConnection`) are service-face proxies whose stubs live in another
+  OpenHarmony repo/process — `HCameraProxy` dispatches to the `HCameraService` system ability
+  (`OnRemoteRequest`, not a `HCameraStub`), and the scene-session proxies target external
+  interfaces (`ISceneSessionManager`) implemented outside this tree. No in-tree stub or
+  same-tree interface method exists to pair them, so they correctly produce no IPC edge.
+- **hdf**: 0 IPC edges (pure C kernel driver framework, no C++ proxy/stub classes)
+- **dmsfwk** (`ability_dmsfwk`): 8 IPC edges — 2 defined-stub bridges
+  (`AbilityConnectionWrapperProxy` → `AbilityConnectionWrapperStub`:
+  `OnAbilityConnectDone`, `OnAbilityDisconnectDone`) plus 6 interface-fallback bridges
+  to external interfaces (`DExtensionProxy`→`IDExtension`, `DmsFreeInstallCallbackProxy`→
+  `IDmsFreeInstallCallback`, `DeviceSelectionNotifierProxy`→`IDeviceSelectionNotifier`).
+
+All existing metrics (direct/indirect/external edges, arg-flow, diagnostics, hub target sets) are
+**unchanged** — IPC bridges are additive. `scripts/eval_expected.json` updated with `edges_ipc`
+exact checks. Total edge counts absorb the new ipc edges (hiview +9, camera +2, dmsfwk +8).
+
+For stubs with no handler methods (only `OnRemoteRequest` dispatching to inherited
+interface methods), the detector falls back to matching the proxy method against the external
+pure-virtual interface method (e.g. `FaultLogQueryResultProxy::HasNext` →
+`IFaultLogQueryResult::HasNext`). These edges target external functions and are still emitted
+for call-graph completeness. Bridges without a pullable handler are detected at PAG build but
+produce no solver edge. In hiview, `QuerySysEventCallbackProxy` has no stub class in the tree
+(no `QuerySysEventCallbackStub`), so its two `SendRequest` methods (`OnQuery`, `OnComplete`)
+cannot be paired.
 
 Performance was re-measured with the current binary (fresh runs, `--jobs 8`; stage timers
 are stable, wall-clock varies with cache so values are rounded). The declarator-shaping
@@ -1915,7 +1954,54 @@ Only `Plugin` and `PluginProxy` define `GetHandlerInfo` in this tree. Complete v
 
 ---
 
-# 3. Camera and clang/test
+# 3. `ability_dmsfwk`
+
+**Path:** `~/ability_dmsfwk`  
+**Role:** OpenHarmony distributed-schedule (DMS) framework — Binder IPC proxy/stub + interface-fallback pairs
+
+Re-verified 2026-09-02 alongside the IPC bridge work. This is the repo with the largest share of
+**defined-stub** and **interface-fallback** IPC bridges of the four corpora.
+
+## Performance
+
+| Step | Time |
+|------|-----:|
+| Index | 2.8s |
+| Analyze | 0.2s |
+| Export | 0.7s |
+| **Wall** | **3.8s** |
+
+| Metric | Value |
+|--------|------:|
+| Files | 851 |
+| Functions | 12,251 (8,797 defined / 3,454 external) |
+| Call edges | 36,764 |
+| Direct / indirect / external / ipc | 5,142 / **6** / 31,608 / **8** |
+| Arg-flow edges | 6,889 |
+| Diagnostics | 90 |
+| `dlsym` PAG edges | 0 |
+
+The 8 IPC edges span the two in-tree handling shapes:
+- **2 defined-stub bridges** (`AbilityConnectionWrapperProxy` → `AbilityConnectionWrapperStub`:
+  `OnAbilityConnectDone`, `OnAbilityDisconnectDone`) — exact name match to a real defined handler.
+- **6 interface-fallback bridges** where the stub dispatches through an external pure-virtual
+  interface method:
+  - `DExtensionProxy::{TriggerOnCreate, OnDestroy, OnCollaborate}` → `IDExtension::{...}`
+  - `DmsFreeInstallCallbackProxy::OnInstallFinished` → `IDmsFreeInstallCallback::OnInstallFinished`
+  - `DeviceSelectionNotifierProxy::{OnDeviceConnect, OnDeviceDisconnect}` →
+    `IDeviceSelectionNotifier::{...}`
+
+## Cases
+
+There are no high-fan-out dispatch hubs: the 6 indirect edges are all single-target
+(test-harness / callback-message sites), so there is no per-case hub table. The repo's value is
+in IPC-bridge completeness, verified by the two `edges_ipc` handler-class probes in
+`scripts/eval_expected.json` (2 defined + 6 external = 8 total). The `defined overload groups`
+probe (≥60) also passes (144 groups).
+
+---
+
+# 4. Camera and clang/test
 
 Hang / stack-overflow checks, not dispatch-hub evals. PCH-style header IR is what lets these trees finish: camera previously hung in preprocess (diamond includes); `clang/test/Sema/deep_recursion.c` overflowed a rayon worker (now 16 MiB stacks + AST walk cap 512).
 
@@ -2158,6 +2244,7 @@ The corpora are pinned to fixed upstream revisions in `scripts/eval_expected.jso
 |--------|------------|----------|
 | `drivers_hdf_core` | `github.com/openharmony/drivers_hdf_core` | `cdc75a20bb8f` |
 | `hiviewdfx_hiview` | `github.com/openharmony/hiviewdfx_hiview` | `92408e2072bd` |
+| `ability_dmsfwk` | `github.com/openharmony/ability_dmsfwk` | `703530039be0` |
 | `multimedia_camera_framework` | `github.com/openharmony/multimedia_camera_framework` | `8ffd69dcd47f` |
 
 `scripts/fetch_corpora.py` shallow-fetches each corpus at its pinned revision into the
@@ -2167,11 +2254,11 @@ git checkout. `scripts/eval_check.py` first verifies every checkout is at the pi
 **and clean** (`git status --porcelain` empty — analysis discovers files from the worktree, so
 edits or untracked sources move the counts just like another revision); either problem fails
 that corpus unless `--skip-rev-check` / `--allow-dirty` downgrade it to a warning. It then
-re-analyzes the three corpora fresh and asserts:
+re-analyzes the corpora fresh and asserts:
 
 1. **Global metrics** — files, functions (defined/external), call edges by resolution
-   (direct/indirect/external), arg-flow, diagnostics, `dlsym` PAG edges. Diagnostics,
-   `dlsym`, and **indirect** edges must match **exactly** (they are correctness
+   (direct/indirect/external/ipc), arg-flow, diagnostics, `dlsym` PAG edges. Diagnostics,
+   `dlsym`, **indirect**, and **ipc** edges must match **exactly** (they are correctness
    invariants); bulk function/edge/arg-flow totals use tolerance bands because the
    parallel index drifts a little run-to-run.
 2. **Dispatch-site checks (exact, name-based)** — the 12 HDF hubs
@@ -2184,15 +2271,17 @@ re-analyzes the three corpora fresh and asserts:
    (hiview ≥120, camera ≥240), template member call sites that carry resolution
    records (camera ≥15 distinct `…<…>` callee texts), and a **calibration probe**:
    external-class template sites (`MetaHdr` `Set<Tag>`/`Get<Tag>`) must stay
-   unresolved (~1,243) instead of degrading into noise edges.
+   unresolved (~1,243) instead of degrading into noise edges. dmsfwk adds
+   **IPC-handler probes** — the 8 bridges must split exactly 2 defined-stub + 6
+   interface-fallback edges, and its defined-overload-groups floor is ≥60.
 
 ```bash
 python3 scripts/fetch_corpora.py              # once; --base DIR to keep the checkouts elsewhere
-python3 scripts/eval_check.py                 # all three corpora, 800k pops, --jobs 8
+python3 scripts/eval_check.py                 # all corpora, 800k pops, --jobs 8
 python3 scripts/eval_check.py hdf camera      # subset (--corpus-base DIR if not under ~)
 ```
 
-Exit 0 = all checks pass (current: **67 checks, 0 failures** — the three extra checks are
+Exit 0 = all checks pass (current: **86 checks, 0 failures** — the four extra checks are
 the revision pins). The expectation values were re-captured on 2026-09-02 from master (`c7c6def`, after #12) at the
 pinned revisions; the metric tables in the corpus sections above still show the 2026-08-28
 snapshot and are refreshed by the preprocessor PRs that change them.
