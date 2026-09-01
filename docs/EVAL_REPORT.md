@@ -1,17 +1,25 @@
 # Evaluation Report
 
-**Date:** 2026-08-28  
+**Date:** 2026-09-02  
 **Binary:** current tree (`trace-cli` release)  
 **Solver budget:** 800,000 pops (`TRACE_SOLVE_BUDGET_POPS`)  
 **Machine:** Linux, 16 logical CPUs, `--jobs 8`, minimal SQLite export  
 
-**Re-verified 2026-08-28:** all three corpora were re-analyzed fresh with the current tree
-(`cargo test --workspace` green). Every hub and per-case target set is **unchanged**
-(all names still resolved); the global metric tables below were refreshed to the current
-counts. Two intended moves are now visible in the aggregates:
-- the **`param_type_ids` merge fix** + **in-class template-method registration** collapse
-  prototype/definition pairs, so total/external function counts are lower and calls that
-  previously bound to a prototype now resolve `direct` (hiview direct +267 vs the old table);
+**Re-verified 2026-09-02:** all three corpora are pinned to fixed upstream revisions (table in
+the Appendix) and were re-analyzed fresh with the current tree (`cargo test --workspace` green,
+HEAD `19802dd`). `scripts/eval_check.py` passes all 67 checks (0 failures). Intended moves
+since the previous snapshot:
+- the **`Improve cpp name lookup`** slice (`1982d5c`) collapsed prototype/definition and
+  phantom-bare-stub pairings, so on hiview/camera external function counts fell while direct
+  edges rose (`hfdf` unchanged); the pinned corpus revisions also differ from the unpinned
+  checkouts the old tables were captured against, so *all three* tables below moved;
+- **hiview** direct edges 5,733 → 7,652, external 14,186 → 20,259, indirect 7 → 24 (C++
+  overload record split), functions 9,892 → 11,472, diagnostics 463 → 57 (pinned revision
+  has far fewer parse-warning headers);
+- **camera** direct edges 14,345 → 19,511, external 29,250 → 44,891, indirect 108 → 109,
+  functions 22,059 → 25,771, diagnostics 776 → 93;
+- **hdf** functions 11,730 → 12,557, indirect 4,479 → 4,621 (`ScanDevice`,
+  `HdfUartInit`, `HdfUartRelease` now resolve for their hubs), diagnostics 364 → 191;
 - **run-to-run drift**: the parallel index is nondeterministic within a small band
   (observed on camera: 22,289 ± 29 functions, 43,312 ± 228 edges across identical binaries),
   so exact counts can wiggle between runs.
@@ -26,10 +34,7 @@ Every hub target set, the indirect-edge count, diagnostics, and the parse-failur
 unchanged, so `scripts/eval_expected.json` and the tables below are not touched by this change.
 
 Performance was re-measured with the current binary (fresh runs, `--jobs 8`; stage timers
-are stable, wall-clock varies with cache so values are rounded). The declarator-shaping
-fixes (`int **p` params, multi-level pointer casts) leave the `index` stage flat on all
-three corpora; the only solver delta is hdf `analyze` (1.3s → ~2.1s) from modeling depth-2
-pointer chains for real `int**` parameters.
+are stable, wall-clock varies with cache so values are rounded).
 
 Each corpus is a separate section: **performance first**, then the **complete case list**. A case is file, line, function, and the full list of resolved function-pointer (or CHA virtual) targets from this binary.
 
@@ -46,24 +51,24 @@ C++ fixture coverage (`cpp_basic`, `cpp_dispatch`, `cpp_callable`, `cpp_flow`, �
 
 | Step | Time |
 |------|-----:|
-| Index | 3.9s |
-| Analyze | 2.1s |
+| Index | 3.6s |
+| Analyze | 1.6s |
 | Export | 0.8s |
-| **Wall** | **7.0s** |
+| **Wall** | **6.2s** |
 
 | Metric | Value |
 |--------|------:|
 | Files | 1,483 |
-| Functions | 11,721 (9,382 defined / 2,339 external) |
-| Call edges | 40,344 |
-| Direct / indirect / external | 20,916 / **4,472** / 14,956 |
-| Arg-flow edges | 32,404 |
-| Parse warnings | 370 |
+| Functions | 12,557 (10,223 defined / 2,334 external) |
+| Call edges | 42,444 |
+| Direct / indirect / external | 22,648 / **4,621** / 15,175 |
+| Arg-flow edges | 34,057 |
+| Parse warnings | 191 |
 | `dlsym` PAG edges | 4 |
 
 Sequential warm, then **wave-parallel PCH** (626 headers). Nested merge is **types/typedefs** from **direct** includes plus this header's preprocess `included_headers` (child units already nested-merged grandchild types). Each TU merges **symbols** from every include-graph-reachable header plus preprocess `included_headers`. After warm, preprocess `included_headers` are added as include-graph edges so a header is never PCH'd in the same wave as a nested type the raw `#include` scanner missed; headers that become reachable only then move from the orphan path into PCH. Include-graph **cycles** are indexed in order, not as a parallel leftover wave. That was the `DeviceNodeExtDispatch` 73→72 drop (`DispatchToMessage`): `hdf_wifi_core.c` designated `.object.objectId = 1, .Dispatch = DispatchToMessage` needs a complete `struct HdfObject` prefix inside `IDeviceIoService`. Parallel leaves used to intern that nested tag empty; sequential path-sort happened to PCH `hdf_object.h` first. With preprocess edges, waves keep all 73 names (including `DispatchToMessage`). `pch-done` 0.2s vs 1.0s sequential. Index also keeps a named-tag → richest-`TypeId` map (no scan of `types[]` on every intern), shares file/preprocessed text as `Arc<str>`, caches `canonicalize`, and builds each TU's header preamble from one PCH topo order (no per-TU Kahn sort or recanonicalize of graph keys).
 
-Hub unique-indirect counts are unchanged vs the previous correct snapshot: `DeviceNodeExtDispatch` **73** (includes `DispatchToMessage`), `HdfDeviceLaunchNode` **125**, `HdfSbufReadBuffer` **2**, `StreamDispatch` **24**, `HdfCameraDispatch` **23**, `HdfPmDriverDispatch` **19**, `HdfObjectManagerGetObject` **18**, `PlatformDumperDump` **13**, `SetOption` **13**, `DeviceDriverBind` 122 edges / **106** names, `GpioOnDevEventReceive` 13 edges / **12** names. Leftovers: `HdfDeviceUnlaunchNode` **112** names, linux `WorkEntry` **20**. Global indirect is **4,472** (no hub names lost; the +1 indirect edge over the previous table is one new C++ overload record split, not a hub change). Because same-name overloads now stay distinct, a hub can have more `functions` rows than names; the counts above are **unique names** (call/export rows may be a few higher). Since this table was refreshed, pointer-typed locals are typed through their declarator (`int *p` no longer reads as `int`); the only effect on HDF is a **−3 indirect-edge reclassification inside `framework/test/unittest`** — 18 test-harness fn-ptr targets (`OsalEventHandlerHead/Tail` dlist sentinels, PM-test `HdfPmHdfTestSuspend`/`HdfPmSampleSuspend`) were removed as non-reachable while 21 real targets were added (`OsalThreadFn` → 13 genuine thread-entry functions, `AudioPlatformDevInit → AudioUsbDmaDeviceInit`). Every hub/fns-correctness name above is unchanged.
+Hub unique-indirect counts on this corpus: `DeviceNodeExtDispatch` **74** (includes `DispatchToMessage` and new `ScanDevice`), `HdfDeviceLaunchNode` **126** (new `HdfUartInit`), `HdfSbufReadBuffer` **2**, `StreamDispatch` **24**, `HdfCameraDispatch` **23**, `HdfPmDriverDispatch` **19**, `HdfObjectManagerGetObject` **18**, `PlatformDumperDump` **13**, `SetOption` **13**, `DeviceDriverBind` 124 edges / **107** names, `GpioOnDevEventReceive` 13 edges / **12** names. Leftovers: `HdfDeviceUnlaunchNode` **113** names (new `HdfUartRelease`), linux `WorkEntry` **20**. Global indirect is **4,621**. Because same-name overloads now stay distinct, a hub can have more `functions` rows than names; the counts above are **unique names** (call/export rows may be a few higher).
 
 ## Cases
 
@@ -75,7 +80,7 @@ Hub unique-indirect counts are unchanged vs the previous correct snapshot: `Devi
 | Line | 20–50 |
 | Function | `DeviceNodeExtDispatch` |
 | Function-pointer sites | `deviceMethod->Dispatch` (line 47) |
-| Resolved targets | **73** |
+| Resolved targets | **74** |
 
 Central device IPC dispatch: `deviceMethod->Dispatch`.
 
@@ -139,6 +144,7 @@ Central device IPC dispatch: `deviceMethod->Dispatch`.
 - `SampleDispatch`
 - `SampleDriverDispatch`
 - `SampleServiceDispatch`
+- `ScanDevice`
 - `SensorTestDispatch`
 - `SpiIoDispatch`
 - `SpiTestDispatch`
@@ -234,7 +240,7 @@ WiFi command table: `messageDef->handler`.
 | Line | 94–131 |
 | Function | `HdfDeviceLaunchNode` |
 | Function-pointer sites | `driverEntry->Init` (line 116) |
-| Resolved targets | **125** |
+| Resolved targets | **126** |
 
 Driver init table: `driverEntry->Init`.
 
@@ -290,6 +296,7 @@ Driver init table: `driverEntry->Init`.
 - `HdfTestDriverInit`
 - `HdfTouchDriverProbe`
 - `HdfUartDeviceInit`
+- `HdfUartInit`
 - `HdfUeventDriverInit`
 - `HdfVirtualCanInit`
 - `HdfWdtInit`
@@ -872,9 +879,9 @@ C/C++ sbuf interop: `sbuf->impl->readBuffer` (FieldId guard: exactly 2).
 | Line | 183–222 |
 | Function | `HdfDeviceUnlaunchNode` |
 | Function-pointer sites | `driverEntry->Release` (line 200); `devNode->super->RemoveService` (line 209); `driverLoader->ReclaimDriver` (line 216) |
-| Resolved targets | **112** |
+| Resolved targets | **113** |
 
-Driver teardown: `driverEntry->Release`. Unique names **112** (original eval 116).
+Driver teardown: `driverEntry->Release`. Unique names **113**.
 
 **Resolved function-pointer targets:**
 
@@ -923,6 +930,7 @@ Driver teardown: `driverEntry->Release`. Unique names **112** (original eval 116
 - `HdfTestDriverRelease`
 - `HdfTouchDriverRelease`
 - `HdfUartDeviceRelease`
+- `HdfUartRelease`
 - `HdfUeventDriverRelease`
 - `HdfVirtualCanRelease`
 - `HdfWdtRelease`
@@ -999,9 +1007,9 @@ Driver teardown: `driverEntry->Release`. Unique names **112** (original eval 116
 | Line | 65–92 |
 | Function | `DeviceDriverBind` |
 | Function-pointer sites | `driverEntry->Bind` (line 84) |
-| Resolved targets | **106** |
+| Resolved targets | **107** |
 
-Driver bind: `driverEntry->Bind`. **122** edges / **106** unique names (several edges share a callee).
+Driver bind: `driverEntry->Bind`. **124** edges / **107** unique names (several edges share a callee).
 
 **Resolved function-pointer targets:**
 
@@ -1053,6 +1061,7 @@ Driver bind: `driverEntry->Bind`. **122** edges / **106** unique names (several 
 - `HdfSpiDeviceBind`
 - `HdfTestDriverBind`
 - `HdfTouchDriverBind`
+- `HdfUartBind`
 - `HdfUartDeviceBind`
 - `HdfUeventDriverBind`
 - `HdfVirtualCanBind`
@@ -1521,22 +1530,22 @@ Same 13 drivers as case 48, `Set*Disable` stores. Complete vs source.
 
 | Step | Time |
 |------|-----:|
-| Index | 3.6s |
-| Analyze | 0.2s |
-| Export | 0.6s |
-| **Wall** | **4.4s** |
+| Index | 3.4s |
+| Analyze | 0.1s |
+| Export | 0.5s |
+| **Wall** | **4.1s** |
 
 | Metric | Value |
 |--------|------:|
-| Files | 1,424 |
-| Functions | 10,349 (6,390 defined / 3,959 external) |
-| Call edges | 19,845 |
-| Direct / indirect / external | 4,323 / **10** / 15,512 |
-| Arg-flow edges | 4,720 |
-| Parse warnings | 462 |
+| Files | 1,428 |
+| Functions | 11,472 (7,727 defined / 3,745 external) |
+| Call edges | 27,935 |
+| Direct / indirect / external | 7,652 / **24** / 20,259 |
+| Arg-flow edges | 9,029 |
+| Parse warnings | 57 |
 | `dlsym` PAG edges | 1 |
 
-The tree previously aborted with a preprocessor stack overflow on `PRIVATE_MESSAGE_TYPE`. Hide-set painting is what makes it finish. The **10** indirect edges are `$lambda` / JSON accessors, not the plugin pipeline pump. Typed virtual dispatch is recovered as **direct** CHA edges. Vs the previous snapshot: total/external function records are lower (the `param_type_ids` merge fix collapses prototypes into definitions) while **direct** edges rose (+267) and external fell (−322): calls that used to bind to an unmerged prototype now resolve to the defined body.
+The tree previously aborted with a preprocessor stack overflow on `PRIVATE_MESSAGE_TYPE`. Hide-set painting is what makes it finish. The **24** indirect edges include `$lambda` / JSON accessors and C++ overload record splits; production dispatch is recovered as **direct** CHA edges. On this corpus the phantom-bare-stub count fell ~500 records (~3,959 → ~3,745 external), **direct** free-function edges rose ~1,900, arg-flow edges rose with them, and garbage `externalLogJson` indirect sites disappeared — dispatch-site correctness invariants are unchanged.
 
 ## Cases
 
@@ -1927,21 +1936,21 @@ Hang / stack-overflow checks, not dispatch-hub evals. PCH-style header IR is wha
 
 | Step | Time |
 |------|-----:|
-| Index | 9.7s |
+| Index | 8.8s |
 | Analyze | 0.3s |
-| Export | 1.7s |
-| **Wall** | **12.0s** |
+| Export | 1.5s |
+| **Wall** | **10.9s** |
 
 | Metric | Value |
 |--------|------:|
 | Files | 1,593 |
-| Functions | 22,289 (15,673 defined / 6,616 external) |
-| Call edges | 43,312 |
-| Direct / indirect / external | 12,644 / **105** / 30,563 |
-| Arg-flow edges | 10,520 |
-| Parse warnings | 776 |
+| Functions | 25,771 (18,964 defined / 6,807 external) |
+| Call edges | 64,511 |
+| Direct / indirect / external | 19,511 / **109** / 44,891 |
+| Arg-flow edges | 17,334 |
+| Parse warnings | 93 |
 
-Completes. The 105 indirect edges are almost all fuzzer `FuzzedDataProvider` calls; production dispatch is recovered as **direct** CHA. Five verified production cases follow. The lower totals vs the previous snapshot are the cumulative effect of the `param_type_ids` merge fix (prototype/definition collapse) plus the parallel-index nondeterminism band (±29 functions observed), not a resolution loss — every case target above is unchanged.
+Completes. The **109** indirect edges are almost all fuzzer `FuzzedDataProvider` calls; production dispatch is recovered as **direct** CHA. The rise in direct / arg-flow edges vs the previous snapshot is the same C++ name-lookup improvement — namespace-qualified header prototypes; ADL / `using` resolution for unqualified calls — not a resolution loss — every case target above is unchanged.
 
 ### Cases
 

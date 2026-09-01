@@ -116,6 +116,12 @@ pub struct SymbolTable {
     /// Every external entry per name, overloads included (C++). Unlike
     /// `fn_by_name` this never collapses to a single id.
     pub externals_by_name: FxHashMap<String, Vec<FnId>>,
+    /// Functions indexed by their *base* name — the last `::` segment
+    /// (`ns::f` -> `f`; leading-`::` global spellings like `::f` also index
+    /// under `f`). unqualified/ADL/`using` lookup iterates the whole
+    /// program for a bare callee name across every namespace, which the
+    /// exact-name `fn_by_name`/`externals_by_name` tables cannot express.
+    base_by_name: FxHashMap<String, Vec<FnId>>,
     pub global_by_name: IndexMap<String, VarId>,
     /// Internal-linkage definitions per file: `(file, name) -> FnId`.
     /// In C, a file-`static` definition shadows any external definition of
@@ -376,6 +382,10 @@ impl SymbolTable {
     fn push_indexed(&mut self, func: Function) -> FnId {
         let id = func.id;
         self.fn_slots.insert(id, self.functions.len() as u32);
+        self.base_by_name
+            .entry(base_name_of(&func.name))
+            .or_default()
+            .push(id);
         self.functions.push(func);
         id
     }
@@ -519,6 +529,33 @@ impl SymbolTable {
             .unwrap_or_default()
     }
 
+    /// Functions whose fully-qualified name is exactly `namespace::name`.
+    /// A declaration may spell the qualification with or without a leading
+    /// `::` (`::ns::swap` and `ns::swap` both match namespace `ns`); the
+    /// empty namespace covers global functions, spelled `name` or `::name`.
+    pub fn functions_in_namespace(&self, namespace: &str, name: &str) -> Vec<FnId> {
+        self.base_by_name
+            .get(name)
+            .map(|bucket| {
+                let plain = name.to_string();
+                let qualified = if namespace.is_empty() {
+                    plain.clone()
+                } else {
+                    format!("{namespace}::{name}")
+                };
+                bucket
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        self.function_by_id(*id).is_some_and(|f| {
+                            f.name == qualified || f.name == format!("::{qualified}")
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn function_by_id(&self, id: FnId) -> Option<&Function> {
         let slot = *self.fn_slots.get(&id)?;
         self.functions.get(slot as usize).filter(|f| f.id == id)
@@ -552,6 +589,14 @@ impl SymbolTable {
     pub fn function_ids_unique(&self) -> bool {
         let mut seen = std::collections::HashSet::new();
         self.functions.iter().all(|f| seen.insert(f.id))
+    }
+}
+
+/// Last `::` segment of a function name, for base-name indexing.
+fn base_name_of(name: &str) -> String {
+    match name.rsplit("::").next() {
+        Some(seg) if !seg.is_empty() => seg.to_string(),
+        _ => name.to_string(),
     }
 }
 
@@ -689,5 +734,78 @@ mod tests {
             "same-arity distinct overloads keep both"
         );
         assert_eq!(p.symbols.externals_by_name["f"].len(), 2);
+    }
+
+    #[test]
+    fn functions_in_namespace_finds_global_and_qualified_spellings() {
+        let mut p = Program::new(PathBuf::from("/t"));
+        let file = p.symbols.add_file(PathBuf::from("/t/a.cpp"));
+
+        let global = fake_function(
+            p.symbols.alloc_fn_id(),
+            "swap",
+            Vec::new(),
+            true,
+            true,
+            file,
+            1,
+        );
+        let global_id = p.symbols.add_function(global);
+
+        // `void ::swap(...)` at global scope registers the leading-`::`
+        // spelling; the empty-namespace query must still find it.
+        let global_explicit = fake_function(
+            p.symbols.alloc_fn_id(),
+            "::swap",
+            Vec::new(),
+            true,
+            true,
+            file,
+            2,
+        );
+        let explicit_id = p.symbols.add_function(global_explicit);
+
+        let kit = fake_function(
+            p.symbols.alloc_fn_id(),
+            "kit::swap",
+            Vec::new(),
+            true,
+            true,
+            file,
+            3,
+        );
+        let kit_id = p.symbols.add_function(kit);
+
+        // Fully-qualified spelling with leading `::` must match namespace `kit`
+        // just like `kit::swap` does (and must NOT match the global namespace
+        // lookup for bare `swap`).
+        let kit_explicit = fake_function(
+            p.symbols.alloc_fn_id(),
+            "::kit::swap",
+            Vec::new(),
+            true,
+            true,
+            file,
+            4,
+        );
+        let kit_explicit_id = p.symbols.add_function(kit_explicit);
+
+        let ns = p.symbols.functions_in_namespace("", "swap");
+        assert_eq!(ns.len(), 2, "global + ::-spelled globals: {ns:?}");
+        assert!(ns.contains(&explicit_id));
+        assert!(
+            !ns.contains(&kit_id) && !ns.contains(&kit_explicit_id),
+            "namespaced swaps must not leak into the global-namespace set"
+        );
+        let kit_ns = p.symbols.functions_in_namespace("kit", "swap");
+        assert_eq!(kit_ns.len(), 2, "kit::swap + ::kit::swap: {kit_ns:?}");
+        assert!(kit_ns.contains(&kit_id));
+        assert!(kit_ns.contains(&kit_explicit_id));
+        assert!(
+            !kit_ns.contains(&global_id),
+            "global swap must not leak into kit"
+        );
+        assert!(p.symbols.functions_in_namespace("other", "swap").is_empty());
+        assert!(p.symbols.functions_in_namespace("", "missing").is_empty());
     }
 }
