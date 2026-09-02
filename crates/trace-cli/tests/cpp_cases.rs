@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::sync::OnceLock;
+
 use common::{default_opts, fixture, fn_name};
 use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
 use trace_ir::{FnId, Program};
@@ -951,5 +953,521 @@ fn cpp_unresolvable_member_args_keep_full_candidate_set() {
         seen.iter()
             .any(|s| !s.is_empty() && s[0].starts_with("Struct")),
         "g(Holder) must be among the kept candidates (both receiver shapes), got {g_targets:?}"
+    );
+}
+
+// --- cpp_name_lookup: ADL, using directives, namespace-relative lookup ---
+
+fn cpp_name_lookup() -> (Program, trace_analysis::AnalysisResult) {
+    static SHARED: OnceLock<(Program, trace_analysis::AnalysisResult)> = OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            let root = fixture("cpp_name_lookup");
+            let program = build_program(&root, &default_opts(&root)).expect("build");
+            let (_pag, analysis) = analyze(&program);
+            (program, analysis)
+        })
+        .clone()
+}
+
+#[test]
+fn cpp_adl_free_function_resolves() {
+    let (program, analysis) = cpp_name_lookup();
+    // `swap(_a, _b)` at global scope with `kit::Widget*` args: ADL finds
+    // `kit::swap`. It must be a direct in-tree edge, not an external stub.
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_drive",
+            "kit::swap",
+            ResolutionKind::Direct
+        ),
+        "ADL swap(kit::Widget*) must resolve to kit::swap"
+    );
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "swap" && !f.is_defined),
+        "bare 'swap' must not survive as an undefined external stub"
+    );
+}
+
+#[test]
+fn cpp_using_namespace_resolves_free_functions() {
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "using_ns_drive",
+            "util::helper",
+            ResolutionKind::Direct
+        ),
+        "using namespace util; helper() must resolve"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "using_ns_drive",
+            "util::twice",
+            ResolutionKind::Direct
+        ),
+        "using namespace util; twice(3) must resolve"
+    );
+}
+
+#[test]
+fn cpp_using_member_import_resolves() {
+    let (program, analysis) = cpp_name_lookup();
+    // `using lib::bump;` imports the exact qualified function.
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "using_member_drive",
+            "lib::bump",
+            ResolutionKind::Direct
+        ),
+        "using lib::bump; bump(c) must resolve to the imported function"
+    );
+}
+
+#[test]
+fn cpp_using_import_of_static_resolves_internal_linkage() {
+    let (program, analysis) = cpp_name_lookup();
+    // `using import_static::only;` + `only(1)` must resolve to the file-local
+    // static `import_static::only(int)` (internal linkage), not degrade to
+    // the global external/overload or an external stub.
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "using_static_drive",
+            "import_static::only",
+            ResolutionKind::Direct
+        ),
+        "using import_static::only; only(1) must resolve to the static definition"
+    );
+}
+
+#[test]
+fn cpp_namespace_relative_call_resolves() {
+    let (program, analysis) = cpp_name_lookup();
+    // From inside `a::b`, bare `clamp` finds the innermost `a::b::clamp`.
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "a::b::go",
+            "a::b::clamp",
+            ResolutionKind::Direct
+        ),
+        "bare clamp() inside a::b must resolve to a::b::clamp"
+    );
+}
+
+#[test]
+fn cpp_qualified_call_unchanged() {
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "qualified_drive",
+            "util::helper",
+            ResolutionKind::Direct
+        ),
+        "util::helper() must still resolve explicitly"
+    );
+    assert!(has_resolution(
+        &program,
+        &analysis,
+        "qualified_drive",
+        "util::twice",
+        ResolutionKind::Direct
+    ));
+}
+
+#[test]
+fn cpp_header_prototypes_register_qualified_names() {
+    // Header-declared `void swap(Widget*, Widget*)` inside `namespace kit`
+    // must register as `kit::swap` (not bare `swap`), so it folds into the
+    // out-of-line definition and ADL resolves exactly once.
+    let (program, _) = cpp_name_lookup();
+    let proto = program.symbols.functions_named("kit::swap");
+    assert!(
+        proto
+            .iter()
+            .any(|&f| program.symbols.function(f).is_defined),
+        "kit::swap must have its in-tree definition registered"
+    );
+    // The header must not leave a bare `swap` *external stub* — the whole
+    // point of qualifying prototypes. (A deliberate global `swap`
+    // definition in main.cpp is fine and expected.)
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "swap" && !f.is_defined),
+        "the header must not produce an undefined bare 'swap' external stub"
+    );
+}
+
+// --- additional name-lookup edge cases ---
+
+#[test]
+fn cpp_adl_may_approx_keeps_global_overload() {
+    // A global `swap(Widget*, Widget*)` and `kit::swap(Widget*, Widget*)`
+    // share base name + arity. Under may-analysis the bare `swap(_a, _b)`
+    // call must keep BOTH candidates (global + ADL namespace), never
+    // collapse to a single wrong target.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_may_approx",
+            "swap",
+            ResolutionKind::Direct
+        ),
+        "global ::swap must remain a candidate"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_may_approx",
+            "kit::swap",
+            ResolutionKind::Direct
+        ),
+        "ADL kit::swap must remain a candidate"
+    );
+    assert!(
+        !has_resolution(
+            &program,
+            &analysis,
+            "adl_may_approx",
+            "swap",
+            ResolutionKind::External
+        ),
+        "both candidates are defined in-tree; neither may degrade to external"
+    );
+}
+
+#[test]
+fn cpp_using_nested_member_import_resolves() {
+    // `using deep::inner::fold;` — a *nested* qualified import that no
+    // ordinary/ADL namespace covers.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_nested_import",
+            "deep::inner::fold",
+            ResolutionKind::Direct
+        ),
+        "using deep::inner::fold must resolve the nested import"
+    );
+}
+
+#[test]
+fn cpp_file_static_shadows_adl() {
+    // A file-scope `static void shadowed(int)` must resolve ahead of any
+    // global/ADL candidate of the same base name (internal linkage wins).
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_static_shadow",
+            "shadowed",
+            ResolutionKind::Direct
+        ),
+        "file-local static shadowed() must resolve"
+    );
+    assert!(
+        !program
+            .symbols
+            .functions
+            .iter()
+            .any(|f| f.name == "shadowed" && !f.is_defined),
+        "static shadowed must not leave an external stub"
+    );
+}
+
+#[test]
+fn cpp_function_scoped_using_namespace_resolves() {
+    // `using namespace body;` inside a function body must make `poke()`
+    // resolvable only for that function.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_function_scoped_using",
+            "body::poke",
+            ResolutionKind::Direct
+        ),
+        "function-scoped using namespace body; poke() must resolve"
+    );
+}
+
+#[test]
+fn cpp_function_scoped_using_namespace_does_not_leak() {
+    // The `using namespace body;` inside `adl_function_scoped_using` must NOT
+    // make `body::poke` a candidate in `adl_using_no_leak` — a leaked
+    // directive would rob the correct in-scope global `poke` edge when the
+    // ranking later collapses to one candidate (under-approximation).
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_using_no_leak",
+            "poke",
+            ResolutionKind::Direct
+        ),
+        "global poke must resolve for a caller without the using directive"
+    );
+    assert!(
+        !has_resolution(
+            &program,
+            &analysis,
+            "adl_using_no_leak",
+            "body::poke",
+            ResolutionKind::Direct
+        ),
+        "function-body using namespace must not leak into other functions"
+    );
+}
+
+#[test]
+fn cpp_relative_using_namespace_target_finds_enclosing_namespace() {
+    // `using namespace detail;` is written inside `relns::via_directive`
+    // while an *enclosing* `relns::detail` namespace exists. C++ resolves
+    // the relative first segment to the enclosing namespace, so
+    // `drive_ns`'s bare `bump(1)` must reach `relns::detail::bump` (and may
+    // over-approximate the global `detail::bump` too; it must not miss the
+    // enclosing one).
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "relns::directive_host::user::drive_ns",
+            "relns::detail::bump",
+            ResolutionKind::Direct
+        ),
+        "relative using-namespace target must resolve against the enclosing namespace"
+    );
+}
+
+#[test]
+fn cpp_relative_using_member_target_finds_enclosing_namespace() {
+    // `using detail::bump;` written inside `relns::via_import` names the
+    // enclosing `relns::detail::bump` (first segment resolved against the
+    // namespace stack), which must end up in `drive_import`'s candidate set
+    // — not just the global-spelled `detail::bump`.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "relns::import_host::user::drive_import",
+            "relns::detail::bump",
+            ResolutionKind::Direct
+        ),
+        "relative using-declaration target must resolve against the enclosing namespace"
+    );
+}
+
+#[test]
+fn cpp_global_qualified_definition_inside_namespace_block() {
+    // `void ::qualified_global() {}` written inside `namespace global_block`
+    // registers at global scope under the normalized name `qualified_global`
+    // (leading `::` stripped by `qualify_decl` so that merge dedup works and
+    // `functions_in_namespace` needs only one comparison).  The enclosing
+    // namespace prefix must NOT be prepended.
+    // `global_block::caller`'s bare call must reach the global function.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "global_block::caller",
+            "qualified_global",
+            ResolutionKind::Direct
+        ),
+        "::global definition inside a namespace block must stay at global scope"
+    );
+}
+
+#[test]
+fn cpp_namespace_scoped_using_namespace_applies_inside_block_only() {
+    // `using namespace boost_ish;` lives inside `scoped_use::inner`. It must
+    // apply to `in_scope` but not leak to `scoped_use::out_of_scope` (which
+    // is in the enclosing namespace, declared after the block). A TU-wide
+    // leak would make `out_of_scope` bind to the better-ranking
+    // `boost_ish::tick(int)` and drop the correct global `tick(double)` edge.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "scoped_use::inner::in_scope",
+            "boost_ish::tick",
+            ResolutionKind::Direct
+        ),
+        "in-scope caller must resolve through the block-scoped directive"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "scoped_use::out_of_scope",
+            "tick",
+            ResolutionKind::Direct
+        ),
+        "caller outside the block must fall back to the in-scope global tick"
+    );
+    assert!(
+        !has_resolution(
+            &program,
+            &analysis,
+            "scoped_use::out_of_scope",
+            "boost_ish::tick",
+            ResolutionKind::Direct
+        ),
+        "namespace-block using namespace must not leak into the enclosing namespace"
+    );
+}
+
+#[test]
+fn cpp_adl_free_function_direct_in_one_of_many_candidates() {
+    // Sanity: the original ADL drive still resolves exactly through ADL with
+    // the additional global overload present.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_drive",
+            "kit::swap",
+            ResolutionKind::Direct
+        ),
+        "adl_drive swap must still resolve to kit::swap"
+    );
+}
+
+#[test]
+fn cpp_inner_block_using_namespace_applies_inside_block_only() {
+    // `using namespace innerlib;` inside the `if` body must apply only to
+    // that block. Two `g()` call sites in one function: the one inside the
+    // block resolves through `innerlib::g`; the sibling call after the block
+    // must stay on the global `g`. A directive leaked to the whole function
+    // would add `innerlib::g` to the sibling call site too (over-approx that
+    // can collapse the ranking and rob the correct in-scope edge) — so
+    // `innerlib::g` must appear exactly once (the in-block call).
+    let (program, analysis) = cpp_name_lookup();
+    let innerlib_edges = analysis
+        .call_edges
+        .iter()
+        .filter(|e| {
+            fn_name(&program, e.caller) == "inner_block_using_scoped"
+                && fn_name(&program, e.callee) == "innerlib::g"
+                && e.resolution == ResolutionKind::Direct
+        })
+        .count();
+    assert_eq!(
+        innerlib_edges, 1,
+        "inner-block using namespace must not leak to the sibling call site \
+         (expected exactly 1 innerlib::g edge, from the in-block call)"
+    );
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "inner_block_using_scoped",
+            "g",
+            ResolutionKind::Direct
+        ),
+        "sibling call after the block must resolve to the global g"
+    );
+}
+
+#[test]
+fn cpp_adl_leading_global_scope_tag_finds_namespace() {
+    // `::kit::LeadWidget` (global-scope spelling) must still derive ADL
+    // namespace `kit` (the leading `::` is the global marker, not part of
+    // the namespace), so the bare `lead_swap` resolves to `kit::lead_swap`.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "adl_leading_global_scope_tag",
+            "kit::lead_swap",
+            ResolutionKind::Direct
+        ),
+        "leading-:: ADL tag must resolve through ADL to kit::lead_swap"
+    );
+}
+
+#[test]
+fn cpp_inner_namespace_hides_global_overload() {
+    // `hide::g() { f(1); }` with a global `::f(int)` and an inner
+    // `hide::f(double)`. The bare name inside `hide` must resolve to
+    // `hide::f` only — the global `::f` is a wrong single answer and must be
+    // dropped (its presence must not be re-added by an out-of-band global
+    // lookup that runs ahead of the hiding walk).
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "hide::g",
+            "hide::f",
+            ResolutionKind::Direct
+        ),
+        "inner-namespace declaration must shadow the global overload"
+    );
+    assert!(
+        !has_resolution(&program, &analysis, "hide::g", "f", ResolutionKind::Direct),
+        "global f(int) must be hidden by hide::f, not kept as a candidate"
+    );
+}
+
+#[test]
+fn cpp_inner_namespace_hides_global_static() {
+    // `hidesf::g() { sf(1); }` with a global file-scope `static sf(int)` and
+    // an inner `hidesf::sf(double)`. The nested namespace declaration must
+    // shadow the file-static, resolving to `hidesf::sf` only — not the
+    // wrong single global-static answer.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "hidesf::g",
+            "hidesf::sf",
+            ResolutionKind::Direct
+        ),
+        "inner-namespace declaration must shadow the global file-static"
+    );
+    assert!(
+        !has_resolution(
+            &program,
+            &analysis,
+            "hidesf::g",
+            "sf",
+            ResolutionKind::Direct
+        ),
+        "global static sf must be hidden by hidesf::sf, not kept as a candidate"
     );
 }

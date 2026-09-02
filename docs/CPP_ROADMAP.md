@@ -27,6 +27,11 @@ Do not chase STL noise (`std::string::c_str`, `parcel->WriteString`,
 | `final` / virtual bases | fixtures only (`cpp_dispatch`); hiview barely uses them |
 | Direct `std::function` field store | `cpp_callable`; **not** the factory path (C3) |
 | `$lambda` as a nested function | 357 interned; almost none have **incoming** edges |
+| ADL (Koenig lookup) | `swap(a, b)` with `kit::Widget*` args → `kit::swap`; namespaces derived from `Struct` `TypeDesc` tag |
+| `using namespace X;` in free-function resolution | unqualified calls now search every namespace brought in by a `using namespace` directive |
+| `using X::f;` member import | `using lib::bump;` introduces `bump(c)` into the candidate set of the bare name `bump` |
+| Header prototypes namespace-qualified | `lower_function_decl` now applies `qualify_decl` so header prototypes register under `ns::f`, not a bare name |
+| Namespace-relative bare call | bare `clamp()` inside `namespace a::b` finds `a::b::clamp` via enclosing-namespace walk |
 
 ---
 
@@ -409,7 +414,6 @@ prebuilt `.so` files that have no source under the target root.
 | Item | Why deferred |
 |------|----------------|
 | Type-based overload ranking | Hiview dispatch is virtual / fn-ptr, not `add(int)` vs `add(double)` |
-| `using` / `using namespace` | Tests + smart_parser; not plugin hubs |
 | Default arguments | `Event::Repack(..., replace=true)` — arity fallback already fires |
 | Exceptions | No CG recovery |
 | `std::variant` / `optional` | Return-type (C1) covers most `optional` uses |
@@ -457,3 +461,4 @@ plugins without `dlsym` is C3 (static `REGISTER` ctors).
 | C9 | `obj.GetNumber<uint64_t>()` → `GetNumber`; overlay done — see `tests/fixtures/cpp_templates_overloads` |
 | C10 | `.c` includes `class` header, `.cpp` defines methods; virtual call still CHA |
 | C11 | `dlsym(h, "target")` then call; `extern "C" int target()` in-tree |
+| ADL | `swap(a, b)` with `kit::Widget*` args → `kit::swap`; `using namespace/util::helper`; `using lib::bump`; `a::b::go()` → `a::b::clamp` — see `tests/fixtures/cpp_name_lookup` |

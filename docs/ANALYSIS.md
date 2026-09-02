@@ -393,8 +393,30 @@ effects = []
 C++-aware only where it must be — everything else reuses the C machinery.
 
 - **Namespaces**: `ns_stack` qualifies declarations (`ns::f`). Anonymous
-  namespaces get internal linkage. `using` directives are recorded but not
-  used for base-name qualification.
+  namespaces get internal linkage. Unqualified C++ calls resolve through
+  **namespace-aware ordinary lookup**: the global namespace, enclosing
+  namespaces (innermost to outermost), plus every namespace brought in by
+  `using namespace X;`. **ADL** (argument-dependent / Koenig lookup):
+  namespaces are derived from the qualified tag of each argument's
+  `Struct`/`Union` type (pointer/array layers peeled) and merged into the
+  candidate set, so `swap(a, b)` where `a` is `kit::Widget*` finds
+  `kit::swap`. **`using X::f;`** imports the exact qualified function name
+  into the candidate set of the bare base name. Relative `using`
+  targets are expanded against the enclosing namespace stack:
+  `using namespace detail;` inside `namespace a` records `a::detail`
+  **and** the literal `detail` (`expand_using_target`), matching C++'s
+  first-segment resolution; exact global lookups still win when the
+  enclosing spelling does not exist. Header prototypes
+  (`lower_function_decl`) are now namespace-qualified like definitions
+  so they register under their correct `ns::f` spelling. `using`
+  directives are **block-scoped**: file-scope directives apply TU-wide,
+  but a directive written inside a function body, a namespace block, or a
+  nested statement block (`if`/`for`/`while` body — itself a
+  `compound_statement`) applies only to that block
+  (length-snapshot/restore in `lower_function`, `lower_namespace`, and
+  around each `compound_statement` in `walk_function_body`). Leaking them
+  block-wide could let the overload ranking collapse away the correct
+  in-scope edge, and is avoided.
 - **Overloads**: same-name entries are kept apart when **both** sides are C++
   and arity (or same-arity param types) differ (`add_function`;
   `externals_by_name` bucket). Signature comparison uses real types: at TU
@@ -479,6 +501,24 @@ Known C++ imprecision (in addition to the general list below):
 - Default construction without parens (`Cls o;`) emits no ctor site.
 - Objects at namespace scope emit no ctor/dtor sites (no enclosing function).
 - Anonymous-namespace overload ties degrade to first-wins.
+- **ADL namespace derivation is spelling-based**: only arguments whose
+  `Struct`/`Union` tag carries an explicit `::` in the source contribute
+  their namespace; enum-typed arguments and types referenced by a *bare*
+  spelling (`using kit::Widget;` then `Widget a`) contribute nothing, so a
+  call that relies purely on such types' ADL can degrade to an external
+  stub (sound — never a wrong binding). A leading global-scope `::` in a
+  tag (`::kit::Widget`) is stripped before deriving the namespace, matching
+  how `functions_in_namespace` treats `kit` and `::kit` as interchangeable.
+- Relative `using`/`using namespace` targets expand to every enclosing
+  namespace the spelling could denote (over-approximation); genuine C++
+  picks the innermost *declared* namespace only.
+- Namespace **hiding/ordering is not modeled** for overload ranking:
+  `rank_overloads` collapses a same-arity set to the best static-type
+  match without preferring a candidate from the innermost enclosing
+  namespace over an exact global match. May-analysis keeps all *tied*
+  candidates (one direct edge per candidate), but a strictly-better-
+  ranking leaked candidate would be preferred even where C++ scoping
+  would hide it.
 - Overload resolution is arity + static-type ranked; a non-exact argument
   (conversion, `auto`, unknown type) still keeps the whole arity set, and
   0-arg member-call overloads resolve through the primary-name entry only.
@@ -495,6 +535,18 @@ Known C++ imprecision (in addition to the general list below):
   subclass targets. Virtual inheritance is recorded as a normal base edge.
 - Headers shared between `.c` and `.cpp` TUs parse under whichever
   grammar reaches them first at merge time.
+- **`using namespace` in headers**: ANALYSIS.md says file-scope directives
+  apply TU-wide, but with header IR merged symbols-only, a `using namespace
+  std;` written in a header is never seen while lowering the TU that includes
+  it, so unqualified calls in the TU that depend on it degrade to external
+  stubs. Sound but imprecise.
+- **`using namespace` across namespace reopenings**: a using-directive at
+  namespace scope stays in effect in later reopenings of the same namespace
+  (`namespace A { using namespace B; }` then `namespace A { … }` finds
+  `B::f`). Lowering truncates directives at namespace block exit, so
+  reopenings lose the candidate. OHOS code reopens `OHOS::X` blocks often;
+  this is an under-approximation. Sound for may-analysis (candidates may be
+  missed but never wrongly added).
 
 Next slices (hiview-grounded): [docs/CPP_ROADMAP.md](CPP_ROADMAP.md).
 
