@@ -6,22 +6,22 @@
 **Machine:** Linux, 16 logical CPUs, `--jobs 8`, minimal SQLite export  
 
 **Re-verified 2026-09-02:** all three corpora are pinned to fixed upstream revisions (table in
-the Appendix) and were re-analyzed fresh with the current tree (`cargo test --workspace` green,
-HEAD `19802dd`). `scripts/eval_check.py` passes all 67 checks (0 failures). Intended moves
-since the previous snapshot:
-- the **`Improve cpp name lookup`** slice (`1982d5c`) collapsed prototype/definition and
+the Appendix) and were re-analyzed fresh with the current tree (`cargo test --workspace`
+green). `scripts/eval_check.py` passes all 67 checks (0 failures). The delta paragraph below
+describes what this change moved compared to master's `eval_expected.json` values (not the
+stale 2026-08-28 tables):
+- the **`Improve cpp name lookup`** slice collapsed prototype/definition and
   phantom-bare-stub pairings, so on hiview/camera external function counts fell while direct
-  edges rose (`hfdf` unchanged); the pinned corpus revisions also differ from the unpinned
-  checkouts the old tables were captured against, so *all three* tables below moved;
-- **hiview** direct edges 5,733 → 7,652, external 14,186 → 20,259, indirect 7 → 24 (C++
-  overload record split), functions 9,892 → 11,472, diagnostics 463 → 57 (pinned revision
-  has far fewer parse-warning headers);
-- **camera** direct edges 14,345 → 19,511, external 29,250 → 44,891, indirect 108 → 109,
-  functions 22,059 → 25,771, diagnostics 776 → 93;
-- **hdf** functions 11,730 → 12,557, indirect 4,479 → 4,621 (`ScanDevice`,
-  `HdfUartInit`, `HdfUartRelease` now resolve for their hubs), diagnostics 364 → 191;
+  edges rose, and hdf moved only slightly. All deltas below are **vs master's
+  `eval_expected.json`** (captured at the same pinned revisions);
+- **hiview** direct edges 5,961 → 7,652, external 21,946 → 20,259, indirect 18 → 24 (C++
+  overload record split), functions 11,978 → 11,472, diagnostics unchanged at 57;
+- **camera** direct edges 17,584 → 19,511, external 46,522 → 44,891, indirect 118 → 109,
+  functions 26,043 → 25,771, diagnostics unchanged at 93;
+- **hdf** direct edges 22,609 → 22,648, external 15,213 → 15,175, functions 12,551 → 12,557;
+  indirect edges and diagnostics are unchanged at 4,621 and 191;
 - **run-to-run drift**: the parallel index is nondeterministic within a small band
-  (observed on camera: 22,289 ± 29 functions, 43,312 ± 228 edges across identical binaries),
+  (observed on camera: 25,771 ± 40 functions, 64,511 ± 240 edges across identical binaries),
   so exact counts can wiggle between runs.
 
 **Re-verified 2026-09-02 (object-macro `(` classification fix, #6/#7):** all three corpora were
@@ -1547,6 +1547,11 @@ Same 13 drivers as case 48, `Set*Disable` stores. Complete vs source.
 
 The tree previously aborted with a preprocessor stack overflow on `PRIVATE_MESSAGE_TYPE`. Hide-set painting is what makes it finish. The **24** indirect edges include `$lambda` / JSON accessors and C++ overload record splits; production dispatch is recovered as **direct** CHA edges. On this corpus the phantom-bare-stub count fell ~500 records (~3,959 → ~3,745 external), **direct** free-function edges rose ~1,900, arg-flow edges rose with them, and garbage `externalLogJson` indirect sites disappeared — dispatch-site correctness invariants are unchanged.
 
+**Indirect edge changes vs. master** (exact-match metric, both sides):
+- **Lost 3** phantom `externalLogJson` targets in `CopyExternalLogsToSandBox` (these were bare-stub false positives that the qualified-prototype merge now resolves correctly as direct calls).
+- **Gained 9** lambda callbacks resolved through `WriteStringWithDesignatedLength` (the qualified prototypes in `base/json` headers enabled the solver to trace function-pointer flow into lambda `$lambda` entries that were previously unreachable).
+- Net: 18 → 24 (18 − 3 + 9) is a genuine improvement from prototype-based resolution, not a regression.
+
 ## Cases
 
 ### 1. `PRIVATE_MESSAGE_TYPE` — X-macro enumerator list (preprocessor)
@@ -1952,6 +1957,11 @@ Hang / stack-overflow checks, not dispatch-hub evals. PCH-style header IR is wha
 
 Completes. The **109** indirect edges are almost all fuzzer `FuzzedDataProvider` calls; production dispatch is recovered as **direct** CHA. The rise in direct / arg-flow edges vs the previous snapshot is the same C++ name-lookup improvement — namespace-qualified header prototypes; ADL / `using` resolution for unqualified calls — not a resolution loss — every case target above is unchanged.
 
+**Indirect edge changes vs. master** (exact-match metric, both sides):
+- **Lost 16** phantom variable targets (`depthProfile`, `depthProfileRet1..4` in `CreateDepthDataOutput`, `infoDumper` in `DumpCameraSummary`): these were bare-stub false positives that the qualified-prototype merge now resolves correctly.
+- **Gained 7** lambda callbacks resolved through `CameraFwkMetadataUtils::ForEach` (the qualified prototypes enabled solver tracing into previously unreachable lambda entries).
+- Net: 118 → 109 (118 − 16 + 7) is a genuine improvement from prototype-based resolution, not a regression.
+
 ### Cases
 
 ### 1. `OHOS::CameraStandard::DeferredProcessing::Command::Do` — `Executing`
@@ -2202,6 +2212,6 @@ python3 scripts/eval_check.py hdf camera      # subset (--corpus-base DIR if not
 ```
 
 Exit 0 = all checks pass (current: **67 checks, 0 failures** — the three extra checks are
-the revision pins). The expectation values were re-captured on 2026-09-02 from master (`c7c6def`, after #12) at the
-pinned revisions; the metric tables in the corpus sections above still show the 2026-08-28
-snapshot and are refreshed by the preprocessor PRs that change them.
+the revision pins). The expectation values were re-captured on 2026-09-02 from the current
+tree (after `Improve cpp name lookup`) at the pinned revisions, and the metric tables in the
+corpus sections above show those same values.

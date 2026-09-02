@@ -537,19 +537,18 @@ impl SymbolTable {
         self.base_by_name
             .get(name)
             .map(|bucket| {
-                let plain = name.to_string();
                 let qualified = if namespace.is_empty() {
-                    plain.clone()
+                    name.to_string()
                 } else {
                     format!("{namespace}::{name}")
                 };
+                let qualified_leading = format!("::{qualified}");
                 bucket
                     .iter()
                     .copied()
                     .filter(|id| {
-                        self.function_by_id(*id).is_some_and(|f| {
-                            f.name == qualified || f.name == format!("::{qualified}")
-                        })
+                        self.function_by_id(*id)
+                            .is_some_and(|f| f.name == qualified || f.name == qualified_leading)
                     })
                     .collect()
             })

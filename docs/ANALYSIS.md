@@ -535,6 +535,18 @@ Known C++ imprecision (in addition to the general list below):
   subclass targets. Virtual inheritance is recorded as a normal base edge.
 - Headers shared between `.c` and `.cpp` TUs parse under whichever
   grammar reaches them first at merge time.
+- **`using namespace` in headers**: ANALYSIS.md says file-scope directives
+  apply TU-wide, but with header IR merged symbols-only, a `using namespace
+  std;` written in a header is never seen while lowering the TU that includes
+  it, so unqualified calls in the TU that depend on it degrade to external
+  stubs. Sound but imprecise.
+- **`using namespace` across namespace reopenings**: a using-directive at
+  namespace scope stays in effect in later reopenings of the same namespace
+  (`namespace A { using namespace B; }` then `namespace A { … }` finds
+  `B::f`). Lowering truncates directives at namespace block exit, so
+  reopenings lose the candidate. OHOS code reopens `OHOS::X` blocks often;
+  this is an under-approximation. Sound for may-analysis (candidates may be
+  missed but never wrongly added).
 
 Next slices (hiview-grounded): [docs/CPP_ROADMAP.md](CPP_ROADMAP.md).
 

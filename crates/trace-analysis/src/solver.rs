@@ -29,7 +29,7 @@ impl Default for AnalyzeOptions {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AnalysisResult {
     pub points_to: IndexMap<PagNodeId, FxHashSet<LocId>>,
     pub call_edges: Vec<CallGraphEdge>,

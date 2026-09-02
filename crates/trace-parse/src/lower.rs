@@ -128,24 +128,31 @@ impl LowerContext {
     /// name a later out-of-line definition does.
     fn qualify_decl(&self, raw_name: &str) -> String {
         let normalized_raw = normalize_qualified(raw_name);
+        // A leading `::` (explicit global qualification such as
+        // `::qualified_global`) means global scope: the enclosing namespace
+        // prefix must NOT be prepended.  We strip the `::` to keep one
+        // spelling everywhere (merges work, `functions_in_namespace` needs
+        // only one comparison) but return early before the namespace-qualify
+        // branches run.
+        let is_global_qualified = normalized_raw.starts_with("::");
+        let normalized_raw = normalized_raw.strip_prefix("::").unwrap_or(&normalized_raw);
+        if is_global_qualified {
+            return normalized_raw.to_string();
+        }
         if let Some(cls) = &self.class_ctx {
             if normalized_raw.contains("::") {
-                normalized_raw
+                normalized_raw.to_string()
             } else {
                 format!("{}::{}", cls.qual_name, normalized_raw)
             }
-        } else if normalized_raw.starts_with("::") {
-            // Explicitly global qualification (`::global` written inside a
-            // namespace block): keep the leading `::` spelling as-is.
-            normalized_raw
         } else if normalized_raw.contains("::") {
             let first_seg = normalized_raw.split("::").next().unwrap_or("");
             let already_qualified =
                 self.ns_stack.iter().flatten().any(|ns| ns == first_seg) || !self.is_cpp;
             if already_qualified {
-                normalized_raw
+                normalized_raw.to_string()
             } else {
-                self.qualify(&normalized_raw)
+                self.qualify(normalized_raw)
             }
         } else {
             self.qualify(raw_name)
@@ -1195,12 +1202,18 @@ fn lower_namespace(program: &mut Program, ctx: &mut LowerContext, source: &str, 
 
 /// Enclosing namespaces of the current scope, innermost first, as joined
 /// prefixes (`namespace a { namespace b { … } }` yields `a::b`, `a`).
-fn enclosing_namespace_prefixes(ctx: &LowerContext) -> Vec<String> {
+/// When `include_self` is true the innermost namespace itself is also
+/// included (needed by `expand_using_target` so that `using namespace detail;`
+/// written inside `relns::directive_host` also yields `relns::directive_host`
+/// as a prefix — C++ resolves the first segment against the enclosing scope).
+fn enclosing_namespace_prefixes(ctx: &LowerContext, include_self: bool) -> Vec<String> {
     let chain: Vec<&str> = ctx.ns_stack.iter().flatten().map(String::as_str).collect();
-    (0..chain.len())
-        .rev()
-        .map(|len| chain[..len].join("::"))
-        .collect()
+    let end = if include_self {
+        chain.len()
+    } else {
+        chain.len().saturating_sub(1)
+    };
+    (0..=end).rev().map(|len| chain[..len].join("::")).collect()
 }
 
 /// All namespaces a relative `using` target may denote: the target with its
@@ -1221,7 +1234,7 @@ fn expand_using_target(ctx: &LowerContext, target: &str) -> Vec<String> {
         return vec![target.to_string()];
     }
     let mut out: Vec<String> = Vec::new();
-    for prefix in enclosing_namespace_prefixes(ctx) {
+    for prefix in enclosing_namespace_prefixes(ctx, true) {
         let qualified_first = format!("{prefix}::{first}");
         match rest {
             Some(r) => out.push(format!("{qualified_first}::{r}")),
@@ -2878,31 +2891,16 @@ fn param_match_rank(arg: &TypeDesc, param: &TypeDesc) -> usize {
     }
 }
 
-/// Namespaces an unqualified call may resolve in — the **ordinary lookup**
-/// set: the global namespace, the enclosing namespaces (innermost to
-/// outermost, so more-qualified names win first), and every namespace
-/// brought in by `using namespace` directives.
-fn ordinary_lookup_namespaces(ctx: &LowerContext) -> Vec<String> {
-    let mut namespaces: Vec<String> = Vec::new();
-    // Enclosing namespaces, innermost first (A::B before A before ::); the
-    // `i == 0` iteration yields the global namespace ("").
-    let present: Vec<String> = ctx.ns_stack.iter().flatten().cloned().collect();
-    for i in (0..=present.len()).rev() {
-        namespaces.push(present[..i].join("::"));
-    }
-    // `using namespace X;` directives.
-    for ns in &ctx.using_nss {
-        if !namespaces.iter().any(|n| n == ns) {
-            namespaces.push(ns.clone());
-        }
-    }
-    namespaces
-}
-
 /// True when the callee is a bare unqualified identifier — the only shape
 /// to which ADL and `using`/`using namespace` lookup apply. Qualified
 /// identifiers (`ns::f`) and template/field/pointer callees keep exact
 /// lookup.
+///
+/// `template_function` is included because `resolve_callee` already strips
+/// the `<...>` argument list, so the `callee_name` passed to
+/// `resolve_cpp_name_candidates` is the bare base name (e.g. `GetNumber`,
+/// not `GetNumber<int>`), which correctly indexes into the `base_by_name`
+/// bucket.
 fn is_bare_callee_node(func: tree_sitter::Node) -> bool {
     matches!(func.kind(), "identifier" | "template_function")
 }
@@ -2924,11 +2922,19 @@ fn adl_namespaces(arg_desc: &[TypeDesc]) -> Vec<String> {
                 // marker, not part of the namespace name, so strip it before
                 // querying (`functions_in_namespace` treats `kit` and `::kit`
                 // as interchangeable, so ADL must too).
-                if let Some(dsep) = name.rfind("::") {
-                    let ns = name[..dsep].trim_start_matches("::").to_string();
+                // For nested qualified tags like `N::Outer::Inner`, add every
+                // prefix (`N::Outer` and `N`): the intermediate segments may
+                // be classes (not namespaces), and in real C++ only enclosing
+                // namespaces contribute to ADL — but without type information
+                // we conservatively add all prefixes (sound over-approximation).
+                let stripped = name.trim_start_matches("::");
+                let mut prefix_end = stripped.find("::");
+                while let Some(sep) = prefix_end {
+                    let ns = stripped[..sep].to_string();
                     if !out.iter().any(|n| n == &ns) {
                         out.push(ns);
                     }
+                    prefix_end = stripped[sep + 2..].find("::").map(|i| i + sep + 2);
                 }
                 return;
             }
@@ -2946,6 +2952,15 @@ fn adl_namespaces(arg_desc: &[TypeDesc]) -> Vec<String> {
 /// ordinary lookup namespaces plus ADL namespaces plus explicitly imported
 /// `using X::f;` members, deduplicated. The caller applies arity filtering
 /// + overload ranking.
+///
+/// Ordinary lookup follows the C++ rule: check enclosing namespaces
+/// innermost-to-outermost, stopping at the first that declares a function
+/// with the requested base name (standard hiding rule).  `using namespace`
+/// directives are checked *after* enclosing namespaces and always add
+/// candidates without hiding (they make the named namespace's declarations
+/// visible in the scope of the directive).  ADL namespaces and
+/// `using X::f;` imports are merged last (they add candidates, never
+/// replace).
 fn resolve_cpp_name_candidates(
     program: &Program,
     ctx: &LowerContext,
@@ -2953,36 +2968,67 @@ fn resolve_cpp_name_candidates(
     arg_desc: &[TypeDesc],
 ) -> Vec<FnId> {
     let mut out: Vec<FnId> = Vec::new();
-    // File-scoped internal linkage (a static definition / header-static in
-    // scope) keeps precedence over plain-identifier externals, mirroring C.
-    for id in program
-        .symbols
-        .resolve_function_candidates(base, Some(ctx.current_file))
-    {
-        if !out.contains(&id) {
-            out.push(id);
+    // Phase 1: enclosing namespaces (innermost to outermost).  Stop at the
+    // first scope that declares any function with `base` — standard C++
+    // hiding rule (inner declarations shadow outer ones).
+    let present: Vec<&str> = ctx.ns_stack.iter().flatten().map(String::as_str).collect();
+    for i in (0..=present.len()).rev() {
+        let ns = present[..i].join("::");
+        let mut found = program.symbols.functions_in_namespace(&ns, base);
+        if i == 0 {
+            // The global rung: also fold in file-scoped internal linkage
+            // (static / header-static) entries, which are declarations in
+            // the global namespace.  Consulting them here — not ahead of the
+            // whole walk — lets them participate in the hiding rule: an
+            // inner-namespace declaration shadows a global/static, and a
+            // file-static shadows an extern global of the same name.
+            for id in program
+                .symbols
+                .resolve_function_candidates(base, Some(ctx.current_file))
+            {
+                if !found.contains(&id) {
+                    found.push(id);
+                }
+            }
+        }
+        if !found.is_empty() {
+            for id in found {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+            break;
         }
     }
-    let mut candidate_ns: Vec<String> = ordinary_lookup_namespaces(ctx);
-    for ns in adl_namespaces(arg_desc) {
-        if !candidate_ns.iter().any(|n| n == &ns) {
-            candidate_ns.push(ns);
-        }
-    }
-    for ns in &candidate_ns {
+    // Phase 2: using namespace directives (always add, never hide — they
+    // make the named namespace's declarations visible in the directive's
+    // scope, alongside any enclosing-namespace candidates).
+    for ns in &ctx.using_nss {
         for id in program.symbols.functions_in_namespace(ns, base) {
             if !out.contains(&id) {
                 out.push(id);
             }
         }
     }
-    // `using X::f;` imports: the exact qualified entry may not fall under
-    // any of the ordinary/ADL namespaces above (e.g. nested `X::Y::f`).
+    // Phase 3: ADL namespaces add candidates without replacing.
+    for ns in adl_namespaces(arg_desc) {
+        for id in program.symbols.functions_in_namespace(&ns, base) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    // Phase 4: `using X::f;` imports: the exact qualified entry may not
+    // fall under any of the ordinary/ADL namespaces above (e.g. nested
+    // `X::Y::f`).
     for (import_base, import_qual) in &ctx.using_name_imports {
         if import_base == base {
+            // Resolve within the current file's scope so a `static`
+            // definition (or header-static) imported via `using X::f;`
+            // resolves instead of degrading to an external stub.
             for id in program
                 .symbols
-                .resolve_function_candidates(import_qual, None)
+                .resolve_function_candidates(import_qual, Some(ctx.current_file))
             {
                 if !out.contains(&id) {
                     out.push(id);

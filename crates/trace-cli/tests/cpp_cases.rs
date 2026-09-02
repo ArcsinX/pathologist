@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::sync::OnceLock;
+
 use common::{default_opts, fixture, fn_name};
 use trace_analysis::{analyze, AnalysisResult, ResolutionKind};
 use trace_ir::{FnId, Program};
@@ -957,10 +959,15 @@ fn cpp_unresolvable_member_args_keep_full_candidate_set() {
 // --- cpp_name_lookup: ADL, using directives, namespace-relative lookup ---
 
 fn cpp_name_lookup() -> (Program, trace_analysis::AnalysisResult) {
-    let root = fixture("cpp_name_lookup");
-    let program = build_program(&root, &default_opts(&root)).expect("build");
-    let (_pag, analysis) = analyze(&program);
-    (program, analysis)
+    static SHARED: OnceLock<(Program, trace_analysis::AnalysisResult)> = OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            let root = fixture("cpp_name_lookup");
+            let program = build_program(&root, &default_opts(&root)).expect("build");
+            let (_pag, analysis) = analyze(&program);
+            (program, analysis)
+        })
+        .clone()
 }
 
 #[test]
@@ -1026,6 +1033,24 @@ fn cpp_using_member_import_resolves() {
             ResolutionKind::Direct
         ),
         "using lib::bump; bump(c) must resolve to the imported function"
+    );
+}
+
+#[test]
+fn cpp_using_import_of_static_resolves_internal_linkage() {
+    let (program, analysis) = cpp_name_lookup();
+    // `using import_static::only;` + `only(1)` must resolve to the file-local
+    // static `import_static::only(int)` (internal linkage), not degrade to
+    // the global external/overload or an external stub.
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "using_static_drive",
+            "import_static::only",
+            ResolutionKind::Direct
+        ),
+        "using import_static::only; only(1) must resolve to the static definition"
     );
 }
 
@@ -1265,8 +1290,10 @@ fn cpp_relative_using_member_target_finds_enclosing_namespace() {
 #[test]
 fn cpp_global_qualified_definition_inside_namespace_block() {
     // `void ::qualified_global() {}` written inside `namespace global_block`
-    // registers at global scope; the enclosing namespace prefix must NOT be
-    // prepended (that would corrupt it to `global_block::::qualified_global`).
+    // registers at global scope under the normalized name `qualified_global`
+    // (leading `::` stripped by `qualify_decl` so that merge dedup works and
+    // `functions_in_namespace` needs only one comparison).  The enclosing
+    // namespace prefix must NOT be prepended.
     // `global_block::caller`'s bare call must reach the global function.
     let (program, analysis) = cpp_name_lookup();
     assert!(
@@ -1274,7 +1301,7 @@ fn cpp_global_qualified_definition_inside_namespace_block() {
             &program,
             &analysis,
             "global_block::caller",
-            "::qualified_global",
+            "qualified_global",
             ResolutionKind::Direct
         ),
         "::global definition inside a namespace block must stay at global scope"
@@ -1389,5 +1416,58 @@ fn cpp_adl_leading_global_scope_tag_finds_namespace() {
             ResolutionKind::Direct
         ),
         "leading-:: ADL tag must resolve through ADL to kit::lead_swap"
+    );
+}
+
+#[test]
+fn cpp_inner_namespace_hides_global_overload() {
+    // `hide::g() { f(1); }` with a global `::f(int)` and an inner
+    // `hide::f(double)`. The bare name inside `hide` must resolve to
+    // `hide::f` only — the global `::f` is a wrong single answer and must be
+    // dropped (its presence must not be re-added by an out-of-band global
+    // lookup that runs ahead of the hiding walk).
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "hide::g",
+            "hide::f",
+            ResolutionKind::Direct
+        ),
+        "inner-namespace declaration must shadow the global overload"
+    );
+    assert!(
+        !has_resolution(&program, &analysis, "hide::g", "f", ResolutionKind::Direct),
+        "global f(int) must be hidden by hide::f, not kept as a candidate"
+    );
+}
+
+#[test]
+fn cpp_inner_namespace_hides_global_static() {
+    // `hidesf::g() { sf(1); }` with a global file-scope `static sf(int)` and
+    // an inner `hidesf::sf(double)`. The nested namespace declaration must
+    // shadow the file-static, resolving to `hidesf::sf` only — not the
+    // wrong single global-static answer.
+    let (program, analysis) = cpp_name_lookup();
+    assert!(
+        has_resolution(
+            &program,
+            &analysis,
+            "hidesf::g",
+            "hidesf::sf",
+            ResolutionKind::Direct
+        ),
+        "inner-namespace declaration must shadow the global file-static"
+    );
+    assert!(
+        !has_resolution(
+            &program,
+            &analysis,
+            "hidesf::g",
+            "sf",
+            ResolutionKind::Direct
+        ),
+        "global static sf must be hidden by hidesf::sf, not kept as a candidate"
     );
 }

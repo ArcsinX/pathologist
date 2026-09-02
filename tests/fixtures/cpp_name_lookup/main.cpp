@@ -41,6 +41,16 @@ using lib::bump;
 
 static void using_member_drive(lib::Count *c) { bump(c); }
 
+// A namespace-scoped `static` function imported via `using`: the import
+// must resolve to the internal linkage definition in this file (when a
+// global same-named overload exists, it must not win).
+namespace import_static {
+static void only(int v) { (void)v; }
+} // namespace import_static
+using import_static::only;
+void only(double v) { (void)v; }
+static void using_static_drive() { only(1); }
+
 // Explicitly qualified calls still resolve (unchanged path).
 static void qualified_drive() {
     util::helper();
@@ -203,4 +213,23 @@ static void adl_leading_global_scope_tag() {
     ::kit::LeadWidget *_w = &w;
     lead_swap(_w);
 }
+
+// Hiding rule, outer rung: an inner-namespace declaration must shadow a
+// global-namespace one of the same name. `hide::g`'s bare `f(1)` must
+// resolve to `hide::f` (the global `::f(int)` is shadowed and dropped).
+void f(int);
+namespace hide {
+void f(double v) { (void)v; }
+void g() { f(1); }
+} // namespace hide
+
+// Hiding rule for internal linkage: a nested namespace declaration must
+// also shadow a global file-scope static of the same name. `hidesf::g`'s
+// bare `sf(1)` must resolve to `hidesf::sf` (the global static `::sf` is
+// dropped, not the wrong single answer).
+static void sf(int v) { (void)v; }
+namespace hidesf {
+void sf(double v) { (void)v; }
+void g() { sf(1); }
+} // namespace hidesf
 
