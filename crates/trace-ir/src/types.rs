@@ -286,12 +286,19 @@ impl TypeTable {
         &self.types[id.0 as usize]
     }
 
+    /// Ids of the primitives `new` interns up front, in that order. Pinned by
+    /// `primitive_accessors_name_their_own_type`.
     pub fn void(&self) -> TypeId {
         TypeId(0)
     }
 
     pub fn int(&self) -> TypeId {
-        TypeId(2)
+        TypeId(4)
+    }
+
+    /// The placeholder a lookup that resolves nothing falls back to.
+    pub fn unknown(&self) -> TypeId {
+        TypeId(10)
     }
 
     pub fn ptr_to(&mut self, inner: TypeDesc) -> TypeId {
@@ -410,9 +417,9 @@ impl TypeTable {
                 self.intern
                     .get(inner.as_ref())
                     .copied()
-                    .unwrap_or(TypeId(5))
+                    .unwrap_or(self.unknown())
             });
-            if pointee != TypeId(5) {
+            if pointee != self.unknown() {
                 let pointee_desc = self.get(pointee).desc.clone();
                 let ptr_desc = TypeDesc::Ptr(Box::new(pointee_desc));
                 if let Some(id) = self.intern.get(&ptr_desc) {
@@ -420,7 +427,7 @@ impl TypeTable {
                 }
             }
         }
-        TypeId(5)
+        self.unknown()
     }
 }
 
@@ -500,6 +507,31 @@ fn align_up(value: u64, align: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primitive_accessors_name_their_own_type() {
+        // These return raw indices into the primitives `new` interns, so a
+        // reordered or extended prelude silently repoints them: `int()` named
+        // `Bool` for as long as `Bool` has sat between `Char` and `Short`.
+        let t = TypeTable::new();
+        assert_eq!(t.get(t.void()).desc, TypeDesc::Void);
+        assert_eq!(t.get(t.int()).desc, TypeDesc::Int);
+        assert_eq!(t.get(t.unknown()).desc, TypeDesc::Unknown);
+    }
+
+    #[test]
+    fn resolving_an_unknown_tag_yields_unknown() {
+        // `resolve_type_id` fell back to a raw `TypeId(5)`, which the prelude
+        // had long since grown past: it named `Long`, so every dereference
+        // through a type the table never interned came back a signed integer
+        // rather than the placeholder the function means.
+        let t = TypeTable::new();
+        let missing = TypeDesc::Struct {
+            name: "NeverInterned".to_string(),
+            fields: Vec::new(),
+        };
+        assert_eq!(t.get(t.resolve_type_id(&missing)).desc, TypeDesc::Unknown);
+    }
 
     #[test]
     fn complete_nested_tags_rewrites_empty_embedded_struct() {
