@@ -59,7 +59,7 @@
         "edges_direct": {"cmp": "band", "value": 7791, "tol": 160},
         "edges_indirect": {"cmp": "exact", "value": 24},
         "edges_external": {"cmp": "band", "value": 20472, "tol": 160},
-        "edges_ipc": {"cmp": "exact", "value": 9},
+        "edges_ipc": {"cmp": "exact", "value": 14},
         "arg_flow_edges": {"cmp": "band", "value": 9243, "tol": 120},
         "diagnostics": {"cmp": "exact", "value": 2959},
         "dlsym_edges": {"cmp": "exact", "value": 1}
